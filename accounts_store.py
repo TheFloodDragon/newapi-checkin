@@ -222,6 +222,13 @@ OAUTH_PROVIDER_DOMAINS = {
 }
 
 
+def _hostname_matches_domain(hostname: str, domain: str) -> bool:
+    """延迟复用 browser.oauth_providers 的统一 hostname 边界语义。"""
+    from browser.oauth_providers import hostname_matches_domain
+
+    return hostname_matches_domain(hostname, domain)
+
+
 def _state_domains(state_text: str) -> set[str]:
     """从经过严格校验的 storage_state 提取 cookie 域名集合。"""
     try:
@@ -232,29 +239,31 @@ def _state_domains(state_text: str) -> set[str]:
         return set()
     domains: set[str] = set()
     for cookie in data.get("cookies", []) if isinstance(data, dict) else []:
-        dom = str(cookie.get("domain", "")).lstrip(".")
+        dom = str(cookie.get("domain", "")).strip().lstrip(".").rstrip(".").lower()
         if dom:
             domains.add(dom)
     return domains
 
 
 def guess_oauth_provider(state_text: str) -> str:
-    """按登录态里的域名猜 OAuth 提供商（linux.do → linuxdo，github.com → github）。"""
+    """按登录态 cookie 的严格域名边界猜 OAuth 提供商。"""
     domains = _state_domains(state_text)
-    if any("linux.do" in d for d in domains):
-        return "linuxdo"
-    if any("github.com" in d for d in domains):
-        return "github"
+    for provider, hints in OAUTH_PROVIDER_DOMAINS.items():
+        if any(
+            _hostname_matches_domain(cookie_domain, hint)
+            for cookie_domain in domains
+            for hint in hints
+        ):
+            return provider
     return ""
 
 
 def state_contains_site_domain(state_text: str, base_url: str) -> bool:
-    """判断 storage_state 是否含目标站点 Cookie；OAuth 共享态不应保存站点凭证。"""
+    """判断 storage_state 是否含可发送给目标 host 的 Cookie。"""
     host = urlparse(normalize_base_url(str(base_url or ""))).hostname or ""
-    host = host.lstrip(".").lower()
     if not host:
         return False
-    return any(domain == host or domain.endswith("." + host) for domain in _state_domains(state_text))
+    return any(_hostname_matches_domain(host, domain) for domain in _state_domains(state_text))
 
 
 def normalize_oauth_provider(value: Any) -> str:

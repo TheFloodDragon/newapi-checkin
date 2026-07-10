@@ -9,6 +9,7 @@ from typing import Any
 from ..auth import has_http_credentials, load_auth
 from ..base import (
     AuthInfo,
+    BrowserAuthError,
     ProfileClient,
     QUOTA_UNIT,
     SiteConfig,
@@ -74,18 +75,23 @@ def build_http_client(site: SiteConfig, profile: SiteProfile) -> ProfileClient:
     - browser：只使用站点级 browser_state 刷新认证（cookie 或 token）；
     - oauth：只使用显式选择的 OAuth provider/account 登录态刷新认证。
 
-    浏览器刷新的确定性失败（如 WAF 持续风控）以 BrowserAuthError 向上传播，
-    由 action 层翻译成 need_verification 等状态。
+    browser/oauth 的认证刷新只在这里执行，且每次 action 最多一次。浏览器刷新的
+    确定性失败（如 WAF 持续风控）以 BrowserAuthError 向上传播，由 action 层翻译
+    成 need_verification 等状态；刷新无结果时直接返回 need_login，不构造空凭据客户端。
     """
     auth_method = (site.auth_method or "cookie").strip().lower()
-    if auth_method in {"browser", "oauth"} and profile.supports_browser_refresh():
-        auth = profile.refresh_auth_via_browser(site)
-        if auth is not None:
-            persist_refreshed_auth(site, auth)
-            return profile.build_client(site, auth)
+    if auth_method in {"browser", "oauth"}:
+        if profile.supports_browser_refresh():
+            auth = profile.refresh_auth_via_browser(site)
+            if auth is not None:
+                persist_refreshed_auth(site, auth)
+                return profile.build_client(site, auth)
+        raise BrowserAuthError(
+            "need_login",
+            f"auth_method={auth_method} 登录态刷新失败，请重新捕获对应登录态。",
+        )
     if auth_method in {"access_token", "cookie"}:
         return profile.build_client(site, load_auth(site))
-    # browser/oauth 但无法刷新时，不回退到 token/cookie，避免隐式混用登录方式。
     return profile.build_client(site, AuthInfo())
 
 

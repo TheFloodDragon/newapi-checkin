@@ -7,7 +7,6 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import inspect
-import json
 import os
 import sys
 import traceback
@@ -119,37 +118,6 @@ def _load_module(script_file: Path) -> ModuleType:
     return module
 
 
-async def _restore_storage_state(context: Any, storage_state: dict[str, Any]) -> None:
-    cookies = storage_state.get("cookies") or []
-    if cookies:
-        await context.add_cookies(cookies)
-
-    origin_map: dict[str, dict[str, str]] = {}
-    for origin_data in storage_state.get("origins", []) or []:
-        origin = str(origin_data.get("origin") or "")
-        if not origin:
-            continue
-        pairs: dict[str, str] = {}
-        for item in origin_data.get("localStorage", []) or []:
-            name = str(item.get("name") or "")
-            if not name:
-                continue
-            pairs[name] = str(item.get("value") or "")
-        if pairs:
-            origin_map[origin] = pairs
-    if origin_map:
-        init_js = """
-        (() => {
-          const states = %s;
-          const pairs = states[location.origin] || {};
-          for (const [key, value] of Object.entries(pairs)) {
-            try { localStorage.setItem(key, value); } catch (_) {}
-          }
-        })();
-        """ % json.dumps(origin_map, ensure_ascii=False, separators=(",", ":"))
-        await context.add_init_script(init_js)
-
-
 def _site_view(site: Any, script_path: str, script_args: dict[str, Any] | None, timeout: int) -> ScriptSiteView:
     return ScriptSiteView(
         name=str(getattr(site, "name", "") or ""),
@@ -230,7 +198,7 @@ async def run_browser_script(
             geoip=True,
             proxy=str(getattr(site, "proxy", "") or "") or None,
         )
-        await _restore_storage_state(context, storage_state)
+        await state.restore_storage_state(context, storage_state)
         page = await context.new_page()
         await popups.setup_popup_guard(page, allowed_origin=_origin_from_url(site_view.base_url))
         helpers = ScriptHelpers(page, context, site_view, SCREENSHOT_DIR)

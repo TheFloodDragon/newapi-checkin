@@ -51,6 +51,49 @@ class BrowserStateError(Exception):
     """browser_state 编码/解码相关错误（供 provider 捕获）。"""
 
 
+async def restore_storage_state(
+    context: Any,
+    storage_state: dict[str, Any] | None,
+) -> None:
+    """把 cookies/localStorage 恢复到浏览器上下文，并严格隔离不同 origin。"""
+    data = storage_state or {}
+    cookies = data.get("cookies") or []
+    if cookies:
+        await context.add_cookies(cookies)
+
+    origin_map: dict[str, dict[str, str]] = {}
+    for origin_data in data.get("origins", []) or []:
+        if not isinstance(origin_data, dict):
+            continue
+        origin = str(origin_data.get("origin") or "").strip()
+        if not origin:
+            continue
+        pairs = origin_map.setdefault(origin, {})
+        for item in origin_data.get("localStorage", []) or []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "")
+            if not name:
+                continue
+            value = item.get("value")
+            pairs[name] = "" if value is None else str(value)
+
+    origin_map = {origin: pairs for origin, pairs in origin_map.items() if pairs}
+    if not origin_map:
+        return
+
+    init_js = """
+    (() => {
+      const states = %s;
+      const pairs = states[location.origin] || {};
+      for (const [key, value] of Object.entries(pairs)) {
+        try { localStorage.setItem(key, value); } catch (_) {}
+      }
+    })();
+    """ % json.dumps(origin_map, ensure_ascii=False, separators=(",", ":"))
+    await context.add_init_script(init_js)
+
+
 def _validate_storage_state(data: Any) -> None:
     """校验 storage_state 顶层结构及 cookies/origins/localStorage 基本类型。
 

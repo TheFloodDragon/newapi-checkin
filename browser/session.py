@@ -1567,17 +1567,7 @@ async def capture_sub2api_token(
 
     page = None
     try:
-        await context.add_cookies(storage_state_dict.get("cookies", []))
-        ls_pairs: list[tuple[str, str]] = []
-        for origin_data in storage_state_dict.get("origins", []):
-            for item in origin_data.get("localStorage", []):
-                ls_pairs.append((item.get("name", ""), item.get("value", "")))
-        if ls_pairs:
-            init_js = "".join(
-                f"try{{localStorage.setItem({json.dumps(k)},{json.dumps(v)});}}catch(e){{}}"
-                for k, v in ls_pairs
-            )
-            await context.add_init_script(init_js)
+        await state.restore_storage_state(context, storage_state_dict)
 
         page = await context.new_page()
         await popups.setup_popup_guard(page, allowed_origin=_origin_from_url(base_url))
@@ -1870,19 +1860,7 @@ async def verify_state(
 
     page = None
     try:
-        # 注入 storage_state：cookies + localStorage（init_script 早注入）
-        if storage_state_dict:
-            await context.add_cookies(storage_state_dict.get("cookies", []))
-            ls_pairs: list[tuple[str, str]] = []
-            for origin_data in storage_state_dict.get("origins", []):
-                for item in origin_data.get("localStorage", []):
-                    ls_pairs.append((item.get("name", ""), item.get("value", "")))
-            if ls_pairs:
-                init_js = "".join(
-                    f"try{{localStorage.setItem({json.dumps(k)},{json.dumps(v)});}}catch(e){{}}"
-                    for k, v in ls_pairs
-                )
-                await context.add_init_script(init_js)
+        await state.restore_storage_state(context, storage_state_dict)
 
         page = await context.new_page()
         await popups.setup_popup_guard(page, allowed_origin=_origin_from_url(base_url))
@@ -1998,18 +1976,7 @@ async def refresh_site_cookies(
 
     page = None
     try:
-        if storage_state_dict:
-            await context.add_cookies(storage_state_dict.get("cookies", []))
-            ls_pairs: list[tuple[str, str]] = []
-            for origin_data in storage_state_dict.get("origins", []):
-                for item in origin_data.get("localStorage", []):
-                    ls_pairs.append((item.get("name", ""), item.get("value", "")))
-            if ls_pairs:
-                init_js = "".join(
-                    f"try{{localStorage.setItem({json.dumps(k)},{json.dumps(v)});}}catch(e){{}}"
-                    for k, v in ls_pairs
-                )
-                await context.add_init_script(init_js)
+        await state.restore_storage_state(context, storage_state_dict)
 
         page = await context.new_page()
         await popups.setup_popup_guard(page, allowed_origin=_origin_from_url(base_url))
@@ -2154,20 +2121,7 @@ async def run_oauth_checkin(
     link: dict[str, Any] = {}
 
     try:
-        # 注入 storage_state：cookies 先注入到 context
-        if storage_state_dict:
-            await context.add_cookies(storage_state_dict.get("cookies", []))
-            # localStorage 用 add_init_script 在每个文档加载前注入（早于前端 SPA 初始化）
-            ls_pairs: list[tuple[str, str]] = []
-            for origin_data in storage_state_dict.get("origins", []):
-                for item in origin_data.get("localStorage", []):
-                    ls_pairs.append((item.get("name", ""), item.get("value", "")))
-            if ls_pairs:
-                init_js = "".join(
-                    f"try{{localStorage.setItem({json.dumps(k)},{json.dumps(v)});}}catch(e){{}}"
-                    for k, v in ls_pairs
-                )
-                await context.add_init_script(init_js)
+        await state.restore_storage_state(context, storage_state_dict)
 
         page = await context.new_page()
         error_collector = _install_site_error_collector(page, base_url)

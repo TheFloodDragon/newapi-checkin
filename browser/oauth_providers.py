@@ -18,7 +18,31 @@
 from __future__ import annotations
 
 from abc import ABC
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
+
+
+def normalize_hostname(value: str | None) -> str:
+    """规范化 URL/cookie hostname，移除 cookie 域名前导点。"""
+    return str(value or "").strip().lstrip(".").rstrip(".").lower()
+
+
+def hostname_matches_domain(hostname: str | None, domain: str | None) -> bool:
+    """判断 hostname 是否等于 domain，或位于 domain 的真实子域边界下。"""
+    host = normalize_hostname(hostname)
+    base = normalize_hostname(domain)
+    return bool(host and base and (host == base or host.endswith("." + base)))
+
+
+def url_matches_domains(url: str, domains: tuple[str, ...], *, require_https: bool = True) -> bool:
+    """按 URL hostname 边界匹配允许域名；OAuth 页面默认只接受 HTTPS。"""
+    try:
+        parsed = urlsplit(str(url or ""))
+        hostname = parsed.hostname
+    except ValueError:
+        return False
+    if require_https and parsed.scheme.lower() != "https":
+        return False
+    return any(hostname_matches_domain(hostname, domain) for domain in domains)
 
 
 class OAuthProvider(ABC):
@@ -51,8 +75,8 @@ class OAuthProvider(ABC):
         return f"/api/oauth/{self.key}"
 
     def matches_url(self, url: str) -> bool:
-        """当前 URL 是否处于该 provider 的授权域名下。"""
-        raise NotImplementedError
+        """当前 HTTPS URL 是否处于该 provider 的授权域名边界下。"""
+        return url_matches_domains(url, self.state_domain_hints)
 
 
 class LinuxDoProvider(OAuthProvider):
@@ -63,10 +87,6 @@ class LinuxDoProvider(OAuthProvider):
     approve_selectors = ['a[href^="/oauth2/approve"]', 'button:has-text("允许")', 'button:has-text("Authorize")']
     login_markers = ["#login-account-name", "#login-account-password", "#login-button"]
 
-    def matches_url(self, url: str) -> bool:
-        u = (url or "").lower()
-        return "connect.linux.do" in u or "linux.do" in u
-
 
 class GitHubProvider(OAuthProvider):
     key = "github"
@@ -76,9 +96,6 @@ class GitHubProvider(OAuthProvider):
     scope = "user:email"
     approve_selectors = ['button[name="authorize"][value="1"]', 'button[type="submit"]']
     login_markers = ["#login_field", "#password"]
-
-    def matches_url(self, url: str) -> bool:
-        return "github.com" in (url or "").lower()
 
 
 _PROVIDERS: dict[str, OAuthProvider] = {
@@ -100,6 +117,9 @@ def get_oauth_provider(value: str | None) -> OAuthProvider:
 
 
 __all__ = [
+    "normalize_hostname",
+    "hostname_matches_domain",
+    "url_matches_domains",
     "OAuthProvider",
     "LinuxDoProvider",
     "GitHubProvider",

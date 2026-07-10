@@ -149,6 +149,7 @@ class Sub2ApiClient(ProfileClient):
         self.base_url = normalize_base_url(site.base_url)
         self.access_token = normalize_access_token(auth.access_token or site.access_token)
         self.cookie = normalize_cookie(auth.cookie or site.cookie)
+        self._user_cache: UserInfo | None = None
 
     def _headers(self) -> dict[str, str]:
         headers = {
@@ -236,6 +237,11 @@ class Sub2ApiClient(ProfileClient):
         )
 
     def fetch_user(self) -> UserInfo:
+        if self._user_cache is None:
+            self._user_cache = self._fetch_user_uncached()
+        return self._user_cache
+
+    def _fetch_user_uncached(self) -> UserInfo:
         login_error: ApiError | None = None
         authenticated_raw: dict[str, Any] | None = None
         username = ""
@@ -270,7 +276,9 @@ class Sub2ApiClient(ProfileClient):
         try:
             data = unwrap_data(self.request("GET", "/usage?page=1&page_size=1&sort_by=created_at&sort_order=desc"))
             remember_authenticated("/usage", data)
-            balance = _extract_usage_user_balance(data) or _extract_standard_balance(data)
+            balance = _extract_usage_user_balance(data)
+            if balance is None:
+                balance = _extract_standard_balance(data)
             if balance is not None:
                 return UserInfo(quota_raw=balance, username=username or _extract_username(data), raw={"source": "/usage", "payload": data})
         except ApiError as exc:
@@ -335,6 +343,8 @@ class Sub2ApiClient(ProfileClient):
                 },
                 extra={"unsupported_checkin": True, "standard_sub2api": True},
             )
+        # 真实签到成功后余额可能变化；后续读取必须重新探测一次。
+        self._user_cache = None
         return self._reward_from(data)
 
     def classify(self, error: ApiError) -> str:
