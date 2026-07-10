@@ -1,0 +1,153 @@
+name: 自动签到
+run-name: 自动签到 - ${{ github.event_name }}
+
+on:
+  schedule:
+    - cron: '30 1 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: auto-checkin
+  cancel-in-progress: false
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUNBUFFERED: 1
+      TZ: Asia/Shanghai
+      # 有头模式：阿里云 WAF 的 JS 挑战对无头浏览器敏感，必须有头（配合 xvfb）
+      CHECKIN_HEADLESS: 'false'
+      # 阿里云 WAF 新版挑战（aliyun_waf_aa/bb）按「出口 IP 信誉」风控，GitHub Actions
+      # 机房 IP 常年过不了 JS 挑战。可选：配置 Secret CHECKIN_PROXY（住宅代理，格式
+      # http://user:pass@host:port，优先中国大陆/亚太住宅 IP），站点未单独配 proxy 时全局兜底。
+      CHECKIN_PROXY: ${{ secrets.CHECKIN_PROXY }}
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7
+
+      - name: 设置 uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
+        with:
+          version: "latest"
+
+      - name: 设置 Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+
+      - name: 缓存 UV 依赖
+        uses: actions/cache@v6
+        id: uv-cache
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: ${{ runner.os }}-uv-${{ hashFiles('pyproject.toml') }}
+          restore-keys: ${{ runner.os }}-uv-
+
+      - name: 安装依赖
+        if: steps.uv-cache.outputs.cache-hit != 'true'
+        run: uv sync
+
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb fonts-noto-color-emoji fonts-wqy-zenhei fonts-unifont
+
+      - name: 获取 Camoufox 版本
+        id: camoufox-version
+        run: |
+          v=$(uv run python -c "import importlib.metadata; print(importlib.metadata.version('camoufox'))" 2>/dev/null || echo unknown)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Camoufox $v"
+
+      - name: 缓存 Camoufox 浏览器
+        uses: actions/cache@v6
+        id: camoufox-cache
+        with:
+          path: ~/.cache/camoufox
+          key: ${{ runner.os }}-camoufox-${{ steps.camoufox-version.outputs.version }}
+          restore-keys: ${{ runner.os }}-camoufox-
+
+      - name: 安装 Camoufox 浏览器
+        if: steps.camoufox-cache.outputs.cache-hit != 'true'
+        run: uv run python -m camoufox fetch
+
+      # 修复 Playwright 1.60 Firefox 驱动的 pageError.location 空指针崩溃
+      # （coreBundle.js 直接取 location.url，Firefox 偶发不带 location 时整个
+      # Node 驱动进程崩溃）。脚本幂等，缓存命中或未命中都需每次执行。
+      - name: 修补 Playwright Firefox 驱动
+        run: uv run python ci/patch_playwright.py
+
+      - name: 恢复 ACCOUNTS 密钥
+        env:
+          ACCOUNTS: ${{ secrets.ACCOUNTS }}
+        run: |
+          python - <<'EOF'
+          import os
+          from pathlib import Path
+          data = os.environ.get("ACCOUNTS", "").strip()
+          if not data:
+              raise SystemExit("❌ 未配置 Secret: ACCOUNTS")
+          Path("ACCOUNTS.json").write_text(data, encoding="utf-8")
+          print("✅ 已写入 ACCOUNTS.json")
+          EOF
+
+      - name: 检测是否需要浏览器签到
+        id: detect_browser
+        run: |
+          need=$(uv run python ci/detect_browser.py)
+          echo "need_browser=$need" >> "$GITHUB_OUTPUT"
+          echo "need_browser=$need"
+
+      - name: 启动 Clash 代理（可选）
+        env:
+          # 完整 mihomo/Clash 配置文件内容（含 proxies/proxy-groups/rules）。
+          # 未配置则自动跳过，站点直连。节点须为能过阿里云 WAF 的住宅/家宽 IP。
+          CLASH_CONFIG: ${{ secrets.CLASH_CONFIG }}
+        run: bash ci/setup_proxy.sh
+
+      - name: 执行签到
+        id: checkin
+        run: |
+          set +e
+          xvfb-run -a --server-args="-screen 0 1920x1080x24" uv run python -u run__all_checkin.py
+          code=$?
+          set -e
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          echo "签到脚本退出码: $code"
+
+      - name: 停止 Clash 代理
+        if: always()
+        run: bash ci/stop_proxy.sh
+
+      - name: 生成签到报告
+        if: always()
+        run: uv run python ci/report.py
+
+      - name: 输出报告
+        if: always()
+        run: |
+          if [ -f checkin_report.md ]; then
+            cat checkin_report.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "⚠️ 未生成签到报告" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: 检查签到结果
+        if: always()
+        run: |
+          # 任何非 0 退出码（签到失败、找不到任务、读取配置失败等）均视为失败
+          code="${{ steps.checkin.outputs.exit_code }}"
+          if [ -z "$code" ]; then
+            echo "❌ 签到步骤未产生退出码，视为失败"
+            exit 1
+          fi
+          if [ "$code" != "0" ]; then
+            echo "❌ 签到任务失败，退出码: $code"
+            exit "$code"
+          fi
+          echo "✅ 所有签到任务成功"

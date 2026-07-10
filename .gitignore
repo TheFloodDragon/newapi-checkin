@@ -1,0 +1,20 @@
+# 凭据与本地配置，严禁入库
+ACCOUNTS.json
+ACCOUNTS.json.bak
+ACCOUNTS.json.lock
+
+# 运行产物
+results/
+login_grant_state.json
+checkin_report.md
+__pycache__/
+*.pyc
+
+# 浏览器持久化登录态（含 Linux.do/OAuth 会话，严禁入库）
+.browser_profile/
+
+# Python 虚拟环境 / 构建产物
+.venv/
+*.egg-info/
+build/
+dist/

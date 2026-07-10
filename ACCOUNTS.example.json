@@ -1,0 +1,71 @@
+{
+  "accounts": [
+    {
+      "name": "示例 New API 站（access_token + api）",
+      "base_url": "https://example-newapi.com",
+      "site_profile": "newapi",
+      "auth_method": "access_token",
+      "checkin_action": "api",
+      "api_variant": "legacy",
+      "enabled": true,
+      "user_id": "10000",
+      "access_token": "<在站点后台或用 collector.js 采集的 access_token>",
+      "cookie": "<可选：session=... 等 Cookie，过 WAF 时需要>"
+    },
+    {
+      "name": "示例 Sub2API 站（access_token + api）",
+      "base_url": "https://sub.example.com",
+      "site_profile": "sub2api",
+      "auth_method": "access_token",
+      "checkin_action": "api",
+      "enabled": true,
+      "user_id": "20000",
+      "access_token": "<浏览器 localStorage 的 auth_token / access_token>"
+    },
+    {
+      "name": "示例 AgentRouter（oauth + relogin）",
+      "base_url": "https://example-router.org",
+      "site_profile": "newapi",
+      "auth_method": "oauth",
+      "checkin_action": "relogin",
+      "oauth_provider": "linuxdo",
+      "oauth_account": "default",
+      "enabled": true,
+      "user_id": "30000",
+      "proxy": ""
+    },
+    {
+      "name": "示例浏览器脚本站（browser_script）",
+      "base_url": "https://example.100xlabs.space",
+      "site_profile": "sub2api",
+      "auth_method": "oauth",
+      "checkin_action": "browser_script",
+      "script": "scripts/checkin/100xlabs.py",
+      "script_args": { "start_path": "/check-in", "checkin_text": "签到" },
+      "script_timeout": 120,
+      "oauth_provider": "linuxdo",
+      "oauth_account": "default",
+      "enabled": false
+    }
+  ],
+  "oauth_states": {
+    "linuxdo": {
+      "accounts": {
+        "default": {
+          "state": "<用 GUI「捕获 OAuth 登录态」或 poc_oauth.py setup 生成的 base64 登录态>",
+          "username": "",
+          "updated_at": ""
+        }
+      }
+    },
+    "github": {
+      "accounts": {
+        "default": {
+          "state": "<GitHub 共享登录态 base64>",
+          "username": "",
+          "updated_at": ""
+        }
+      }
+    }
+  }
+}
