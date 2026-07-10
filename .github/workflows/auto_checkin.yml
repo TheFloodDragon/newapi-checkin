@@ -22,27 +22,27 @@ jobs:
 
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 设置 uv
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
         with:
-          version: '0.8.22'
+          version: "latest"
 
       - name: 设置 Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
-          python-version: '3.12'
+          python-version: '3.14'
 
       - name: 缓存 uv 依赖
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cache/uv
             .venv
-          key: ${{ runner.os }}-python-3.12-uv-${{ hashFiles('uv.lock') }}
+          key: ${{ runner.os }}-python-3.14-uv-${{ hashFiles('uv.lock') }}
           restore-keys: |
-            ${{ runner.os }}-python-3.12-uv-
+            ${{ runner.os }}-python-3.14-uv-
 
       - name: 安装锁定依赖
         run: uv sync --locked --extra dev
@@ -106,7 +106,7 @@ jobs:
 
       - name: 缓存 Camoufox 浏览器
         if: steps.detect_browser.outputs.need_browser == 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         id: camoufox-cache
         with:
           path: ~/.cache/camoufox
