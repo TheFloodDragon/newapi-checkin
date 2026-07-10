@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import accounts_store
+
 from .base import (
     AuthInfo,
     SiteConfig,
@@ -58,7 +60,8 @@ def load_cookie_file(path: Path) -> AuthInfo:
     if cookie != raw_cookie.strip() and cookie:
         try:
             extra = f"{access_token}\n" if access_token else ""
-            path.write_text(f"{cookie}\n{user_id}\n{extra}", encoding="utf-8")
+            with accounts_store.file_lock(path):
+                accounts_store.atomic_write_text(path, f"{cookie}\n{user_id}\n{extra}")
             print(f"[DEBUG] 已清理 {path.name} 中的重复 Cookie 字段")
         except Exception as e:
             print(f"[WARN] 无法回写清理后的 Cookie 文件 {path}: {e}")

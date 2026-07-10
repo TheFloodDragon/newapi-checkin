@@ -7,6 +7,8 @@ ACCOUNTS.json.lock
 results/
 login_grant_state.json
 checkin_report.md
+*.lock
+!uv.lock
 __pycache__/
 *.pyc
 

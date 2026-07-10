@@ -18,11 +18,12 @@ from datetime import datetime, date
 from pathlib import Path
 from typing import Any
 
+import accounts_store
+
 from ..base import (
     ApiError,
     BrowserAuthError,
     CheckinResult,
-    ProfileClient,
     QueryStatus,
     SiteConfig,
     SiteProfile,
@@ -44,16 +45,24 @@ def _load_state() -> dict[str, Any]:
         return {}
     try:
         data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise accounts_store.ConfigError(f"额度状态文件 {STATE_PATH.name} 损坏或不可读：{exc}") from exc
+    if not isinstance(data, dict):
+        raise accounts_store.ConfigError(f"额度状态文件 {STATE_PATH.name} 顶层必须是 JSON 对象")
+    return data
 
 
-def _save_state(state: dict[str, Any]) -> None:
-    try:
-        STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception as exc:
-        print(f"[WARN] 无法写入 login_grant 状态文件 {STATE_PATH.name}: {exc}")
+def _record_state(key: str, record: dict[str, Any]) -> dict[str, Any]:
+    """在共享文件锁内完成额度状态的读-改-写。"""
+    with accounts_store.file_lock(STATE_PATH):
+        state = _load_state()
+        previous = state.get(key) if isinstance(state.get(key), dict) else {}
+        state[key] = record
+        accounts_store.atomic_write_text(
+            STATE_PATH,
+            json.dumps(state, ensure_ascii=False, indent=2),
+        )
+    return dict(previous)
 
 
 def _state_key(base_url: str, user_id: str = "") -> str:
@@ -80,6 +89,14 @@ def run_action(site: SiteConfig, profile: SiteProfile, turnstile: str = "") -> C
     try:
         user = client.fetch_user()
     except ApiError as exc:
+        if exc.transient:
+            return CheckinResult(
+                site.name,
+                base_url,
+                "network_error",
+                f"站点暂时不可达或接口限流：{exc.message}",
+                detail=exc.payload,
+            )
         if contains_any(exc.message, VERIFICATION_PATTERNS):
             return CheckinResult(site.name, base_url, "need_verification", exc.message, detail=exc.payload)
         if client.classify(exc) == "need_login":
@@ -94,12 +111,19 @@ def run_action(site: SiteConfig, profile: SiteProfile, turnstile: str = "") -> C
     quota = user.quota_raw
     username = user.username
 
-    # 跨次对比额度变化
-    state = _load_state()
+    # 跨次对比额度变化；读-改-写必须在同一文件锁内完成。
     key = _state_key(base_url, site.user_id.strip())
-    prev = state.get(key) if isinstance(state.get(key), dict) else {}
-    prev_quota = prev.get("quota")
     today = date.today().isoformat()
+    prev = _record_state(
+        key,
+        {
+            "quota": quota,
+            "username": username,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "date": today,
+        },
+    )
+    prev_quota = prev.get("quota")
 
     detail: dict[str, Any] = {
         "checkin_source": "visit",
@@ -111,14 +135,6 @@ def run_action(site: SiteConfig, profile: SiteProfile, turnstile: str = "") -> C
     quota_delta: float | None = None
     if isinstance(quota, (int, float)) and isinstance(prev_quota, (int, float)):
         quota_delta = float(quota) - float(prev_quota)
-
-    state[key] = {
-        "quota": quota,
-        "username": username,
-        "updated_at": datetime.now().isoformat(timespec="seconds"),
-        "date": today,
-    }
-    _save_state(state)
 
     is_usd = client.quota_is_usd
     if quota_delta is not None and quota_delta > 0:

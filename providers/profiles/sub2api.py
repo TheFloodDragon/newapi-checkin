@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import json
 import sys
-from pathlib import Path
 from typing import Any
 
 from ..base import (
@@ -43,8 +42,6 @@ from ..base import (
     normalize_cookie,
     unwrap_data,
 )
-
-SCRIPT_DIR = Path(__file__).resolve().parent.parent.parent
 
 API_PREFIX = "/api/v1"
 LOGIN_PATTERNS = ["unauthorized", "登录", "token", "expired", "invalid", "forbidden", "无效", "过期"]
@@ -176,7 +173,13 @@ class Sub2ApiClient(ProfileClient):
             headers["Content-Type"] = "application/json"
             raw_body = json.dumps(body or {}).encode("utf-8")
 
-        payload = http_request(url, method=method, headers=headers, body=raw_body)
+        payload = http_request(
+            url,
+            method=method,
+            headers=headers,
+            body=raw_body,
+            proxy=self.site.proxy,
+        )
         # Sub2API 统一响应：{code:0, data:{...}}；code != 0 视为失败
         if isinstance(payload, dict) and "code" in payload:
             code = payload.get("code")
@@ -188,7 +191,12 @@ class Sub2ApiClient(ProfileClient):
         """按用户提供的余额脚本请求 {base_url}/v1/usage。"""
         if not self.access_token:
             raise ApiError(401, None, "缺少 access_token/apiKey，无法请求 /v1/usage")
-        return http_request(self.base_url + "/v1/usage", method="GET", headers=self._headers())
+        return http_request(
+            self.base_url + "/v1/usage",
+            method="GET",
+            headers=self._headers(),
+            proxy=self.site.proxy,
+        )
 
     @staticmethod
     def _extract_usage_balance(payload: Any) -> tuple[bool, float | int | None, str] | None:
@@ -398,7 +406,6 @@ class Sub2ApiProfile(SiteProfile):
             return None
 
         try:
-            sys.path.insert(0, str(SCRIPT_DIR))
             from browser import session as browser_session
         except Exception as exc:
             print(f"[sub2api:{site.name}] 加载 browser_session 失败：{exc}", file=sys.stderr, flush=True)

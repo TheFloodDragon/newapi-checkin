@@ -25,7 +25,6 @@ from ..base import (
     SiteConfig,
     SiteProfile,
     StatusInfo,
-    contains_any,
 )
 from ._common import build_http_client, credentials_ready, has_refresh_state, persist_refreshed_auth, usd_str
 
@@ -64,6 +63,14 @@ def _checkin_once(site: SiteConfig, client: ProfileClient, turnstile: str) -> Ch
     try:
         status = client.fetch_status()
     except ApiError as exc:
+        if exc.transient:
+            return CheckinResult(
+                site.name,
+                base_url,
+                "network_error",
+                f"签到状态查询暂时失败：{exc.message}",
+                detail=exc.payload,
+            )
         kind = client.classify(exc)
         if kind == "already_done":
             return CheckinResult(site.name, base_url, "already_done", exc.message, detail=exc.payload)
@@ -96,6 +103,14 @@ def _checkin_once(site: SiteConfig, client: ProfileClient, turnstile: str) -> Ch
     try:
         reward = client.do_checkin(turnstile)
     except ApiError as exc:
+        if exc.transient:
+            return CheckinResult(
+                site.name,
+                base_url,
+                "network_error",
+                f"签到请求暂时失败：{exc.message}",
+                detail=exc.payload,
+            )
         kind = client.classify(exc)
         if kind == "already_done":
             return CheckinResult(site.name, base_url, "already_done", exc.message, detail=exc.payload)

@@ -4,19 +4,14 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 from typing import Any
 
 import accounts_store
 
 from ..base import CheckinResult, QueryStatus, SiteConfig, SiteProfile, normalize_base_url
 
-SCRIPT_DIR = Path(__file__).resolve().parent.parent.parent
-
 
 def _load_runner():
-    sys.path.insert(0, str(SCRIPT_DIR))
     from browser import script_runner
     return script_runner
 

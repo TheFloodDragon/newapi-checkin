@@ -245,31 +245,18 @@ def _patch_windows_asyncio_finalizers() -> None:
     _wrap(base_subprocess.BaseSubprocessTransport)
 
 
-def run_sync(coro: Any) -> Any:
-    """同步执行一个 async 协程，并规避 Windows ProactorEventLoop 的清理警告。
+def _run_loop(loop: asyncio.AbstractEventLoop, coro: Any) -> Any:
+    """在给定 loop 上运行协程，并在 finally 中做优雅清理。
 
-    Windows 上 Camoufox/Playwright 子进程退出时，asyncio 在 __del__ 里清理
-    管道传输会抛 "I/O operation on closed pipe" / "unclosed transport"。
-    通过手动创建 loop + 退出前 sleep 让传输优雅关闭，避免污染日志。
+    适合在独立线程里调用（该线程已通过 asyncio.set_event_loop(loop) 绑定）。
+    Windows 专有清理逻辑（sleep + shutdown_asyncgens）同样在此执行。
     """
     import sys as _sys
 
-    _patch_windows_asyncio_finalizers()
-    if _sys.platform == "win32":
-        # Proactor 事件循环支持子进程（Camoufox 需要）
-        try:
-            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-        except Exception:
-            pass
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
     try:
-        result = loop.run_until_complete(coro)
-        return result
+        return loop.run_until_complete(coro)
     finally:
-        # 优雅清理：取消残留 task（如 Playwright Connection.run），关闭 asyncgens，
-        # 再给事件循环一点时间处理子进程传输关闭，避免 __del__ 阶段的管道错误日志。
+        # 取消所有残留 task（例如 Playwright Connection.run）
         try:
             pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
             for t in pending:
@@ -278,10 +265,12 @@ def run_sync(coro: Any) -> Any:
                 loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
         except Exception:
             pass
-        try:
-            loop.run_until_complete(asyncio.sleep(0.3))
-        except Exception:
-            pass
+        # Windows：给传输一点时间优雅关闭，避免 __del__ 阶段的管道错误日志
+        if _sys.platform == "win32":
+            try:
+                loop.run_until_complete(asyncio.sleep(0.3))
+            except Exception:
+                pass
         try:
             loop.run_until_complete(loop.shutdown_asyncgens())
         except Exception:
@@ -290,6 +279,67 @@ def run_sync(coro: Any) -> Any:
             loop.close()
         except Exception:
             pass
+
+
+def run_sync(coro: Any) -> Any:
+    """同步执行一个 async 协程，并规避 Windows ProactorEventLoop 的清理警告。
+
+    Windows 上 Camoufox/Playwright 子进程退出时，asyncio 在 __del__ 里清理
+    管道传输会抛 "I/O operation on closed pipe" / "unclosed transport"。
+    通过手动创建 loop + 退出前 sleep 让传输优雅关闭，避免污染日志。
+
+    当调用线程已有一个正在运行的 event loop（例如 Jupyter / FastAPI / GUI 框架）时，
+    直接 loop.run_until_complete() 会抛 RuntimeError。此时把协程提交到一个独立线程
+    的新 loop 里执行，确保阻塞等待完成后再返回结果；任何异常都会原样重新抛出。
+    协程仅被调度一次，不会泄漏。
+    """
+    import concurrent.futures
+    import sys as _sys
+
+    _patch_windows_asyncio_finalizers()
+
+    # 探测当前线程是否已有运行中的 event loop
+    _running_loop: asyncio.AbstractEventLoop | None = None
+    try:
+        _running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _running_loop = None
+
+    if _running_loop is not None:
+        # 当前线程在 loop 内 —— 必须在独立线程里跑新 loop，否则会死锁。
+        # 用 concurrent.futures.Future 把结果/异常传回主线程。
+        result_future: concurrent.futures.Future = concurrent.futures.Future()
+
+        def _thread_target() -> None:
+            if _sys.platform == "win32":
+                try:
+                    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+                except Exception:
+                    pass
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            try:
+                value = _run_loop(new_loop, coro)
+                result_future.set_result(value)
+            except BaseException as exc:  # noqa: BLE001
+                result_future.set_exception(exc)
+
+        t = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        t.submit(_thread_target)
+        t.shutdown(wait=True)
+        # 重新抛出在子线程中捕获的异常（含原始 traceback）
+        return result_future.result()
+
+    # 普通路径：当前线程没有运行中的 event loop
+    if _sys.platform == "win32":
+        try:
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+        except Exception:
+            pass
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    return _run_loop(loop, coro)
 
 
 def quota_to_usd(value: Any) -> str:

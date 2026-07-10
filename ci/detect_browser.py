@@ -8,29 +8,22 @@
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
-CHECKIN_DIR = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(CHECKIN_DIR))
+import accounts_store
 
 need = False
-try:
-    import accounts_store
-
-    for acc in accounts_store.load_unified_accounts():
-        enabled = accounts_store.parse_enabled(acc.get("enabled"), True)
-        if not enabled:
-            continue
-        auth_method = str(acc.get("auth_method") or "").strip().lower()
-        checkin_action = str(acc.get("checkin_action") or "").strip().lower()
-        old_mode = str(acc.get("checkin_mode") or acc.get("mode") or "").strip().lower()
-        if auth_method in {"browser", "oauth"} or checkin_action == "relogin" or old_mode == "browser_oauth":
-            need = True
-            break
-except Exception:
-    pass
+for acc in accounts_store.load_unified_accounts():
+    enabled = accounts_store.parse_enabled(acc.get("enabled"), True)
+    if not enabled:
+        continue
+    auth_method = str(acc.get("auth_method") or "").strip().lower()
+    checkin_action = str(acc.get("checkin_action") or "").strip().lower()
+    old_mode = str(acc.get("checkin_mode") or acc.get("mode") or "").strip().lower()
+    if auth_method in {"browser", "oauth"} or checkin_action in {"relogin", "browser_script"} or old_mode == "browser_oauth":
+        need = True
+        break
 
 print("true" if need else "false")

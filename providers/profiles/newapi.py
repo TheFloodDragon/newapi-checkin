@@ -37,7 +37,6 @@ from ..base import (
     extract_message,
     http_request,
     normalize_base_url,
-    normalize_cookie,
     parse_json,
     payload_code,
     strip_session_cookie,
@@ -85,7 +84,13 @@ class NewApiClient(ProfileClient):
             if body is None:
                 body = b"{}"
 
-        payload = http_request(url, method=method, headers=headers, body=body)
+        payload = http_request(
+            url,
+            method=method,
+            headers=headers,
+            body=body,
+            proxy=self.site.proxy,
+        )
         if isinstance(payload, dict) and payload.get("success") is False:
             raise ApiError(None, payload, extract_message(payload))
         return payload
@@ -238,7 +243,6 @@ class NewApiProfile(SiteProfile):
             return None
 
         try:
-            sys.path.insert(0, str(SCRIPT_DIR))
             from browser import session as browser_session
         except Exception as exc:
             print(f"[newapi:{site.name}] 加载 browser_session 失败：{exc}", file=sys.stderr, flush=True)

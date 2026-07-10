@@ -20,13 +20,12 @@ import traceback
 from typing import Any
 
 try:
-    from PySide6.QtCore import Qt, QTimer, QThread, QThreadPool, QRunnable, QMetaObject, QObject, Signal, Slot
-    from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut, QDragEnterEvent, QDropEvent
+    from PySide6.QtCore import Qt, QTimer, QThread, QThreadPool, QRunnable, QObject, Signal
+    from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut
     from PySide6.QtWidgets import (
         QApplication,
         QAbstractItemView,
         QButtonGroup,
-        QCheckBox,
         QComboBox,
         QDialog,
         QFrame,
@@ -605,7 +604,6 @@ class BrowserWorker(QThread):
             return
 
         try:
-            sys.path.insert(0, str(SCRIPT_DIR))
             from browser import session as browser_session
             import asyncio
         except Exception as exc:
@@ -691,9 +689,7 @@ class BrowserWorker(QThread):
     def _run_site_checkin(self, log) -> None:
         """走统一入口 providers.run_checkin，对所有站点类型执行一次真实签到。"""
         try:
-            sys.path.insert(0, str(SCRIPT_DIR))
             import providers
-            from providers.base import SiteConfig
         except Exception as exc:
             self._fail("加载 providers 失败", exc)
             return
@@ -701,25 +697,7 @@ class BrowserWorker(QThread):
         p = self.params
         started = time.perf_counter()
         try:
-            site = SiteConfig(
-                name=p.get("name") or p["base_url"],
-                base_url=p["base_url"],
-                site_profile=p.get("site_profile") or p.get("type", "newapi"),
-                auth_method=p.get("auth_method", "cookie"),
-                checkin_action=p.get("checkin_action", "api"),
-                script=p.get("script", ""),
-                script_args=accounts_store.normalize_script_args(p.get("script_args")),
-                script_timeout=accounts_store.parse_script_timeout(p.get("script_timeout"), 120),
-                api_variant=p.get("api_variant", "auto"),
-                cookie=p.get("cookie", ""),
-                user_id=p.get("user_id", ""),
-                access_token=p.get("access_token", ""),
-                login_selector=p.get("login_selector", ""),
-                oauth_provider=p.get("oauth_provider", "linuxdo"),
-                oauth_account=p.get("oauth_account", accounts_store.DEFAULT_OAUTH_ACCOUNT),
-                browser_state=p.get("browser_state", ""),
-                proxy=p.get("proxy", ""),
-            )
+            site = accounts_store.site_config_from_mapping(p)
             log(f"开始测试签到（{site.site_profile} / {site.auth_method} / {site.checkin_action}）…")
             _bg_log("INFO", "测试签到开始", **self._context())
             result = providers.run_checkin(site)
@@ -747,9 +725,7 @@ class BrowserWorker(QThread):
     def _run_query(self, log) -> None:
         """走 providers.query_status 只读查询额度 + 签到状态。"""
         try:
-            sys.path.insert(0, str(SCRIPT_DIR))
             import providers
-            from providers.base import SiteConfig
         except Exception as exc:
             self._fail("加载 providers 失败", exc)
             return
@@ -757,25 +733,7 @@ class BrowserWorker(QThread):
         p = self.params
         started = time.perf_counter()
         try:
-            site = SiteConfig(
-                name=p.get("name") or p["base_url"],
-                base_url=p["base_url"],
-                site_profile=p.get("site_profile") or p.get("type", "newapi"),
-                auth_method=p.get("auth_method", "cookie"),
-                checkin_action=p.get("checkin_action", "api"),
-                script=p.get("script", ""),
-                script_args=accounts_store.normalize_script_args(p.get("script_args")),
-                script_timeout=accounts_store.parse_script_timeout(p.get("script_timeout"), 120),
-                api_variant=p.get("api_variant", "auto"),
-                cookie=p.get("cookie", ""),
-                user_id=p.get("user_id", ""),
-                access_token=p.get("access_token", ""),
-                login_selector=p.get("login_selector", ""),
-                oauth_provider=p.get("oauth_provider", "linuxdo"),
-                oauth_account=p.get("oauth_account", accounts_store.DEFAULT_OAUTH_ACCOUNT),
-                browser_state=p.get("browser_state", ""),
-                proxy=p.get("proxy", ""),
-            )
+            site = accounts_store.site_config_from_mapping(p)
             log(f"查询额度（{site.site_profile} / {site.auth_method} / {site.checkin_action}）…")
             _bg_log("INFO", "查询开始", **self._context())
             qs = providers.query_status(site)
@@ -837,29 +795,9 @@ class BatchTask(QRunnable):
         started = time.perf_counter()
         _bg_log("INFO", "独立任务开始", **context)
         try:
-            sys.path.insert(0, str(SCRIPT_DIR))
             import providers
-            from providers.base import SiteConfig
 
-            site = SiteConfig(
-                name=p.get("name") or p["base_url"],
-                base_url=p["base_url"],
-                site_profile=p.get("site_profile") or p.get("type", "newapi"),
-                auth_method=p.get("auth_method", "cookie"),
-                checkin_action=p.get("checkin_action", "api"),
-                script=p.get("script", ""),
-                script_args=accounts_store.normalize_script_args(p.get("script_args")),
-                script_timeout=accounts_store.parse_script_timeout(p.get("script_timeout"), 120),
-                api_variant=p.get("api_variant", "auto"),
-                cookie=p.get("cookie", ""),
-                user_id=p.get("user_id", ""),
-                access_token=p.get("access_token", ""),
-                login_selector=p.get("login_selector", ""),
-                oauth_provider=p.get("oauth_provider", "linuxdo"),
-                oauth_account=p.get("oauth_account", accounts_store.DEFAULT_OAUTH_ACCOUNT),
-                browser_state=p.get("browser_state", ""),
-                proxy=p.get("proxy", ""),
-            )
+            site = accounts_store.site_config_from_mapping(p)
 
             if self.action == "query":
                 qs = providers.query_status(site)

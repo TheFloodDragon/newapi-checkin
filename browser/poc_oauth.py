@@ -35,8 +35,8 @@ if hasattr(sys.stderr, "reconfigure"):
 CHECKIN_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(CHECKIN_DIR))
 
-from browser import session as browser_session
-from browser.session import BrowserSessionError
+from browser import session as browser_session  # noqa: E402  (需先 sys.path.insert)
+from browser.session import BrowserSessionError  # noqa: E402
 
 
 def _log(msg: str) -> None:

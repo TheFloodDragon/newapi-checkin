@@ -18,9 +18,7 @@ ACCOUNTS.json 支持以下任一形态：
 
 from __future__ import annotations
 
-import base64
 import contextlib
-import gzip
 import json
 import os
 import tempfile
@@ -113,10 +111,7 @@ def _file_lock(path: Path, *, timeout: float = 30.0):
     We hold an exclusive lock on a sibling ``<name>.lock`` file for the entire
     RMW so those operations serialize.
 
-    Best-effort: if locking is unavailable (unsupported platform, permission
-    issue), we log nothing and proceed without the lock rather than blocking
-    the whole run -- correctness degrades to the previous behaviour, it does
-    not get worse.
+    若无法在超时内获得锁则显式失败，绝不在无锁状态继续读-改-写，避免并发覆盖。
     """
     # Reentrancy: the same thread may nest lock scopes (e.g. update_* -> save_accounts).
     # A plain OS file lock would self-deadlock on Windows (msvcrt), so we serialize
@@ -134,6 +129,8 @@ def _file_lock(path: Path, *, timeout: float = 30.0):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 handle = open(lock_path, "a+")  # noqa: SIM115 - lifetime tied to context
                 locked = _acquire_lock(handle, timeout=timeout)
+                if not locked:
+                    raise ConfigError(f"等待配置文件锁超时：{lock_path.name}")
                 _LOCK_STATE.local.handle = handle
                 _LOCK_STATE.local.locked = locked
             yield
@@ -202,6 +199,19 @@ def _release_lock(handle) -> None:
     except ImportError:
         pass
 
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """公开的共享原子写入口。"""
+    _atomic_write_text(path, text)
+
+
+@contextlib.contextmanager
+def file_lock(path: Path, *, timeout: float = 30.0):
+    """公开的共享文件锁入口，供额度状态和结果文件复用。"""
+    with _file_lock(path, timeout=timeout):
+        yield
+
+
 # 第三方 OAuth 提供商（OAuth 登录 / relogin 使用），登录态跨站点共享，存 ACCOUNTS.json 顶层 oauth_states
 KNOWN_OAUTH_PROVIDERS = ("linuxdo", "github")
 DEFAULT_OAUTH_ACCOUNT = "default"
@@ -213,11 +223,11 @@ OAUTH_PROVIDER_DOMAINS = {
 
 
 def _state_domains(state_text: str) -> set[str]:
-    """从 base64(gzip(storage_state)) 文本提取 cookie 域名集合（纯标准库，容错）。"""
+    """从经过严格校验的 storage_state 提取 cookie 域名集合。"""
     try:
-        packed = base64.b64decode("".join((state_text or "").split()).encode("ascii"))
-        raw = gzip.decompress(packed)
-        data = json.loads(raw.decode("utf-8"))
+        from browser.state import decode_state
+
+        data = decode_state(state_text)
     except Exception:
         return set()
     domains: set[str] = set()
@@ -455,7 +465,11 @@ def _account_entries(path: Path | None = None) -> list[dict[str, Any]]:
             entry.update(value)
             entries.append(entry)
     elif isinstance(raw, list):
-        entries = [item.copy() for item in raw if isinstance(item, dict)]
+        if any(not isinstance(item, dict) for item in raw):
+            raise ConfigError("accounts 数组中的每一项都必须是对象")
+        entries = [item.copy() for item in raw]
+    else:
+        raise ConfigError("accounts 顶层必须是数组、对象映射或包含 accounts 的对象")
     return entries
 
 
@@ -483,6 +497,45 @@ def _normalize_account_entry(entry: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def site_config_from_mapping(
+    data: dict[str, Any],
+    *,
+    overrides: dict[str, Any] | None = None,
+):
+    """把任意兼容配置映射规范化为唯一的 ``SiteConfig`` 构造路径。"""
+    from providers.base import SiteConfig
+
+    raw = dict(data or {})
+    if overrides:
+        raw.update(overrides)
+    row = _normalize_account_entry(raw)
+    base_url = normalize_base_url(str(row.get("base_url") or row.get("url") or ""))
+    return SiteConfig(
+        name=str(row.get("name") or base_url),
+        base_url=base_url,
+        site_profile=str(row.get("site_profile") or "newapi"),
+        auth_method=str(row.get("auth_method") or "cookie"),
+        checkin_action=str(row.get("checkin_action") or "api"),
+        script=str(row.get("script") or ""),
+        script_args=normalize_script_args(row.get("script_args")),
+        script_timeout=parse_script_timeout(row.get("script_timeout"), 120),
+        api_variant=str(row.get("api_variant") or "auto"),
+        cookie=str(row.get("cookie") or ""),
+        user_id=str(row.get("user_id") or row.get("new_api_user") or ""),
+        access_token=str(row.get("access_token") or row.get("authorization") or ""),
+        cookie_file=str(row.get("cookie_file") or row.get("token_file") or ""),
+        browser_state=str(row.get("browser_state") or ""),
+        browser_profile=str(row.get("browser_profile") or ".browser_profile"),
+        login_selector=str(row.get("login_selector") or ""),
+        oauth_provider=normalize_oauth_provider(row.get("oauth_provider")) or "linuxdo",
+        oauth_account=normalize_oauth_account(row.get("oauth_account") or row.get("oauth_account_id")),
+        proxy=str(row.get("proxy") or ""),
+        referer_path=str(row.get("referer_path") or "/profile"),
+        enabled=parse_enabled(row.get("enabled"), True),
+        auto_refresh_cookie=parse_enabled(row.get("auto_refresh_cookie"), True),
+    )
+
+
 def load_raw_sites(path: Path | None = None) -> list[dict[str, Any]]:
     """读取 sites.json，返回站点配置数组（不含凭据）。"""
     path = path or SITES_CONFIG_PATH
@@ -498,15 +551,16 @@ def load_raw_sites(path: Path | None = None) -> list[dict[str, Any]]:
 # ── 共享 OAuth 登录态（linux.do / github，跨 relogin 站点共享）──────────────────
 
 def _read_full(path: Path | None = None) -> dict[str, Any]:
-    """读取整份 ACCOUNTS.json 为 dict（非 dict 或缺失返回 {}）。"""
+    """读取整份 ACCOUNTS.json 为 dict；损坏配置必须显式失败。"""
     path = path or ACCOUNTS_PATH
     if not path.exists():
         return {}
-    try:
-        raw = _read_json_file(path, what="accounts")
-    except Exception:
-        return {}
-    return raw if isinstance(raw, dict) else {}
+    raw = _read_json_file(path, what="accounts")
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, list):
+        return {"accounts": raw}
+    raise ConfigError("accounts 顶层必须是数组或对象")
 
 
 def _normalize_oauth_state_entry(data: Any) -> dict[str, Any]:
@@ -585,8 +639,17 @@ def oauth_state_text(provider: str, account: str = DEFAULT_OAUTH_ACCOUNT, path: 
     return str(oauth_account_state(provider, account, path).get("state") or "")
 
 
+def _document_metadata(path: Path) -> dict[str, Any]:
+    """保留 ACCOUNTS.json 顶层未知元数据，避免局部更新时丢失。"""
+    full = _read_full(path)
+    if not isinstance(full, dict):
+        return {}
+    return {key: value for key, value in full.items() if key not in {"accounts", "oauth_states"}}
+
+
 def _write_accounts_with_oauth(path: Path, accounts: list[dict[str, Any]], oauth_states: dict[str, dict[str, Any]]) -> None:
-    payload: dict[str, Any] = {"accounts": accounts}
+    payload: dict[str, Any] = _document_metadata(path)
+    payload["accounts"] = accounts
     oauth = normalize_oauth_states(oauth_states)
     if oauth:
         payload["oauth_states"] = oauth
@@ -675,7 +738,11 @@ def load_accounts(path: Path | None = None) -> dict[str, dict[str, Any]]:
             entry.update(value)
             entries.append(entry)
     elif isinstance(raw, list):
-        entries = [item for item in raw if isinstance(item, dict)]
+        if any(not isinstance(item, dict) for item in raw):
+            raise ConfigError("accounts 数组中的每一项都必须是对象")
+        entries = list(raw)
+    else:
+        raise ConfigError("accounts 顶层必须是数组、对象映射或包含 accounts 的对象")
 
     index: dict[str, dict[str, Any]] = {}
     for entry in entries:
@@ -764,7 +831,19 @@ _PERSIST_ORDER = (
     "access_token",
     "cookie",
 )
-_PERSIST_OPTIONAL = ("cookie_file", "referer_path", "browser_profile", "login_selector", "proxy")
+_PERSIST_OPTIONAL = (
+    "cookie_file",
+    "referer_path",
+    "browser_profile",
+    "login_selector",
+    "proxy",
+    "auto_refresh_cookie",
+)
+_KNOWN_ACCOUNT_FIELDS = set(CONFIG_FIELDS) | set(CRED_FIELDS) | {
+    "url",
+    "authorization",
+    "new_api_user",
+}
 
 
 def _account_to_persist(row: dict[str, Any]) -> dict[str, Any]:
@@ -774,7 +853,11 @@ def _account_to_persist(row: dict[str, Any]) -> dict[str, Any]:
     - OAuth 登录 / relogin 站点：写 oauth_provider + oauth_account；
     - relogin 站点不落盘 browser_state；非 relogin 的 browser/oauth 可保存站点级 browser_state。
     """
-    out: dict[str, Any] = {}
+    out: dict[str, Any] = {
+        str(key): value
+        for key, value in row.items()
+        if key not in _KNOWN_ACCOUNT_FIELDS and not str(key).startswith("__")
+    }
     needs_oauth = row.get("auth_method") == "oauth" or row.get("checkin_action") == "relogin"
     for field in _PERSIST_ORDER:
         if field == "enabled":
@@ -845,10 +928,7 @@ def _is_legacy_file(path: Path) -> bool:
     - OAuth 登录 / relogin 站点缺 oauth_provider 或 oauth_account；
     - 顶层 oauth_states 仍是旧 provider.state 格式。
     """
-    try:
-        raw = _read_json_file(path, what="accounts")
-    except Exception:
-        return False
+    raw = _read_json_file(path, what="accounts")
     if isinstance(raw, dict) and isinstance(raw.get("oauth_states"), dict):
         for data in raw["oauth_states"].values():
             if isinstance(data, dict) and "state" in data:
@@ -906,13 +986,17 @@ def _maybe_migrate_accounts_file(path: Path | None, merged: list[dict[str, Any]]
     if not _is_legacy_file(target):
         return
     try:
-        existing_oauth = load_oauth_states(target)
-        oauth_states = _collect_oauth_states(merged, existing_oauth)
-        account_list = [_account_to_persist(row) for row in merged]
-        payload: dict[str, Any] = {"accounts": account_list}
-        if oauth_states:
-            payload["oauth_states"] = oauth_states
-        _atomic_write_text(target, json.dumps(payload, ensure_ascii=False, indent=2))
+        with _file_lock(target):
+            if not _is_legacy_file(target):
+                return
+            existing_oauth = load_oauth_states(target)
+            oauth_states = _collect_oauth_states(merged, existing_oauth)
+            account_list = [_account_to_persist(row) for row in merged]
+            payload: dict[str, Any] = _document_metadata(target)
+            payload["accounts"] = account_list
+            if oauth_states:
+                payload["oauth_states"] = oauth_states
+            _atomic_write_text(target, json.dumps(payload, ensure_ascii=False, indent=2))
         print(f"[INFO] 已将 {target.name} 迁移为新格式（三维字段 + 共享 oauth_states）")
     except Exception as exc:
         print(f"[WARN] 自动迁移 {target.name} 失败：{exc}")
@@ -1068,10 +1152,32 @@ def save_accounts(
             oauth_states = normalize_oauth_states(oauth_states)
 
         persisted = [_account_to_persist(_normalize_account_entry(entry)) for entry in account_list if isinstance(entry, dict)]
-        payload: dict[str, Any] = {"accounts": persisted}
+        payload: dict[str, Any] = _document_metadata(path)
+        payload["accounts"] = persisted
         if oauth_states:
             payload["oauth_states"] = oauth_states
         _atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _unique_account_index(entries: list[dict[str, Any]], name: str, base_url: str) -> int | None:
+    """按规范化 base_url + name 定位唯一账号；歧义时拒绝写入。"""
+    name_key = _norm_key(str(name or ""))
+    base_key = _norm_key(normalize_base_url(str(base_url or "")))
+    matches: list[int] = []
+    for index, entry in enumerate(entries):
+        entry_name = _norm_key(str(entry.get("name") or ""))
+        entry_base = _norm_key(normalize_base_url(str(entry.get("base_url") or entry.get("url") or "")))
+        if base_key and name_key:
+            matched = entry_base == base_key and entry_name == name_key
+        elif base_key:
+            matched = entry_base == base_key
+        else:
+            matched = bool(name_key and entry_name == name_key)
+        if matched:
+            matches.append(index)
+    if len(matches) > 1:
+        raise ConfigError(f"账号身份不唯一，拒绝更新：name={name!r}, base_url={base_url!r}")
+    return matches[0] if matches else None
 
 
 def update_account_auth_data(
@@ -1087,23 +1193,21 @@ def update_account_auth_data(
     if not token and not state_text:
         return False
     path = path or ACCOUNTS_PATH
-    name_key = _norm_key(str(name or ""))
-    base_key = _norm_key(normalize_base_url(str(base_url or "")))
     with _file_lock(path):
         entries = _account_entries(path)
         if not entries:
             return False
+        index = _unique_account_index(entries, name, base_url)
+        if index is None:
+            return False
+        entry = entries[index]
         changed = False
-        for entry in entries:
-            entry_name = _norm_key(str(entry.get("name") or ""))
-            entry_base = _norm_key(normalize_base_url(str(entry.get("base_url") or entry.get("url") or "")))
-            if (name_key and entry_name == name_key) or (base_key and entry_base == base_key):
-                if token and str(entry.get("access_token") or "").strip() != token:
-                    entry["access_token"] = token
-                    changed = True
-                if state_text and str(entry.get("browser_state") or "").strip() != state_text:
-                    entry["browser_state"] = state_text
-                    changed = True
+        if token and str(entry.get("access_token") or "").strip() != token:
+            entry["access_token"] = token
+            changed = True
+        if state_text and str(entry.get("browser_state") or "").strip() != state_text:
+            entry["browser_state"] = state_text
+            changed = True
         if not changed:
             return False
         save_accounts(entries, path=path, oauth_states=load_oauth_states(path))
@@ -1125,22 +1229,17 @@ def update_account_access_token(
     if not token:
         return False
     path = path or ACCOUNTS_PATH
-    name_key = _norm_key(str(name or ""))
-    base_key = _norm_key(normalize_base_url(str(base_url or "")))
     with _file_lock(path):
         entries = _account_entries(path)
         if not entries:
             return False
-        changed = False
-        for entry in entries:
-            entry_name = _norm_key(str(entry.get("name") or ""))
-            entry_base = _norm_key(normalize_base_url(str(entry.get("base_url") or entry.get("url") or "")))
-            if (name_key and entry_name == name_key) or (base_key and entry_base == base_key):
-                if str(entry.get("access_token") or "").strip() != token:
-                    entry["access_token"] = token
-                    changed = True
-        if not changed:
+        index = _unique_account_index(entries, name, base_url)
+        if index is None:
             return False
+        entry = entries[index]
+        if str(entry.get("access_token") or "").strip() == token:
+            return False
+        entry["access_token"] = token
         save_accounts(entries, path=path, oauth_states=load_oauth_states(path))
     return True
 
@@ -1149,4 +1248,5 @@ def save_sites(sites: list[dict[str, Any]], path: Path | None = None) -> None:
     """以 {"sites": [...]} 形态写回 sites.json（GUI 使用）。"""
     path = path or SITES_CONFIG_PATH
     payload = {"sites": sites}
-    _atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
+    with _file_lock(path):
+        _atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))

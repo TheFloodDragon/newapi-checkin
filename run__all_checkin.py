@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 import accounts_store
-from mask_utils import mask_secrets
+from mask_utils import mask_secrets, sanitize_data
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -40,12 +40,15 @@ RESULTS_DIR = SCRIPT_DIR / "results"
 RESULT_JSON_PATH = RESULTS_DIR / "checkin_result.json"
 OLD_NEWAPI_SCRIPTS = {"elysiver_checkin.py", "chybenzun_checkin.py"}
 OK_STATUSES = {"success", "already_done"}
+VALID_RESULT_STATUSES = OK_STATUSES | {
+    "need_login",
+    "need_verification",
+    "need_config",
+    "network_error",
+    "error",
+}
 QUOTA_UNIT = 500_000  # New API 内部 quota 与 USD 的换算系数：quota / 500000 = $
 # 新三维字段：站点适配器 / 登录方式 / 签到方式
-DEFAULT_PROFILE = "newapi"
-KNOWN_PROFILES = {"newapi", "sub2api"}
-KNOWN_AUTH_METHODS = {"access_token", "cookie", "browser", "oauth"}
-KNOWN_ACTIONS = {"api", "relogin", "visit", "browser_script"}
 FLOW_LABELS = {
     "api": "接口签到",
     "visit": "访问保活",
@@ -71,6 +74,7 @@ class CheckinTask:
     # the whole ThreadPoolExecutor shutdown until the CI job-level timeout. A
     # per-task timeout guarantees the batch always makes progress.
     timeout: float = 180.0
+    worker_protocol: bool = False
 
 
 @dataclass
@@ -81,38 +85,8 @@ class TaskResult:
     started_at: datetime | None = None
     ended_at: datetime | None = None
     duration: float = 0.0
-
-
-def normalize_base_url(value: str) -> str:
-    value = value.strip().rstrip("/")
-    if value and not value.startswith(("http://", "https://")):
-        value = "https://" + value
-    return value
-
-
-def load_config_sites(config_path: Path) -> list[dict[str, Any]]:
-    if not config_path.exists():
-        return []
-    raw = json.loads(config_path.read_text(encoding="utf-8-sig"))
-    raw_sites = raw.get("sites", []) if isinstance(raw, dict) else raw
-    if not isinstance(raw_sites, list):
-        raise ValueError("sites.json 必须是数组，或包含 sites 数组的对象。")
-    return [site for site in raw_sites if isinstance(site, dict)]
-
-
-def normalize_profile(value: Any) -> str:
-    text = str(value or DEFAULT_PROFILE).strip().lower()
-    return text if text in KNOWN_PROFILES else DEFAULT_PROFILE
-
-
-def normalize_auth_method(value: Any) -> str:
-    text = str(value or "cookie").strip().lower()
-    return text if text in KNOWN_AUTH_METHODS else "cookie"
-
-
-def normalize_action(value: Any) -> str:
-    text = str(value or "api").strip().lower()
-    return text if text in KNOWN_ACTIONS else "api"
+    diagnostics: str = ""
+    worker_protocol: bool = False
 
 
 def build_site_tasks() -> list[CheckinTask]:
@@ -120,27 +94,23 @@ def build_site_tasks() -> list[CheckinTask]:
     if not CHECKIN_SCRIPT.exists():
         return []
 
-    try:
-        sites = accounts_store.load_unified_accounts(sites_path=SITES_CONFIG_PATH)
-    except Exception as exc:
-        print(f"[WARN] 读取统一配置失败：{exc}")
-        return []
+    sites = accounts_store.load_unified_accounts(sites_path=SITES_CONFIG_PATH)
 
     tasks: list[CheckinTask] = []
     for site in sites:
-        base_url = normalize_base_url(str(site.get("base_url") or site.get("url") or ""))
+        site_config = accounts_store.site_config_from_mapping(site)
+        base_url = site_config.base_url
         if not base_url:
             continue
 
-        name = str(site.get("name") or base_url)
-        site_profile = normalize_profile(site.get("site_profile") or site.get("type") or site.get("provider"))
-        auth_method = normalize_auth_method(site.get("auth_method"))
-        checkin_action = normalize_action(site.get("checkin_action"))
-        enabled = accounts_store.parse_enabled(site.get("enabled"), True)
-        if not enabled:
+        name = site_config.name
+        site_profile = site_config.site_profile
+        auth_method = site_config.auth_method
+        checkin_action = site_config.checkin_action
+        if not site_config.enabled:
             continue
-        oauth_provider = accounts_store.normalize_oauth_provider(site.get("oauth_provider")) or "linuxdo"
-        oauth_account = accounts_store.normalize_oauth_account(site.get("oauth_account") or site.get("oauth_account_id"))
+        oauth_provider = site_config.oauth_provider
+        oauth_account = site_config.oauth_account
 
         command = [
             sys.executable, str(CHECKIN_SCRIPT),
@@ -149,6 +119,7 @@ def build_site_tasks() -> list[CheckinTask]:
             "--site-profile", site_profile,
             "--auth-method", auth_method,
             "--checkin-action", checkin_action,
+            "--worker",
         ]
         api_variant = str(site.get("api_variant") or "auto").strip().lower()
         if api_variant:
@@ -168,21 +139,21 @@ def build_site_tasks() -> list[CheckinTask]:
 
         if cookie_file:
             command.extend(["--token-file", cookie_file])
+        env_values: dict[str, str] = {}
         if cookie:
-            command.extend(["--cookie", cookie])
+            env_values["CHECKIN_COOKIE"] = cookie
         if access_token:
-            command.extend(["--access-token", access_token])
+            env_values["CHECKIN_ACCESS_TOKEN"] = access_token
         if user_id:
-            command.extend(["--user-id", user_id])
+            env_values["CHECKIN_USER_ID"] = user_id
         if auth_method == "oauth" or checkin_action == "relogin":
             command.extend(["--oauth-provider", oauth_provider, "--oauth-account", oauth_account])
         # 站点未配 proxy 时，回退到全局 CHECKIN_PROXY（CI 可从 Secret 注入住宅代理，
         # 用于绕过阿里云 WAF 对数据中心/CI 出口 IP 的持续风控）。
         proxy = str(site.get("proxy") or "").strip() or os.environ.get("CHECKIN_PROXY", "").strip()
         if proxy:
-            command.extend(["--proxy", proxy])
+            env_values["CHECKIN_PROXY"] = proxy
 
-        env: dict[str, str] | None = None
         if auth_method in {"browser", "oauth"}:
             browser_profile = str(site.get("browser_profile") or "").strip()
             login_selector = str(site.get("login_selector") or "").strip()
@@ -196,9 +167,10 @@ def build_site_tasks() -> list[CheckinTask]:
             else:
                 browser_state = str(site.get("browser_state") or "").strip()
             if browser_state:
-                env = {"CHECKIN_BROWSER_STATE": browser_state}
+                env_values["CHECKIN_BROWSER_STATE"] = browser_state
 
-        # Per-task timeout. Browser-driven flows (browser/oauth login, relogin,
+        env = env_values or None
+        # Browser-driven flows (browser/oauth login, relogin,
         # custom browser scripts) can spend minutes on WAF solving + navigation,
         # so they get a generous cap; plain HTTP flows finish fast. browser_script
         # honors its own script_timeout plus startup/teardown headroom.
@@ -211,7 +183,16 @@ def build_site_tasks() -> list[CheckinTask]:
             task_timeout = 120.0
 
         flow_label = f"{FLOW_LABELS.get(site_profile, site_profile)} / {FLOW_LABELS.get(auth_method, auth_method)} / {FLOW_LABELS.get(checkin_action, checkin_action)}"
-        tasks.append(CheckinTask(f"{flow_label}: {name}", command, env=env, site_key=base_url, timeout=task_timeout))
+        tasks.append(
+            CheckinTask(
+                f"{flow_label}: {name}",
+                command,
+                env=env,
+                site_key=base_url,
+                timeout=task_timeout,
+                worker_protocol=True,
+            )
+        )
     return tasks
 
 
@@ -265,9 +246,9 @@ def run_task(task: CheckinTask) -> TaskResult:
         partial_err = exc.stderr or ""
         if isinstance(partial_err, bytes):
             partial_err = partial_err.decode("utf-8", "replace")
-        output = partial
+        diagnostics = partial
         if partial_err:
-            output = output + ("\n" if output else "") + partial_err
+            diagnostics = diagnostics + ("\n" if diagnostics else "") + partial_err
         timeout_line = json.dumps(
             {
                 "site": task.name,
@@ -277,28 +258,36 @@ def run_task(task: CheckinTask) -> TaskResult:
             },
             ensure_ascii=False,
         )
-        output = (output + ("\n" if output else "")) + timeout_line
         return TaskResult(
             task.name,
             124,  # conventional timeout exit code
-            output.rstrip(),
+            timeout_line,
             started_at=started_at,
             ended_at=ended_at,
             duration=time.perf_counter() - start_perf,
+            diagnostics=diagnostics.rstrip(),
+            worker_protocol=task.worker_protocol,
         )
     ended_at = datetime.now()
-    output = completed.stdout
-    if completed.stderr:
-        output = output + ("\n" if output else "") + completed.stderr
-    return TaskResult(task.name, completed.returncode, output.rstrip(), started_at=started_at, ended_at=ended_at, duration=time.perf_counter() - start_perf)
+    return TaskResult(
+        task.name,
+        completed.returncode,
+        completed.stdout.rstrip(),
+        started_at=started_at,
+        ended_at=ended_at,
+        duration=time.perf_counter() - start_perf,
+        diagnostics=completed.stderr.rstrip(),
+        worker_protocol=task.worker_protocol,
+    )
 
 
 def extract_json_payload(output: str) -> Any | None:
-    """从子任务输出中提取 JSON；允许 JSON 前面带有 [WARN] 等日志。"""
+    """返回 stdout 中最后一个可完整解码的 JSON 对象/数组。"""
     if not output.strip():
         return None
 
     decoder = json.JSONDecoder()
+    last: Any | None = None
     for index, char in enumerate(output):
         if char not in "[{":
             continue
@@ -307,16 +296,35 @@ def extract_json_payload(output: str) -> Any | None:
         except json.JSONDecodeError:
             continue
         if isinstance(candidate, (dict, list)):
-            return candidate
-    return None
+            last = candidate
+    return last
 
 
 def first_result_item(payload: Any) -> dict[str, Any]:
-    if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+    if isinstance(payload, list):
+        if len(payload) != 1 or not isinstance(payload[0], dict):
+            return {}
         return payload[0]
     if isinstance(payload, dict):
         return payload
     return {}
+
+
+def validate_result_item(item: dict[str, Any]) -> str:
+    """校验 worker 结果最小 schema，返回错误原因；空串表示有效。"""
+    if not item:
+        return "stdout 中没有有效结果对象"
+    missing = [key for key in ("site", "base_url", "status", "message") if key not in item]
+    if missing:
+        return f"结果缺少字段：{', '.join(missing)}"
+    status = str(item.get("status") or "")
+    if status not in VALID_RESULT_STATUSES:
+        return f"结果 status 无效：{status!r}"
+    if not isinstance(item.get("site"), str) or not isinstance(item.get("base_url"), str):
+        return "结果 site/base_url 必须是字符串"
+    if not isinstance(item.get("message"), str):
+        return "结果 message 必须是字符串"
+    return ""
 
 
 def is_blank(value: Any) -> bool:
@@ -483,17 +491,17 @@ def compact_status(status: str, returncode: int) -> str:
         return "需验证"
     if status == "need_config":
         return "需配置"
-    if status == "unknown" and returncode == 0:
-        return "成功"
+    if status == "network_error":
+        return "网络错误"
     if status == "unknown":
-        return "失败"
+        return "协议错误"
     if status == "error":
         return "失败"
     return status if status != "unknown" else "失败"
 
 
 def status_icon(status: str, returncode: int) -> str:
-    if status == "success" or (status == "unknown" and returncode == 0):
+    if status == "success":
         return "✅"
     if status == "already_done":
         return "🎁"
@@ -507,12 +515,36 @@ def status_icon(status: str, returncode: int) -> str:
 
 
 def task_result_to_summary(result: TaskResult) -> dict[str, Any]:
-    payload = extract_json_payload(result.output)
+    payload: Any | None
+    if result.worker_protocol:
+        try:
+            payload = json.loads(result.output.strip())
+        except (json.JSONDecodeError, TypeError):
+            payload = None
+    else:
+        payload = extract_json_payload(result.output)
     item = first_result_item(payload)
-    output_tail = result.output.strip().splitlines()[-1][:200] if result.output.strip() else "无输出"
+    protocol_error = validate_result_item(item)
+    diagnostic_source = result.diagnostics.strip() or result.output.strip()
+    output_tail = diagnostic_source.splitlines()[-1][:200] if diagnostic_source else "无输出"
+    if protocol_error:
+        item = {
+            "site": result.name,
+            "base_url": "",
+            "status": "error",
+            "message": f"子任务结果协议错误：{protocol_error}；诊断：{output_tail}",
+            "detail": {"protocol_error": protocol_error},
+        }
+    elif result.returncode != 0 and str(item.get("status")) in OK_STATUSES:
+        item = {
+            **item,
+            "status": "error",
+            "message": f"子任务退出码为 {result.returncode}，与成功结果不一致",
+        }
 
-    status = str(item.get("status") or "unknown")
-    message = str(item.get("message") or ("执行成功" if result.returncode == 0 else output_tail))
+    item = sanitize_data(item)
+    status = str(item.get("status") or "error")
+    message = str(item.get("message") or output_tail)
     site = str(item.get("site") or result.name)
     base_url = str(item.get("base_url") or "")
     detail = item.get("detail")
@@ -522,7 +554,7 @@ def task_result_to_summary(result: TaskResult) -> dict[str, Any]:
     label = compact_status(status, result.returncode)
     icon = status_icon(status, result.returncode)
     note = build_detail_note(status, message, detail)
-    ok = status in OK_STATUSES or (status == "unknown" and result.returncode == 0)
+    ok = status in OK_STATUSES and result.returncode == 0
 
     return {
         "site": site,
@@ -560,9 +592,10 @@ def print_result(result: TaskResult, verbose: bool = False) -> None:
     if summary.get("duration_seconds"):
         print(f"  耗时：{summary['duration_seconds']:.1f}s", flush=True)
     # 默认不打印完整原始输出（可能含 Cookie/token 回显）；仅在 verbose 或任务失败时打印，且经脱敏。
-    if result.output and (verbose or not summary["ok"]):
+    raw_output = "\n".join(part for part in (result.output, result.diagnostics) if part)
+    if raw_output and (verbose or not summary["ok"]):
         print("  原始输出：", flush=True)
-        print(textwrap.indent(mask_secrets(result.output), "    "), flush=True)
+        print(textwrap.indent(mask_secrets(raw_output), "    "), flush=True)
     print(flush=True)
 
 
@@ -587,7 +620,13 @@ def run_tasks(tasks: list[CheckinTask], workers: int = 0, verbose: bool = False)
             try:
                 result = future.result()
             except Exception as exc:
-                result = TaskResult(task.name, 1, f"任务异常：{exc}")
+                result = TaskResult(
+                    task.name,
+                    1,
+                    "",
+                    diagnostics=f"任务异常：{exc}",
+                    worker_protocol=task.worker_protocol,
+                )
             results.append(result)
             print_result(result, verbose=verbose)
     return results
@@ -598,15 +637,19 @@ def write_result_file(summaries: list[dict[str, Any]]) -> None:
     failed_count = sum(1 for item in summaries if not item["ok"])
     success_count = sum(1 for item in summaries if item["status"] == "success")
     already_done_count = sum(1 for item in summaries if item["status"] == "already_done")
-    payload = {
+    payload = sanitize_data({
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "total": len(summaries),
         "success_count": success_count,
         "already_done_count": already_done_count,
         "failed_count": failed_count,
         "results": summaries,
-    }
-    RESULT_JSON_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    })
+    with accounts_store.file_lock(RESULT_JSON_PATH):
+        accounts_store.atomic_write_text(
+            RESULT_JSON_PATH,
+            json.dumps(payload, ensure_ascii=False, indent=2),
+        )
 
 
 def parse_args() -> argparse.Namespace:

@@ -23,16 +23,18 @@ import json
 import random
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
 USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/130.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) "
+    "Gecko/20100101 Firefox/135.0"
 )
+
+IDEMPOTENT_METHODS = {"GET", "HEAD", "OPTIONS", "PUT", "DELETE"}
 
 SESSION_COOKIE_NAMES = {"session", "newapi_session", "new-api-session", "new_api_session"}
 
@@ -356,6 +358,21 @@ def unwrap_data(payload: Any) -> Any:
     return payload
 
 
+def _build_url_opener(proxy: str = "") -> urllib.request.OpenerDirector:
+    """构造不依赖进程隐式代理环境的 opener。"""
+    proxy = str(proxy or "").strip()
+    if not proxy:
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    parsed = urllib.parse.urlsplit(proxy)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        if parsed.scheme.startswith("socks"):
+            raise ApiError(None, None, "标准库 HTTP 客户端不支持 SOCKS 代理，请改用 http/https 代理。")
+        raise ApiError(None, None, "代理地址无效，必须是 http:// 或 https:// URL。")
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+    )
+
+
 def _http_request_once(
     url: str,
     *,
@@ -363,11 +380,13 @@ def _http_request_once(
     headers: dict[str, str],
     body: bytes | None,
     timeout: int,
+    proxy: str,
 ) -> Any:
     """单次 HTTP 请求并解析 JSON；HTTP 错误也尽量解析 body，统一抛 ApiError。"""
     req = urllib.request.Request(url, data=body, headers=headers, method=method.upper())
+    opener = _build_url_opener(proxy)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
+        with opener.open(req, timeout=timeout) as response:
             text = decode_response_body(response.read(), response.headers.get("content-encoding", ""))
             return parse_json(text)
     except urllib.error.HTTPError as exc:
@@ -401,19 +420,30 @@ def http_request(
     body: bytes | None = None,
     timeout: int = 30,
     max_attempts: int = RETRY_MAX_ATTEMPTS,
+    proxy: str = "",
+    retry_non_idempotent: bool = False,
 ) -> Any:
-    """发送 HTTP 请求并解析 JSON，对瞬时性错误做指数退避重试。
+    """发送 HTTP 请求并解析 JSON，对可安全重放的瞬时性错误做退避重试。
 
-    重试条件：HTTP 429/5xx，或网络层失败/超时（ApiError.status is None）。
-    不重试：4xx（除 429）、非 JSON 响应、Cloudflare 验证等确定性错误。
-    最终仍失败时，抛出最后一次的 ApiError，保持与旧版调用方一致。
+    默认仅重试幂等方法；POST/PATCH 等可能产生副作用的请求只执行一次，除非
+    调用方明确设置 ``retry_non_idempotent=True``。HTTP 429/5xx 与网络失败会被
+    标记为瞬时错误，4xx、非 JSON 和验证页不会重试。
     """
     headers = dict(headers or {})
-    attempts = max(1, max_attempts)
+    method_upper = method.upper()
+    retry_allowed = method_upper in IDEMPOTENT_METHODS or retry_non_idempotent
+    attempts = max(1, max_attempts) if retry_allowed else 1
     last_error: ApiError | None = None
     for attempt in range(attempts):
         try:
-            return _http_request_once(url, method=method, headers=headers, body=body, timeout=timeout)
+            return _http_request_once(
+                url,
+                method=method_upper,
+                headers=headers,
+                body=body,
+                timeout=timeout,
+                proxy=proxy,
+            )
         except ApiError as exc:
             last_error = exc
             if attempt >= attempts - 1 or not _is_retryable(exc):

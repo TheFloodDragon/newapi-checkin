@@ -28,14 +28,15 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
 import json
 import os
 import sys
 from pathlib import Path
-from typing import Any
 
 import accounts_store
 import providers
+from mask_utils import sanitize_data
 from providers.base import CheckinResult, SiteConfig
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -66,11 +67,7 @@ def run_site_checkin(site: SiteConfig, turnstile: str = "") -> CheckinResult:
 
 
 def load_sites(config_path: Path) -> list[SiteConfig]:
-    try:
-        raw_sites = accounts_store.load_unified_accounts(sites_path=config_path)
-    except Exception as exc:
-        print(f"[WARN] 读取 ACCOUNTS.json 失败，将回退到站点配置：{exc}")
-        raw_sites = accounts_store.load_raw_sites(config_path)
+    raw_sites = accounts_store.load_unified_accounts(sites_path=config_path)
 
     sites: list[SiteConfig] = []
     for item in raw_sites:
@@ -79,34 +76,17 @@ def load_sites(config_path: Path) -> list[SiteConfig]:
         base_url = normalize_base_url(str(item.get("base_url") or item.get("url") or ""))
         if not base_url:
             continue
-        name = str(item.get("name") or base_url)
-        enabled = accounts_store.parse_enabled(item.get("enabled"), True)
-        sites.append(
-            SiteConfig(
-                name=name,
-                base_url=base_url,
-                site_profile=providers.normalize_profile(item.get("site_profile") or item.get("type") or item.get("provider")),
-                auth_method=providers.normalize_auth_method(item.get("auth_method")),
-                checkin_action=providers.normalize_action(item.get("checkin_action")),
-                script=str(item.get("script") or ""),
-                script_args=accounts_store.normalize_script_args(item.get("script_args")),
-                script_timeout=accounts_store.parse_script_timeout(item.get("script_timeout"), 120),
-                api_variant=str(item.get("api_variant") or "auto"),
-                cookie=str(item.get("cookie") or ""),
-                user_id=str(item.get("user_id") or item.get("new_api_user") or ""),
-                access_token=str(item.get("access_token") or item.get("authorization") or ""),
-                cookie_file=str(item.get("cookie_file") or item.get("token_file") or ""),
-                enabled=enabled,
-                referer_path=str(item.get("referer_path") or "/profile"),
-                auto_refresh_cookie=bool(item.get("auto_refresh_cookie", True)),
-                browser_profile=str(item.get("browser_profile") or ".browser_profile"),
-                login_selector=str(item.get("login_selector") or ""),
-                oauth_provider=accounts_store.normalize_oauth_provider(item.get("oauth_provider")) or "linuxdo",
-                oauth_account=accounts_store.normalize_oauth_account(item.get("oauth_account") or item.get("oauth_account_id")),
-                browser_state=str(item.get("browser_state") or ""),
-                proxy=str(item.get("proxy") or ""),
-            )
+        site = accounts_store.site_config_from_mapping(
+            item,
+            overrides={
+                "name": str(item.get("name") or base_url),
+                "base_url": base_url,
+                "enabled": accounts_store.parse_enabled(item.get("enabled"), True),
+                "proxy": str(item.get("proxy") or "").strip()
+                or os.environ.get("CHECKIN_PROXY", "").strip(),
+            },
         )
+        sites.append(site)
     return sites
 
 
@@ -153,9 +133,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--login-selector", default="", help="旧兼容字段：OAuth 登录入口选择器（当前 relogin 不再使用）")
     parser.add_argument("--oauth-provider", default="linuxdo", choices=accounts_store.KNOWN_OAUTH_PROVIDERS, help="OAuth 提供商：linuxdo / github")
     parser.add_argument("--oauth-account", default=accounts_store.DEFAULT_OAUTH_ACCOUNT, help="OAuth 账号名（同一 provider 下多账号，默认 default）")
-    parser.add_argument("--proxy", default="", help="代理 URL（http/https/socks5）")
+    parser.add_argument("--proxy", default="", help="代理 URL（HTTP API 支持 http/https；浏览器流程可使用 socks5）")
     parser.add_argument("--turnstile", default="", help="如站点要求 Turnstile，可临时传入验证值")
     parser.add_argument("--workers", type=int, default=0, help="同时执行的最大任务数，默认最多 8 个")
+    parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
@@ -165,63 +146,80 @@ def _infer_auth_method(args: argparse.Namespace) -> str:
         return providers.normalize_auth_method(args.auth_method)
     if args.checkin_action in {"relogin", "browser_script"}:
         return "oauth"
-    if args.access_token:
+    if args.access_token or os.environ.get("CHECKIN_ACCESS_TOKEN", ""):
         return "access_token"
     return "cookie"
 
 
-def main() -> int:
-    args = parse_args()
+def _result_payload(result: CheckinResult) -> dict[str, object]:
+    return sanitize_data(result.__dict__)
+
+
+def _execute(args: argparse.Namespace) -> tuple[dict[str, object] | list[dict[str, object]], int]:
     try:
         script_args = json.loads(args.script_args or "{}")
         if not isinstance(script_args, dict):
             raise ValueError("--script-args 必须是 JSON 对象")
     except Exception as exc:
         result = CheckinResult("checkin", "", "need_config", f"解析 --script-args 失败：{exc}")
-        print(json.dumps(result.__dict__, ensure_ascii=False, indent=2))
-        return 2
+        return _result_payload(result), 2
 
     if args.base_url:
-        sites = [
-            SiteConfig(
-                name=args.name or args.base_url,
-                base_url=args.base_url,
-                site_profile=providers.normalize_profile(args.site_profile),
-                auth_method=_infer_auth_method(args),
-                checkin_action=providers.normalize_action(args.checkin_action),
-                script=args.script,
-                script_args=script_args,
-                script_timeout=accounts_store.parse_script_timeout(args.script_timeout, 120),
-                api_variant=args.api_variant,
-                cookie=args.cookie,
-                user_id=args.user_id,
-                access_token=args.access_token,
-                cookie_file=args.token_file,
-                browser_profile=args.browser_profile,
-                login_selector=args.login_selector,
-                oauth_provider=accounts_store.normalize_oauth_provider(args.oauth_provider) or "linuxdo",
-                oauth_account=accounts_store.normalize_oauth_account(args.oauth_account),
-                browser_state=os.environ.get("CHECKIN_BROWSER_STATE", ""),
-                proxy=args.proxy,
-            )
-        ]
+        raw_site = {
+            "name": args.name or args.base_url,
+            "base_url": args.base_url,
+            "site_profile": providers.normalize_profile(args.site_profile),
+            "auth_method": _infer_auth_method(args),
+            "checkin_action": providers.normalize_action(args.checkin_action),
+            "script": args.script,
+            "script_args": script_args,
+            "script_timeout": args.script_timeout,
+            "api_variant": args.api_variant,
+            "cookie": args.cookie or os.environ.get("CHECKIN_COOKIE", ""),
+            "user_id": args.user_id or os.environ.get("CHECKIN_USER_ID", ""),
+            "access_token": args.access_token or os.environ.get("CHECKIN_ACCESS_TOKEN", ""),
+            "cookie_file": args.token_file,
+            "browser_profile": args.browser_profile,
+            "login_selector": args.login_selector,
+            "oauth_provider": args.oauth_provider,
+            "oauth_account": args.oauth_account,
+            "browser_state": os.environ.get("CHECKIN_BROWSER_STATE", ""),
+            "proxy": args.proxy or os.environ.get("CHECKIN_PROXY", ""),
+        }
+        sites = [accounts_store.site_config_from_mapping(raw_site)]
     else:
         config_path = Path(args.config).resolve()
         try:
             sites = load_sites(config_path)
         except Exception as exc:
             result = CheckinResult("checkin", "", "error", f"读取配置失败：{exc}")
-            print(json.dumps(result.__dict__, ensure_ascii=False, indent=2))
-            return 2
+            return _result_payload(result), 2
         if not sites:
             result = CheckinResult("checkin", "", "need_config", f"未找到站点配置，请创建 {config_path}")
-            print(json.dumps(result.__dict__, ensure_ascii=False, indent=2))
-            return 0
+            return _result_payload(result), 0
 
     results = run_sites(sites, args.turnstile, args.workers)
-    print(json.dumps([result.__dict__ for result in results], ensure_ascii=False, indent=2))
+    payloads = [_result_payload(result) for result in results]
+    code = 0 if all(result.status in OK_STATUSES for result in results) else 2
+    if args.worker:
+        if len(payloads) != 1:
+            result = CheckinResult("checkin", "", "error", f"worker 模式要求且仅允许一个站点，实际为 {len(payloads)} 个")
+            return _result_payload(result), 2
+        return payloads[0], code
+    return payloads, code
 
-    return 0 if all(result.status in OK_STATUSES for result in results) else 2
+
+def main() -> int:
+    args = parse_args()
+    # worker stdout 是机器协议通道；所有诊断输出都重定向到 stderr。
+    stream = contextlib.redirect_stdout(sys.stderr) if args.worker else contextlib.nullcontext()
+    with stream:
+        payload, code = _execute(args)
+    if args.worker:
+        print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    else:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return code
 
 
 if __name__ == "__main__":

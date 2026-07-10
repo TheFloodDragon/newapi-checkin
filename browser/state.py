@@ -23,7 +23,9 @@ from __future__ import annotations
 import argparse
 import base64
 import gzip
+import io
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -35,36 +37,149 @@ if hasattr(sys.stderr, "reconfigure"):
 
 GITHUB_SECRET_LIMIT = 64 * 1024  # GitHub 单个 Secret 上限约 64KB
 
+# 压缩前（JSON 原始字节）上限：4 MB，足以容纳大量 cookie/localStorage
+_MAX_RAW_BYTES = 4 * 1024 * 1024
+# base64 后必须能放进 GitHub Secret；压缩包上限按 4:3 膨胀反推。
+_MAX_ENCODED_BYTES = GITHUB_SECRET_LIMIT
+_MAX_PACKED_BYTES = (GITHUB_SECRET_LIMIT // 4) * 3
+
+# encode_state 只生成标准 base64；解码时拒绝 URL-safe/混合字母表。
+_BASE64_RE = re.compile(r"^[A-Za-z0-9+/]+=*$")
+
 
 class BrowserStateError(Exception):
     """browser_state 编码/解码相关错误（供 provider 捕获）。"""
 
 
+def _validate_storage_state(data: Any) -> None:
+    """校验 storage_state 顶层结构及 cookies/origins/localStorage 基本类型。
+
+    只做类型/存在性检查，不校验具体字段语义，以保持对不同版本 Playwright 的兼容。
+    抛 BrowserStateError 说明不合规原因。
+    """
+    if not isinstance(data, dict):
+        raise BrowserStateError("storage_state 必须是 JSON 对象（dict）。")
+    if "cookies" not in data:
+        raise BrowserStateError("storage_state 缺少必要字段 'cookies'。")
+
+    cookies = data["cookies"]
+    if not isinstance(cookies, list):
+        raise BrowserStateError("storage_state.cookies 必须是数组。")
+    for i, c in enumerate(cookies):
+        if not isinstance(c, dict):
+            raise BrowserStateError(f"storage_state.cookies[{i}] 必须是对象。")
+        for required in ("name", "value", "domain", "path"):
+            if required not in c:
+                raise BrowserStateError(
+                    f"storage_state.cookies[{i}] 缺少必要字段 '{required}'。"
+                )
+        if any(not isinstance(c.get(key), str) for key in ("name", "value", "domain", "path")):
+            raise BrowserStateError(
+                f"storage_state.cookies[{i}] 的 name/value/domain/path 必须是字符串。"
+            )
+        for bool_key in ("httpOnly", "secure"):
+            if bool_key in c and not isinstance(c[bool_key], bool):
+                raise BrowserStateError(f"storage_state.cookies[{i}].{bool_key} 必须是布尔值。")
+        if "expires" in c and (isinstance(c["expires"], bool) or not isinstance(c["expires"], (int, float))):
+            raise BrowserStateError(f"storage_state.cookies[{i}].expires 必须是数字。")
+
+    origins = data.get("origins")
+    if origins is None:
+        return  # origins 是可选的
+    if not isinstance(origins, list):
+        raise BrowserStateError("storage_state.origins 必须是数组。")
+    for i, origin_entry in enumerate(origins):
+        if not isinstance(origin_entry, dict):
+            raise BrowserStateError(f"storage_state.origins[{i}] 必须是对象。")
+        if not isinstance(origin_entry.get("origin"), str):
+            raise BrowserStateError(f"storage_state.origins[{i}].origin 必须是字符串。")
+        ls = origin_entry.get("localStorage")
+        if ls is None:
+            continue
+        if not isinstance(ls, list):
+            raise BrowserStateError(
+                f"storage_state.origins[{i}].localStorage 必须是数组。"
+            )
+        for j, item in enumerate(ls):
+            if not isinstance(item, dict):
+                raise BrowserStateError(
+                    f"storage_state.origins[{i}].localStorage[{j}] 必须是对象。"
+                )
+            if not isinstance(item.get("name"), str) or not isinstance(
+                item.get("value"), str
+            ):
+                raise BrowserStateError(
+                    f"storage_state.origins[{i}].localStorage[{j}] "
+                    "的 name/value 必须是字符串。"
+                )
+
+
 def encode_state(storage_state: dict[str, Any]) -> str:
-    """把 Playwright storage_state dict 编码为可粘贴的 base64(gzip(json)) 文本。"""
+    """把 Playwright storage_state dict 编码为可粘贴的 base64(gzip(json)) 文本。
+
+    编码前校验输入结构，并检查编码结果不超过 GitHub Secret 上限。
+    """
+    _validate_storage_state(storage_state)
     raw = json.dumps(storage_state, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(raw) > _MAX_RAW_BYTES:
+        raise BrowserStateError(
+            f"storage_state 序列化后过大（{len(raw):,} 字节 > 上限 {_MAX_RAW_BYTES:,}），"
+            "请清理不必要的 cookie/localStorage 后重新捕获。"
+        )
     packed = gzip.compress(raw, compresslevel=9)
-    return base64.b64encode(packed).decode("ascii")
+    if len(packed) > _MAX_PACKED_BYTES:
+        raise BrowserStateError(
+            f"压缩后仍过大（{len(packed):,} 字节 > 上限 {_MAX_PACKED_BYTES:,}），"
+            "超出 GitHub Secret 存储限制，请减少登录站点数量或清理登录态后重试。"
+        )
+    encoded = base64.b64encode(packed).decode("ascii")
+    if len(encoded.encode("ascii")) > _MAX_ENCODED_BYTES:
+        raise BrowserStateError(
+            f"base64 登录态过大（{len(encoded):,} 字节 > 上限 {_MAX_ENCODED_BYTES:,}），"
+            "无法放入 GitHub Secret。"
+        )
+    return encoded
 
 
 def decode_state(text: str) -> dict[str, Any]:
     """把 base64(gzip(json)) 文本解码回 storage_state dict。失败抛 BrowserStateError。
 
     对旧版（tar.xz 打包 profile）格式给出明确升级提示。
+    严格校验：base64 合法性、压缩包大小、JSON schema。
     """
     text = (text or "").strip()
     if not text:
         raise BrowserStateError("登录态文本为空")
-    # 剔除粘贴时可能混入的空白/换行；非 ASCII 说明数据已损坏
+    # 剔除粘贴时可能混入的空白/换行
     text = "".join(text.split())
+
+    # 非 ASCII 说明数据已损坏
     try:
         ascii_bytes = text.encode("ascii")
     except UnicodeEncodeError as exc:
         raise BrowserStateError(
             "登录态文本含非 ASCII 字符，数据已损坏，请用「浏览器登录捕获」重新生成。"
         ) from exc
+
+    if len(ascii_bytes) > _MAX_ENCODED_BYTES:
+        raise BrowserStateError(
+            f"base64 登录态过大（{len(ascii_bytes):,} 字节 > 上限 {_MAX_ENCODED_BYTES:,}），拒绝处理。"
+        )
+
+    # 严格校验标准 base64 字符集和 padding
+    if not _BASE64_RE.match(text):
+        raise BrowserStateError(
+            "登录态文本含非法 base64 字符，数据已损坏，请用「浏览器登录捕获」重新生成。"
+        )
+    # 标准 base64 长度必须是 4 的倍数（已用 '=' 填充）
+    if len(text) % 4 != 0:
+        raise BrowserStateError(
+            "base64 文本长度不合规（非 4 的倍数），数据可能被截断，"
+            "请用「浏览器登录捕获」重新生成。"
+        )
+
     try:
-        packed = base64.b64decode(ascii_bytes)
+        packed = base64.b64decode(ascii_bytes, validate=True)
     except Exception as exc:
         raise BrowserStateError(f"base64 解码失败：{exc}") from exc
 
@@ -75,16 +190,33 @@ def decode_state(text: str) -> dict[str, Any]:
             "请用「浏览器登录捕获」重新生成 storage_state 登录态。"
         )
 
+    # 压缩包大小限制（防止 gzip bomb）
+    if len(packed) > _MAX_PACKED_BYTES:
+        raise BrowserStateError(
+            f"压缩数据过大（{len(packed):,} 字节 > 上限 {_MAX_PACKED_BYTES:,}），"
+            "拒绝处理，数据可能已损坏。"
+        )
+
     try:
-        raw = gzip.decompress(packed)
+        with gzip.GzipFile(fileobj=io.BytesIO(packed), mode="rb") as gz:
+            raw = gz.read(_MAX_RAW_BYTES + 1)
     except Exception as exc:
         raise BrowserStateError(f"gzip 解压失败（数据损坏或格式过旧）：{exc}") from exc
+
+    # 流式读取只允许上限 + 1 字节，避免 gzip bomb 在校验前占满内存。
+    if len(raw) > _MAX_RAW_BYTES:
+        raise BrowserStateError(
+            f"解压后数据过大（{len(raw):,} 字节 > 上限 {_MAX_RAW_BYTES:,}），"
+            "拒绝处理，数据可能已损坏。"
+        )
+
     try:
         data = json.loads(raw.decode("utf-8"))
     except Exception as exc:
         raise BrowserStateError(f"JSON 解析失败：{exc}") from exc
-    if not isinstance(data, dict) or "cookies" not in data:
-        raise BrowserStateError("登录态内容不是有效的 storage_state（缺少 cookies）。")
+
+    # 校验 storage_state schema（类型 + 结构）
+    _validate_storage_state(data)
     return data
 
 

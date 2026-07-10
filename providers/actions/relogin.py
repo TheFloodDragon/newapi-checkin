@@ -19,7 +19,6 @@
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 from typing import Any
 
 import accounts_store
@@ -34,13 +33,9 @@ from ..base import (
     SiteProfile,
     normalize_base_url,
 )
-from ._common import build_http_client
-
-SCRIPT_DIR = Path(__file__).resolve().parent.parent.parent
 
 
 def _load_session():
-    sys.path.insert(0, str(SCRIPT_DIR))
     from browser import session as browser_session
     return browser_session
 
