@@ -6,6 +6,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import accounts_store
+
 from ..auth import has_http_credentials, load_auth
 from ..base import (
     AuthInfo,
@@ -33,11 +35,10 @@ def usd_str(value: Any, *, is_usd: bool) -> str:
 def oauth_state_text_for_site(site: SiteConfig) -> str:
     """读取当前站点显式选择的 OAuth provider/account 登录态。"""
     try:
-        import accounts_store
         provider = accounts_store.normalize_oauth_provider(getattr(site, "oauth_provider", "")) or "linuxdo"
         account = accounts_store.normalize_oauth_account(getattr(site, "oauth_account", ""))
         return accounts_store.oauth_state_text(provider, account)
-    except Exception:
+    except (OSError, accounts_store.ConfigError):
         return ""
 
 
@@ -54,11 +55,11 @@ def has_refresh_state(site: SiteConfig) -> bool:
 def persist_access_token(site: SiteConfig, token: str) -> None:
     """刷新出新 access_token 后尽力写回 ACCOUNTS.json。"""
     try:
-        import accounts_store
         if accounts_store.update_account_access_token(site.name, site.base_url, token):
             site.access_token = token
-    except Exception:
-        # 持久化失败不应影响本次签到；本次内存 token 仍可继续使用。
+    except (OSError, accounts_store.ConfigError):
+        # 持久化失败（文件锁超时/损坏/IO 错误）不应影响本次签到；
+        # 本次内存 token 仍可继续使用。
         site.access_token = token
 
 

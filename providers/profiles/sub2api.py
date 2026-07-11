@@ -165,7 +165,7 @@ class Sub2ApiClient(ProfileClient):
             headers["Cookie"] = self.cookie
         return headers
 
-    def request(self, method: str, path: str, body: dict | None = None) -> Any:
+    def request(self, method: str, path: str, body: dict | None = None, *, retry_non_idempotent: bool = False) -> Any:
         url = self.base_url + API_PREFIX + path
         headers = self._headers()
 
@@ -180,6 +180,7 @@ class Sub2ApiClient(ProfileClient):
             headers=headers,
             body=raw_body,
             proxy=self.site.proxy,
+            retry_non_idempotent=retry_non_idempotent,
         )
         # Sub2API 统一响应：{code:0, data:{...}}；code != 0 视为失败
         if isinstance(payload, dict) and "code" in payload:
@@ -323,7 +324,8 @@ class Sub2ApiClient(ProfileClient):
         # 只要标准用户资料/用量接口可用，就把“登录态验证 + 余额查询”视为本次自动签到/保活成功。
         body = {"turnstile_token": turnstile} if turnstile else {}
         try:
-            data = unwrap_data(self.request("POST", "/check-in", body))
+            # 签到 POST 是幂等的（重复签到 → already_checked_in），瞬时网络错误可安全重试。
+            data = unwrap_data(self.request("POST", "/check-in", body, retry_non_idempotent=True))
         except ApiError as exc:
             if self.classify(exc) == "need_verification":
                 raise

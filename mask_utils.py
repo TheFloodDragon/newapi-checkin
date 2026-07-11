@@ -30,6 +30,7 @@ _SENSITIVE_KEYS = {
     "authorization",
     "browser_state",
     "cookie",
+    "oauth_state",
     "password",
     "refresh_token",
     "secret",
@@ -70,7 +71,7 @@ def mask_secrets(text: str) -> str:
 
     # 3) JSON / repr / query-string 中的常见敏感字段。
     text = re.sub(
-        r"(?i)([\"']?(?:access_token|refresh_token|browser_state|password|secret|token|cookie|state)[\"']?\s*[:=]\s*[\"']?)([^\s,;\"'&}]+)",
+        r"(?i)([\"']?(?:access_token|refresh_token|browser_state|oauth_state|password|secret|token|cookie|state)[\"']?\s*[:=]\s*[\"']?)([^\s,;\"'&}]+)",
         lambda m: m.group(1) + _mask_value(m.group(2)),
         text,
     )

@@ -100,6 +100,9 @@ class _LockState:
 
 _LOCK_STATE = _LockState()
 
+# Windows msvcrt.locking 需要指定锁定字节数；我们只用文件存在性做互斥，锁 1 字节即可。
+_MSVCRT_LOCK_BYTES = 1
+
 
 @contextlib.contextmanager
 def _file_lock(path: Path, *, timeout: float = 30.0):
@@ -156,7 +159,7 @@ def _acquire_lock(handle, *, timeout: float) -> bool:
 
         while True:
             try:
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, _MSVCRT_LOCK_BYTES)
                 return True
             except OSError:
                 if time.monotonic() >= deadline:
@@ -187,7 +190,7 @@ def _release_lock(handle) -> None:
 
         with contextlib.suppress(OSError):
             handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, _MSVCRT_LOCK_BYTES)
         return
     except ImportError:
         pass
@@ -421,12 +424,13 @@ def normalize_script_args(value: Any) -> dict[str, Any]:
 
 
 def parse_script_timeout(value: Any, default: int = 120) -> int:
-    """解析 browser_script 超时秒数，限制在 1 秒以上。"""
+    """解析 browser_script 超时秒数，限制在 [1, BROWSER_SCRIPT_MAX] 区间内。"""
+    from config import Timeouts
     try:
         timeout = int(value)
     except (TypeError, ValueError):
         return default
-    return max(1, timeout)
+    return max(1, min(timeout, Timeouts.BROWSER_SCRIPT_MAX))
 
 
 def parse_enabled(value: Any, default: bool = True) -> bool:

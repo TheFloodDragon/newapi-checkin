@@ -46,6 +46,9 @@ _MAX_PACKED_BYTES = (GITHUB_SECRET_LIMIT // 4) * 3
 # encode_state 只生成标准 base64；解码时拒绝 URL-safe/混合字母表。
 _BASE64_RE = re.compile(r"^[A-Za-z0-9+/]+=*$")
 
+# 流式解压时多读 1 字节用于检测是否超过 _MAX_RAW_BYTES（gzip bomb 防护哨兵）。
+_GZIP_BOMB_SENTINEL = 1
+
 
 class BrowserStateError(Exception):
     """browser_state 编码/解码相关错误（供 provider 捕获）。"""
@@ -242,7 +245,7 @@ def decode_state(text: str) -> dict[str, Any]:
 
     try:
         with gzip.GzipFile(fileobj=io.BytesIO(packed), mode="rb") as gz:
-            raw = gz.read(_MAX_RAW_BYTES + 1)
+            raw = gz.read(_MAX_RAW_BYTES + _GZIP_BOMB_SENTINEL)
     except Exception as exc:
         raise BrowserStateError(f"gzip 解压失败（数据损坏或格式过旧）：{exc}") from exc
 

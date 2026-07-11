@@ -22,6 +22,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from config import Timeouts
+
 from ..base import (
     USER_AGENT,
     ApiError,
@@ -45,7 +47,7 @@ from ..base import (
 
 SCRIPT_DIR = Path(__file__).resolve().parent.parent.parent
 CHALLENGE_HELPER_PATH = SCRIPT_DIR / "checkin_challenge.js"
-CHALLENGE_TIMEOUT = 60  # Node 执行 WASM PoW 的超时（秒）
+CHALLENGE_TIMEOUT = Timeouts.NODE_CHALLENGE  # Node 执行 WASM PoW 的超时（秒）
 
 ALREADY_DONE_PATTERNS = ["已签到", "今日已", "已领取", "明天再来", "already"]
 VERIFICATION_PATTERNS = ["Turnstile", "Cloudflare", "Just a moment", "安全验证", "challenge-platform"]
@@ -64,7 +66,7 @@ class NewApiClient(ProfileClient):
         self.referer = self.base_url + (site.referer_path if site.referer_path.startswith("/") else "/" + site.referer_path)
 
     # ── 底层请求 ──
-    def request(self, method: str, path: str, body: bytes | None = None) -> Any:
+    def request(self, method: str, path: str, body: bytes | None = None, *, retry_non_idempotent: bool = False) -> Any:
         url = path if path.startswith("http") else self.base_url + path
         headers = {
             "User-Agent": USER_AGENT,
@@ -90,6 +92,7 @@ class NewApiClient(ProfileClient):
             headers=headers,
             body=body,
             proxy=self.site.proxy,
+            retry_non_idempotent=retry_non_idempotent,
         )
         if isinstance(payload, dict) and payload.get("success") is False:
             raise ApiError(None, payload, extract_message(payload))
@@ -136,7 +139,8 @@ class NewApiClient(ProfileClient):
         path = "/api/user/checkin"
         if turnstile:
             path += "?" + urllib.parse.urlencode({"turnstile": turnstile})
-        return unwrap_data(self.request("POST", path))
+        # 签到 POST 是幂等的（重复签到 → already_done），瞬时网络错误可安全重试。
+        return unwrap_data(self.request("POST", path, retry_non_idempotent=True))
 
     def _challenge_checkin(self) -> Any:
         if not CHALLENGE_HELPER_PATH.exists():

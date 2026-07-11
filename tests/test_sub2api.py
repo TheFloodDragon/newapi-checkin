@@ -32,7 +32,7 @@ def test_usage_zero_balance_does_not_fall_back(monkeypatch) -> None:
     def fake_standard_balance(data):
         return 99 if data is usage_payload else None
 
-    def fake_request(method: str, path: str, body=None):
+    def fake_request(method: str, path: str, body=None, *, retry_non_idempotent: bool = False):
         assert method == "GET"
         if path in {"/user/profile", "/auth/me"}:
             return {}
@@ -50,7 +50,7 @@ def test_status_then_unsupported_checkin_reuses_user_probe(monkeypatch) -> None:
     client = _client()
     calls: list[tuple[str, str]] = []
 
-    def fake_request(method: str, path: str, body=None):
+    def fake_request(method: str, path: str, body=None, *, retry_non_idempotent: bool = False):
         calls.append((method, path))
         if method == "GET" and path == "/user/profile":
             return {"username": "alice", "balance": 7}
@@ -73,7 +73,7 @@ def test_query_action_fetch_user_and_status_share_one_probe(monkeypatch) -> None
     client = _client()
     calls: list[tuple[str, str]] = []
 
-    def fake_request(method: str, path: str, body=None):
+    def fake_request(method: str, path: str, body=None, *, retry_non_idempotent: bool = False):
         calls.append((method, path))
         if method == "GET" and path == "/user/profile":
             return {"username": "alice", "balance": 12.5}
@@ -94,7 +94,7 @@ def test_successful_real_checkin_invalidates_user_cache(monkeypatch) -> None:
     client = _client()
     profile_requests = 0
 
-    def fake_request(method: str, path: str, body=None):
+    def fake_request(method: str, path: str, body=None, *, retry_non_idempotent: bool = False):
         nonlocal profile_requests
         if method == "GET" and path == "/user/profile":
             profile_requests += 1
@@ -115,7 +115,7 @@ def test_failed_first_user_query_does_not_poison_cache(monkeypatch) -> None:
     client = _client()
     attempts = 0
 
-    def fake_request(method: str, path: str, body=None):
+    def fake_request(method: str, path: str, body=None, *, retry_non_idempotent: bool = False):
         nonlocal attempts
         assert (method, path) == ("GET", "/user/profile")
         attempts += 1
@@ -136,7 +136,7 @@ def test_authenticated_unknown_balance_is_cached(monkeypatch) -> None:
     client = _client()
     calls: list[tuple[str, str]] = []
 
-    def fake_request(method: str, path: str, body=None):
+    def fake_request(method: str, path: str, body=None, *, retry_non_idempotent: bool = False):
         calls.append((method, path))
         return {}
 

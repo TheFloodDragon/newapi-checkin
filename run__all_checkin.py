@@ -19,12 +19,14 @@ import sys
 import textwrap
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import accounts_store
+from config import Timeouts, OutputConfig
 from mask_utils import mask_secrets, sanitize_data
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -48,6 +50,8 @@ VALID_RESULT_STATUSES = OK_STATUSES | {
     "error",
 }
 QUOTA_UNIT = 500_000  # New API 内部 quota 与 USD 的换算系数：quota / 500000 = $
+# 子任务因超时被强制终止时使用的约定退出码（与 GNU timeout 一致）。
+TIMEOUT_EXIT_CODE = 124
 # 新三维字段：站点适配器 / 登录方式 / 签到方式
 FLOW_LABELS = {
     "api": "接口签到",
@@ -175,12 +179,12 @@ def build_site_tasks() -> list[CheckinTask]:
         # so they get a generous cap; plain HTTP flows finish fast. browser_script
         # honors its own script_timeout plus startup/teardown headroom.
         if checkin_action == "browser_script":
-            script_timeout = accounts_store.parse_script_timeout(site.get("script_timeout"), 120)
-            task_timeout = float(script_timeout) + 120.0
+            script_timeout = accounts_store.parse_script_timeout(site.get("script_timeout"), Timeouts.BROWSER_SCRIPT_DEFAULT)
+            task_timeout = float(script_timeout) + Timeouts.BROWSER_STARTUP_OVERHEAD
         elif auth_method in {"browser", "oauth"} or checkin_action == "relogin":
-            task_timeout = 420.0
+            task_timeout = Timeouts.BROWSER_TASK
         else:
-            task_timeout = 120.0
+            task_timeout = Timeouts.HTTP_TASK
 
         flow_label = f"{FLOW_LABELS.get(site_profile, site_profile)} / {FLOW_LABELS.get(auth_method, auth_method)} / {FLOW_LABELS.get(checkin_action, checkin_action)}"
         tasks.append(
@@ -260,7 +264,7 @@ def run_task(task: CheckinTask) -> TaskResult:
         )
         return TaskResult(
             task.name,
-            124,  # conventional timeout exit code
+            TIMEOUT_EXIT_CODE,  # conventional timeout exit code (128+SIGKILL)
             timeout_line,
             started_at=started_at,
             ended_at=ended_at,
@@ -282,17 +286,23 @@ def run_task(task: CheckinTask) -> TaskResult:
 
 
 def extract_json_payload(output: str) -> Any | None:
-    """返回 stdout 中最后一个可完整解码的 JSON 对象/数组。"""
+    """返回 stdout 中最后一个可完整解码的 JSON 对象/数组。
+
+    只扫描末尾 ``OutputConfig.MAX_OUTPUT_SCAN`` 字节：legacy 脚本通常把结果 JSON
+    打印在最后一行（前面可能有大量诊断输出）。限制扫描长度可避免对超长输出逐字符
+    raw_decode 造成的 O(n²) 级开销，同时保留「取最后一个有效 JSON」的语义。
+    """
     if not output.strip():
         return None
 
+    scan_text = output[-OutputConfig.MAX_OUTPUT_SCAN :]
     decoder = json.JSONDecoder()
     last: Any | None = None
-    for index, char in enumerate(output):
+    for index, char in enumerate(scan_text):
         if char not in "[{":
             continue
         try:
-            candidate, _end = decoder.raw_decode(output[index:])
+            candidate, _end = decoder.raw_decode(scan_text[index:])
         except json.JSONDecodeError:
             continue
         if isinstance(candidate, (dict, list)):
@@ -332,13 +342,17 @@ def is_blank(value: Any) -> bool:
 
 
 def find_first_value(data: Any, keys: list[str]) -> Any:
-    """在嵌套 dict/list 中按键名查找第一个非空值。"""
+    """在嵌套 dict/list 中按键名（不区分大小写）BFS 查找第一个非空值。
+
+    使用 deque 做队列，popleft() 为 O(1)，避免 list.pop(0) 的 O(n) 开销；
+    seen 记录已访问对象 id，防止循环引用导致的无限遍历。
+    """
     wanted = {key.lower() for key in keys}
-    queue: list[Any] = [data]
+    queue: deque[Any] = deque([data])
     seen: set[int] = set()
 
     while queue:
-        item = queue.pop(0)
+        item = queue.popleft()
         if item is None:
             continue
         marker = id(item)

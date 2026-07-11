@@ -31,13 +31,16 @@ from urllib.parse import urlparse
 
 from . import bypass, oauth_providers, popups, state
 
+# WAF/OAuth 相关配置集中到 config 模块
+from config import WAFConfig, Timeouts
+
 SCRIPT_DIR = Path(__file__).resolve().parent.parent  # checkin/
 QUOTA_UNIT = 500_000
-OAUTH_WAIT_SECONDS = 25
-WAF_RETRY = 4
+OAUTH_WAIT_SECONDS = Timeouts.OAUTH_WAIT
+WAF_RETRY = WAFConfig.RETRY_ATTEMPTS
 # 连续多少次「整轮」WAF 求解失败后，判定出口 IP 被阿里云 WAF 持续风控（熔断），
 # 后续跳过所有重复求解，避免在被风控的 IP 上空耗数分钟。
-WAF_BLOCK_THRESHOLD = 2
+WAF_BLOCK_THRESHOLD = WAFConfig.BLOCK_THRESHOLD
 
 
 def _env_headless() -> bool:

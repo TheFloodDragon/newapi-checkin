@@ -106,12 +106,20 @@ def resolve_script_path(script_path: str) -> Path:
 
 def _load_module(script_file: Path) -> ModuleType:
     module_name = f"checkin_browser_script_{abs(hash(str(script_file)))}"
+    # 强制清除同名缓存：脚本文件在两次运行之间可能被修改，若命中 sys.modules
+    # 旧缓存会执行过期代码。每次都重新加载确保拿到磁盘上的最新脚本。
+    sys.modules.pop(module_name, None)
     spec = importlib.util.spec_from_file_location(module_name, script_file)
     if spec is None or spec.loader is None:
         raise BrowserScriptError(f"无法加载脚本：{script_file}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
-    spec.loader.exec_module(module)
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        # 加载失败时清除半初始化模块，避免污染后续加载。
+        sys.modules.pop(module_name, None)
+        raise
     run_func = getattr(module, "run", None)
     if not callable(run_func):
         raise BrowserScriptError("脚本必须定义 async def run(page, context, site, helpers)")
