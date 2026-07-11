@@ -40,6 +40,9 @@ async def run(page: Any, context: Any, site: Any, helpers: Any) -> dict[str, Any
     goto_timeout = int(args.get("goto_timeout", 60000) or 60000)
     ready_timeout = int(args.get("ready_timeout", 10000) or 10000)
     click_timeout = int(args.get("click_timeout", 5000) or 5000)
+    # SPA（React）站点：签到按钮要等前端拉取签到数据后才渲染，goto 后立即扫描会扑空。
+    # 在放弃前轮询等待「已签到状态」或「签到按钮」出现，默认最多 15s。
+    button_wait_ms = int(args.get("button_wait_ms", 15000) or 15000)
     completion_timeout_ms = int(
         args.get("completion_timeout_ms", args.get("after_click_wait_ms", 10000)) or 10000
     )
@@ -89,7 +92,8 @@ async def run(page: Any, context: Any, site: Any, helpers: Any) -> dict[str, Any
                 return text
         return ""
 
-    async def _click_checkin() -> tuple[str, Any, str]:
+    async def _find_checkin_control() -> tuple[str, Any, str] | None:
+        """找到可见且未禁用的签到控件（不点击）；找不到返回 None。"""
         # 先扫描所有 button/role=button，防止宽松文本候选点到页面标题。
         for text in checkin_texts:
             try:
@@ -98,15 +102,7 @@ async def run(page: Any, context: Any, site: Any, helpers: Any) -> dict[str, Any
                 continue
             if not await _is_visible(locator) or await _is_disabled(locator):
                 continue
-            try:
-                element = await locator.element_handle()
-            except Exception:
-                element = None
-            try:
-                await locator.click(timeout=click_timeout)
-                return text, element, "button"
-            except Exception:
-                continue
+            return text, locator, "button"
 
         # 兼容没有语义化 button 的旧页面，保留原有页面文本点击兜底。
         for text in checkin_texts:
@@ -116,16 +112,23 @@ async def run(page: Any, context: Any, site: Any, helpers: Any) -> dict[str, Any
                 continue
             if not await _is_visible(locator):
                 continue
-            try:
-                element = await locator.element_handle()
-            except Exception:
-                element = None
-            try:
-                await locator.click(timeout=click_timeout)
-                return text, element, "text"
-            except Exception:
-                continue
-        return "", None, ""
+            return text, locator, "text"
+        return None
+
+    async def _click_checkin() -> tuple[str, Any, str]:
+        control = await _find_checkin_control()
+        if control is None:
+            return "", None, ""
+        text, locator, kind = control
+        try:
+            element = await locator.element_handle()
+        except Exception:
+            element = None
+        try:
+            await locator.click(timeout=click_timeout)
+            return text, element, kind
+        except Exception:
+            return "", None, ""
 
     await helpers.goto(target_url, timeout=goto_timeout, wait_until=str(args.get("wait_until") or "commit"))
     try:
@@ -134,18 +137,45 @@ async def run(page: Any, context: Any, site: Any, helpers: Any) -> dict[str, Any
         # 部分站点/风控页不会按时触发 domcontentloaded；继续用页面可见文本判断。
         pass
 
-    already_control = await _find_already_control()
-    if already_control:
-        text, _ = already_control
-        return helpers.already_done(
-            "今日已签到",
-            {"matched_text": text, "completion_signal": "button_state", "target_url": resolved_url},
-        )
-    matched_already_text = await _find_already_text()
-    if matched_already_text:
-        return helpers.already_done(
-            "今日已签到",
-            {"matched_text": matched_already_text, "completion_signal": "page_text", "target_url": resolved_url},
+    # SPA 站点签到按钮是前端拉取数据后才渲染的，goto 完成时通常还没出现。
+    # 轮询等待，直到命中「已签到状态」或「可点击的签到按钮」，或超过 button_wait_ms。
+    loop = asyncio.get_running_loop()
+    button_deadline = loop.time() + max(0, button_wait_ms) / 1000
+    checkin_control: tuple[str, Any, str] | None = None
+    while True:
+        already_control = await _find_already_control()
+        if already_control:
+            text, _ = already_control
+            return helpers.already_done(
+                "今日已签到",
+                {"matched_text": text, "completion_signal": "button_state", "target_url": resolved_url},
+            )
+        matched_already_text = await _find_already_text()
+        if matched_already_text:
+            return helpers.already_done(
+                "今日已签到",
+                {"matched_text": matched_already_text, "completion_signal": "page_text", "target_url": resolved_url},
+            )
+
+        checkin_control = await _find_checkin_control()
+        if checkin_control is not None:
+            break
+
+        if loop.time() >= button_deadline:
+            break
+        remaining_ms = max(1, int((button_deadline - loop.time()) * 1000))
+        await page.wait_for_timeout(min(poll_interval_ms * 3, remaining_ms))
+
+    if checkin_control is None:
+        screenshot = await helpers.screenshot("100xlabs-no-checkin-button.png")
+        return helpers.need_config(
+            f"未找到签到按钮文本：{', '.join(checkin_texts)}",
+            {
+                "checkin_texts": checkin_texts,
+                "target_url": resolved_url,
+                "button_wait_ms": button_wait_ms,
+                "screenshot": screenshot,
+            },
         )
 
     checkin_response: dict[str, Any] = {}
@@ -171,11 +201,24 @@ async def run(page: Any, context: Any, site: Any, helpers: Any) -> dict[str, Any
         pass
 
     try:
-        clicked_text, clicked_locator, clicked_kind = await _click_checkin()
+        # 点击轮询阶段已定位到的签到控件（避免重新扫描再次遇到 SPA 渲染时序问题）。
+        found_text, found_locator, found_kind = checkin_control
+        clicked_text, clicked_locator, clicked_kind = "", found_locator, found_kind
+        try:
+            clicked_element = await found_locator.element_handle()
+        except Exception:
+            clicked_element = None
+        try:
+            await found_locator.click(timeout=click_timeout)
+            clicked_text, clicked_locator = found_text, clicked_element or found_locator
+        except Exception:
+            # 定位到但点击失败（可能刚好被重渲染替换）：兜底重新扫描点击一次。
+            clicked_text, clicked_locator, clicked_kind = await _click_checkin()
+
         if not clicked_text:
-            screenshot = await helpers.screenshot("100xlabs-no-checkin-button.png")
-            return helpers.need_config(
-                f"未找到签到按钮文本：{', '.join(checkin_texts)}",
+            screenshot = await helpers.screenshot("100xlabs-click-failed.png")
+            return helpers.error(
+                "定位到签到按钮但点击失败，请稍后重试",
                 {"checkin_texts": checkin_texts, "target_url": resolved_url, "screenshot": screenshot},
             )
 
@@ -184,7 +227,6 @@ async def run(page: Any, context: Any, site: Any, helpers: Any) -> dict[str, Any
             "clicked_kind": clicked_kind,
             "target_url": resolved_url,
         }
-        loop = asyncio.get_running_loop()
         deadline = loop.time() + max(0, completion_timeout_ms) / 1000
 
         while True:
