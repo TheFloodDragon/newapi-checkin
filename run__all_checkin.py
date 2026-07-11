@@ -459,7 +459,13 @@ def build_detail_note(status: str, message: str, detail: Any) -> str:
     checked_in_today = find_first_value(detail, ["checked_in_today", "today_checked", "is_checked_in"])
 
     if status == "already_done":
-        parts.append("今日已领取，无需重复签到")
+        # relogin / visit 类站点靠 OAuth 登录发放额度，无独立签到状态接口，
+        # 「额度无变化」不代表今日一定已领取（可能到账延迟）。这类场景保留 action
+        # 给出的更准确 message，不要覆盖成确定性的「今日已领取」。
+        if str(source) in {"relogin", "visit"} and message:
+            parts.append(message)
+        else:
+            parts.append("今日已领取，无需重复签到")
     if status == "success" and not is_blank(quota_awarded):
         parts.append(f"获得额度：{format_quota(quota_awarded, already_usd=already_usd)}")
     elif "获得额度" in message:

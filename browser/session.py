@@ -2293,7 +2293,8 @@ async def run_oauth_checkin(
 
         # OAuth 回跳后优先捕获瞬时 Toast/弹窗。AgentRouter 的每日奖励提示可能早于额度接口更新，
         # 也可能在固定等待结束前消失，因此不能只依赖 OAuth 前后额度差。
-        if link.get("landed_back") and not link.get("cloudflare") and not link.get("need_human"):
+        oauth_ok = link.get("landed_back") and not link.get("cloudflare") and not link.get("need_human")
+        if oauth_ok:
             success_message = await _wait_for_site_success_message(page, error_collector, link, timeout_ms=3000)
             if success_message:
                 log(f"已捕获 OAuth 签到成功弹窗：{success_message}")
@@ -2306,6 +2307,32 @@ async def run_oauth_checkin(
         if user_data_after:
             quota_after = user_data_after.get("quota")
             log(f"OAuth 后额度：{quota_to_usd(quota_after)}")
+
+        # 额度到账延迟兜底：OAuth 已顺畅回跳、但既没抢到成功弹窗、额度也还没增长时，
+        # 站点很可能只是 quota 接口尚未刷新（发放异步）。再轮询重读几次，避免把「刚发放
+        # 但接口滞后」误判成「今日已领取，额度无变化」。一旦额度增长或捕获到弹窗即停止。
+        if (
+            oauth_ok
+            and not str(link.get("site_success_message") or "").strip()
+            and isinstance(quota_before, (int, float))
+            and isinstance(quota_after, (int, float))
+            and quota_after <= quota_before
+        ):
+            for attempt in range(3):
+                await asyncio.sleep(2)
+                late_message = await _wait_for_site_success_message(page, error_collector, link, timeout_ms=500)
+                if late_message:
+                    log(f"延迟捕获 OAuth 签到成功弹窗：{late_message}")
+                    break
+                user_data_late = await read_user(page, base_url, fallback_uid, log)
+                if not user_data_late:
+                    continue
+                quota_late = user_data_late.get("quota")
+                if isinstance(quota_late, (int, float)):
+                    quota_after = quota_late
+                    if quota_late > quota_before:
+                        log(f"额度延迟到账，重读后额度：{quota_to_usd(quota_late)}（重试 {attempt + 1}/3）")
+                        break
 
         # 兜底同步 WAF 熔断状态到 link（read_user 触发熔断但未经 _trigger_oauth 早退时）
         if _waf_is_blocked(page):
