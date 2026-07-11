@@ -13,11 +13,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 
 async def run(page: Any, context: Any, site: Any, helpers: Any) -> dict[str, Any]:
     args = dict(getattr(site, "script_args", {}) or {})
+
     def _list_arg(key: str, default: list[str]) -> list[str]:
         value = args.get(key)
         if isinstance(value, list):
@@ -26,14 +28,104 @@ async def run(page: Any, context: Any, site: Any, helpers: Any) -> dict[str, Any
             return [value.strip()]
         return default
 
-    checkin_texts = _list_arg("checkin_text", ["签到", "每日签到", "立即签到", "领取", "今日领取", "Check in", "Claim"])
-    already_texts = _list_arg("already_text", ["已签到", "今日已签到", "已领取", "今日已领取", "Already", "Checked"])
+    checkin_texts = _list_arg(
+        "checkin_text",
+        ["签到", "每日签到", "立即签到", "领取", "今日领取", "Check in", "Claim", "now"],
+    )
+    already_texts = _list_arg(
+        "already_text",
+        ["已签到", "今日已签到", "已领取", "今日已领取", "Already", "Checked", "today"],
+    )
     success_texts = _list_arg("success_text", ["签到成功", "领取成功", "成功", "获得", "Success"])
     goto_timeout = int(args.get("goto_timeout", 60000) or 60000)
     ready_timeout = int(args.get("ready_timeout", 10000) or 10000)
+    click_timeout = int(args.get("click_timeout", 5000) or 5000)
+    completion_timeout_ms = int(
+        args.get("completion_timeout_ms", args.get("after_click_wait_ms", 10000)) or 10000
+    )
+    poll_interval_ms = max(20, int(args.get("poll_interval_ms", 100) or 100))
     start_url = str(args.get("start_url") or args.get("url") or "").strip()
     start_path = str(args.get("start_path") or args.get("path") or "/check-in").strip()
     target_url = start_url or start_path
+    resolved_url = helpers.resolve_url(target_url)
+
+    async def _is_visible(locator: Any) -> bool:
+        try:
+            return bool(await locator.is_visible())
+        except Exception:
+            return False
+
+    async def _is_disabled(locator: Any) -> bool:
+        try:
+            return bool(await locator.is_disabled())
+        except Exception:
+            return False
+
+    async def _visible_text(text: str) -> bool:
+        try:
+            return await _is_visible(page.get_by_text(text, exact=False).first)
+        except Exception:
+            return False
+
+    async def _find_already_control() -> tuple[str, Any] | None:
+        for text in already_texts:
+            try:
+                locator = page.get_by_role("button", name=text, exact=False).first
+            except Exception:
+                continue
+            if not await _is_visible(locator):
+                continue
+            # "today" 过于宽泛，只能由禁用按钮确认；其它完成文案仍兼容未禁用控件。
+            if text.strip().casefold() != "today" or await _is_disabled(locator):
+                return text, locator
+        return None
+
+    async def _find_already_text() -> str:
+        for text in already_texts:
+            # 避免把普通页面中的 today（例如标题/日期）误判为已签到。
+            if text.strip().casefold() == "today":
+                continue
+            if await _visible_text(text):
+                return text
+        return ""
+
+    async def _click_checkin() -> tuple[str, Any, str]:
+        # 先扫描所有 button/role=button，防止宽松文本候选点到页面标题。
+        for text in checkin_texts:
+            try:
+                locator = page.get_by_role("button", name=text, exact=False).first
+            except Exception:
+                continue
+            if not await _is_visible(locator) or await _is_disabled(locator):
+                continue
+            try:
+                element = await locator.element_handle()
+            except Exception:
+                element = None
+            try:
+                await locator.click(timeout=click_timeout)
+                return text, element, "button"
+            except Exception:
+                continue
+
+        # 兼容没有语义化 button 的旧页面，保留原有页面文本点击兜底。
+        for text in checkin_texts:
+            try:
+                locator = page.get_by_text(text, exact=False).first
+            except Exception:
+                continue
+            if not await _is_visible(locator):
+                continue
+            try:
+                element = await locator.element_handle()
+            except Exception:
+                element = None
+            try:
+                await locator.click(timeout=click_timeout)
+                return text, element, "text"
+            except Exception:
+                continue
+        return "", None, ""
 
     await helpers.goto(target_url, timeout=goto_timeout, wait_until=str(args.get("wait_until") or "commit"))
     try:
@@ -42,29 +134,131 @@ async def run(page: Any, context: Any, site: Any, helpers: Any) -> dict[str, Any
         # 部分站点/风控页不会按时触发 domcontentloaded；继续用页面可见文本判断。
         pass
 
-    for text in already_texts:
-        if await helpers.visible_text(text, timeout=1500):
-            return helpers.already_done("今日已签到", {"matched_text": text, "target_url": helpers.resolve_url(target_url)})
-
-    clicked_text = ""
-    for text in checkin_texts:
-        if await helpers.click_text(text, timeout=5000):
-            clicked_text = text
-            break
-    if not clicked_text:
-        screenshot = await helpers.screenshot("100xlabs-no-checkin-button.png")
-        return helpers.need_config(
-            f"未找到签到按钮文本：{', '.join(checkin_texts)}",
-            {"checkin_texts": checkin_texts, "target_url": helpers.resolve_url(target_url), "screenshot": screenshot},
+    already_control = await _find_already_control()
+    if already_control:
+        text, _ = already_control
+        return helpers.already_done(
+            "今日已签到",
+            {"matched_text": text, "completion_signal": "button_state", "target_url": resolved_url},
+        )
+    matched_already_text = await _find_already_text()
+    if matched_already_text:
+        return helpers.already_done(
+            "今日已签到",
+            {"matched_text": matched_already_text, "completion_signal": "page_text", "target_url": resolved_url},
         )
 
-    await page.wait_for_timeout(int(args.get("after_click_wait_ms", 2000) or 2000))
-    for text in success_texts:
-        if await helpers.visible_text(text, timeout=5000):
-            return helpers.success("签到成功", {"matched_text": text, "clicked_text": clicked_text, "target_url": helpers.resolve_url(target_url)})
-    for text in already_texts:
-        if await helpers.visible_text(text, timeout=3000):
-            return helpers.already_done("今日已签到", {"matched_text": text, "clicked_text": clicked_text, "target_url": helpers.resolve_url(target_url)})
+    checkin_response: dict[str, Any] = {}
 
-    screenshot = await helpers.screenshot("100xlabs-after-click.png")
-    return helpers.success("已点击签到按钮，请按页面结果确认", {"clicked_text": clicked_text, "target_url": helpers.resolve_url(target_url), "screenshot": screenshot})
+    def _capture_checkin_response(response: Any) -> None:
+        try:
+            request = getattr(response, "request", None)
+            method = str(getattr(request, "method", "") or "").upper()
+            url = str(getattr(response, "url", "") or "")
+            lowered_url = url.casefold()
+            if method != "POST" or ("check-in" not in lowered_url and "checkin" not in lowered_url):
+                return
+            status = int(getattr(response, "status", 0) or 0)
+            checkin_response.update({"status": status, "url": url})
+        except Exception:
+            return
+
+    listener_registered = False
+    try:
+        page.on("response", _capture_checkin_response)
+        listener_registered = True
+    except Exception:
+        pass
+
+    try:
+        clicked_text, clicked_locator, clicked_kind = await _click_checkin()
+        if not clicked_text:
+            screenshot = await helpers.screenshot("100xlabs-no-checkin-button.png")
+            return helpers.need_config(
+                f"未找到签到按钮文本：{', '.join(checkin_texts)}",
+                {"checkin_texts": checkin_texts, "target_url": resolved_url, "screenshot": screenshot},
+            )
+
+        base_detail = {
+            "clicked_text": clicked_text,
+            "clicked_kind": clicked_kind,
+            "target_url": resolved_url,
+        }
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0, completion_timeout_ms) / 1000
+
+        while True:
+            response_status = int(checkin_response.get("status", 0) or 0)
+            if 200 <= response_status < 300:
+                return helpers.success(
+                    "签到成功",
+                    {
+                        **base_detail,
+                        "completion_signal": "checkin_response",
+                        "response_status": response_status,
+                        "response_url": checkin_response.get("url", ""),
+                    },
+                )
+            if response_status >= 400:
+                return helpers.error(
+                    f"签到接口返回错误（HTTP {response_status}）",
+                    {
+                        **base_detail,
+                        "completion_signal": "checkin_response",
+                        "response_status": response_status,
+                        "response_url": checkin_response.get("url", ""),
+                    },
+                )
+
+            for text in success_texts:
+                if await _visible_text(text):
+                    return helpers.success(
+                        "签到成功",
+                        {**base_detail, "completion_signal": "success_text", "matched_text": text},
+                    )
+
+            already_control = await _find_already_control()
+            if already_control:
+                text, _ = already_control
+                return helpers.success(
+                    "签到成功",
+                    {**base_detail, "completion_signal": "button_state", "matched_text": text},
+                )
+
+            matched_already_text = await _find_already_text()
+            if matched_already_text:
+                return helpers.success(
+                    "签到成功",
+                    {
+                        **base_detail,
+                        "completion_signal": "already_text",
+                        "matched_text": matched_already_text,
+                    },
+                )
+
+            if clicked_locator is not None and not await _is_visible(clicked_locator):
+                return helpers.success(
+                    "签到成功",
+                    {**base_detail, "completion_signal": "button_hidden"},
+                )
+
+            if loop.time() >= deadline:
+                break
+            remaining_ms = max(1, int((deadline - loop.time()) * 1000))
+            await page.wait_for_timeout(min(poll_interval_ms, remaining_ms))
+
+        screenshot = await helpers.screenshot("100xlabs-after-click.png")
+        return helpers.error(
+            "已点击签到按钮，但未检测到签到完成信号",
+            {
+                **base_detail,
+                "completion_timeout_ms": completion_timeout_ms,
+                "screenshot": screenshot,
+            },
+        )
+    finally:
+        if listener_registered:
+            try:
+                page.remove_listener("response", _capture_checkin_response)
+            except Exception:
+                pass

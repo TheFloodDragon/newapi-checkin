@@ -789,13 +789,83 @@ async def _site_error_messages(page=None, collector: dict[str, Any] | None = Non
     return list((collector or {}).get("items") or [])
 
 
+def _message_text(item: Any) -> str:
+    text = _redact_site_error(item)
+    source, separator, message = text.partition(": ")
+    if separator and source in {"dom", "toast", "notification"}:
+        return message.strip()
+    return text
+
+
+def _site_success_message(messages: list[str] | None) -> str:
+    """从站点 Toast/弹窗中提取明确的签到或登录奖励成功提示。"""
+    success_patterns = (
+        "签到成功",
+        "领取成功",
+        "登录成功",
+        "奖励已发放",
+        "额度已发放",
+        "成功获得",
+        "check-in success",
+        "check in success",
+        "checked in successfully",
+        "login successful",
+        "reward has been credited",
+    )
+    reject_patterns = (
+        "失败",
+        "错误",
+        "未成功",
+        "今日已",
+        "已经签到",
+        "already",
+        "failed",
+        "error",
+    )
+    for item in messages or []:
+        message = _message_text(item)
+        lowered = message.casefold()
+        if any(pattern in lowered for pattern in reject_patterns):
+            continue
+        if any(pattern in lowered for pattern in success_patterns):
+            return message
+    return ""
+
+
 def _attach_site_errors(target: dict[str, Any], errors: list[str], log: LogFn = _noop) -> None:
     if not errors:
         return
-    summary = "；".join(errors[:3])
-    target["site_errors"] = errors
+    success_message = _site_success_message(errors)
+    if success_message:
+        target.setdefault("site_success_message", success_message)
+        log(f"站点成功提示：{success_message}")
+    error_items = [item for item in errors if _message_text(item) != success_message]
+    if not error_items:
+        return
+    summary = "；".join(error_items[:3])
+    target["site_errors"] = error_items
     target["site_error"] = summary
     log(f"站点原始错误：{summary}")
+
+
+async def _wait_for_site_success_message(
+    page,
+    collector: dict[str, Any] | None,
+    target: dict[str, Any],
+    timeout_ms: int = 3000,
+) -> str:
+    """短暂轮询 OAuth 回跳页，避免瞬时成功 Toast 消失后只能按额度差判断。"""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0, timeout_ms) / 1000
+    while True:
+        messages = await _site_error_messages(page, collector)
+        _attach_site_errors(target, messages)
+        success_message = str(target.get("site_success_message") or "").strip()
+        if success_message:
+            return success_message
+        if loop.time() >= deadline:
+            return ""
+        await asyncio.sleep(min(0.15, max(0, deadline - loop.time())))
 
 
 def _message_with_site_error(message: str, link: dict[str, Any]) -> str:
@@ -803,6 +873,71 @@ def _message_with_site_error(message: str, link: dict[str, Any]) -> str:
     if not site_error:
         return message
     return f"{message} 站点原始错误：{site_error}"
+
+
+def _oauth_checkin_result(quota_before: Any, quota_after: Any, link: dict[str, Any]) -> dict[str, Any]:
+    """综合额度变化、OAuth 回跳状态和站点弹窗生成签到结果。"""
+    result: dict[str, Any] = {
+        "quota_before": quota_before,
+        "quota_after": quota_after,
+        "delta": None,
+        "link": link,
+    }
+
+    if quota_before is not None and quota_after is not None and quota_after > quota_before:
+        delta = quota_after - quota_before
+        result["delta"] = delta
+        result["status"] = "success"
+        result["message"] = f"OAuth 重登成功，额度增加 {quota_to_usd(delta)}（当前 {quota_to_usd(quota_after)}）。"
+        return result
+
+    success_message = str(link.get("site_success_message") or "").strip()
+    oauth_completed = (
+        link.get("landed_back")
+        and not link.get("cloudflare")
+        and not link.get("need_human")
+        and not link.get("waf_blocked")
+    )
+    if oauth_completed and success_message:
+        result["status"] = "success"
+        result["message"] = f"签到成功（站点弹窗：{success_message}）。"
+        return result
+
+    if quota_before is None and quota_after is None:
+        if link.get("waf_blocked"):
+            # 出口 IP 被阿里云 WAF 持续风控：登录态本身可能仍有效，不是登录问题。
+            result["status"] = "need_verification"
+            result["message"] = _message_with_site_error(
+                "站点阿里云 WAF 持续拦截当前出口 IP（数据中心/CI IP 信誉过低），"
+                "浏览器无法通过 JS 挑战，本次签到中止。登录态可能仍有效，无需重新捕获；"
+                "请为该账号配置住宅代理（proxy 字段），或改用住宅 IP 环境运行。",
+                link,
+            )
+        elif link.get("cloudflare"):
+            result["status"] = "need_verification"
+            result["message"] = _message_with_site_error(
+                "OAuth 过程命中 Cloudflare/WAF 人机验证，无法自动完成，请重新捕获登录态。",
+                link,
+            )
+        else:
+            result["status"] = "need_login"
+            result["message"] = _message_with_site_error("无法读取额度，登录态可能已失效，请重新捕获登录态。", link)
+        return result
+
+    if oauth_completed:
+        cur = quota_after if quota_after is not None else quota_before
+        result["status"] = "already_done"
+        result["message"] = f"OAuth 重登完成，额度无变化（当前 {quota_to_usd(cur)}，今日可能已发放）。"
+        return result
+
+    reason = (
+        "停在第三方登录页（共享登录态可能已过期）"
+        if link.get("need_human")
+        else ("OAuth 授权未带 code 顺畅跳回站点" if not link.get("landed_back") else "OAuth 链路未顺畅完成")
+    )
+    result["status"] = "need_login"
+    result["message"] = _message_with_site_error(f"OAuth 自动重登未完成：{reason}。请重新捕获登录态。", link)
+    return result
 
 
 async def _fetch_oauth_client_id(page, base_url: str, provider) -> tuple[str, bool]:
@@ -2152,8 +2287,15 @@ async def run_oauth_checkin(
                 "link": link,
             }
 
-        # 等待 OAuth 完成
-        await asyncio.sleep(3)
+        # OAuth 回跳后优先捕获瞬时 Toast/弹窗。AgentRouter 的每日奖励提示可能早于额度接口更新，
+        # 也可能在固定等待结束前消失，因此不能只依赖 OAuth 前后额度差。
+        if link.get("landed_back") and not link.get("cloudflare") and not link.get("need_human"):
+            success_message = await _wait_for_site_success_message(page, error_collector, link, timeout_ms=3000)
+            if success_message:
+                log(f"已捕获 OAuth 签到成功弹窗：{success_message}")
+                await asyncio.sleep(0.5)
+        else:
+            await asyncio.sleep(3)
 
         # 读取 OAuth 后额度
         user_data_after = await read_user(page, base_url, fallback_uid, log)
@@ -2189,49 +2331,4 @@ async def run_oauth_checkin(
         await _safe_close_page(page)
         await _safe_close_browser(browser)
 
-    # 结果判定
-    result: dict[str, Any] = {
-        "quota_before": quota_before,
-        "quota_after": quota_after,
-        "delta": None,
-        "link": link,
-    }
-
-    if quota_before is None and quota_after is None:
-        if link.get("waf_blocked"):
-            # 出口 IP 被阿里云 WAF 持续风控：登录态本身可能仍有效，不是登录问题。
-            result["status"] = "need_verification"
-            result["message"] = _message_with_site_error(
-                "站点阿里云 WAF 持续拦截当前出口 IP（数据中心/CI IP 信誉过低），"
-                "浏览器无法通过 JS 挑战，本次签到中止。登录态可能仍有效，无需重新捕获；"
-                "请为该账号配置住宅代理（proxy 字段），或改用住宅 IP 环境运行。",
-                link,
-            )
-        elif link.get("cloudflare"):
-            result["status"] = "need_verification"
-            result["message"] = _message_with_site_error("OAuth 过程命中 Cloudflare/WAF 人机验证，无法自动完成，请重新捕获登录态。", link)
-        else:
-            result["status"] = "need_login"
-            result["message"] = _message_with_site_error("无法读取额度，登录态可能已失效，请重新捕获登录态。", link)
-        return result
-
-    if quota_before is not None and quota_after is not None and quota_after > quota_before:
-        delta = quota_after - quota_before
-        result["delta"] = delta
-        result["status"] = "success"
-        result["message"] = f"OAuth 重登成功，额度增加 {quota_to_usd(delta)}（当前 {quota_to_usd(quota_after)}）。"
-        return result
-
-    if link.get("landed_back") and not link.get("cloudflare") and not link.get("need_human"):
-        cur = quota_after if quota_after is not None else quota_before
-        result["status"] = "already_done"
-        result["message"] = f"OAuth 重登完成，额度无变化（当前 {quota_to_usd(cur)}，今日可能已发放）。"
-        return result
-
-    reason = (
-        "停在第三方登录页（共享登录态可能已过期）" if link.get("need_human")
-        else ("OAuth 授权未带 code 顺畅跳回站点" if not link.get("landed_back") else "OAuth 链路未顺畅完成")
-    )
-    result["status"] = "need_login"
-    result["message"] = _message_with_site_error(f"OAuth 自动重登未完成：{reason}。请重新捕获登录态。", link)
-    return result
+    return _oauth_checkin_result(quota_before, quota_after, link)

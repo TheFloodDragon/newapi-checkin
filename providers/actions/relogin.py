@@ -114,6 +114,8 @@ def run_action(site: SiteConfig, profile: SiteProfile, turnstile: str = "") -> C
         "oauth_landed_back": link.get("landed_back"),
         "oauth_frontend_entry": bool(link.get("frontend_entry")),
     }
+    if link.get("site_success_message"):
+        detail["site_success_message"] = link.get("site_success_message")
     if link.get("site_error"):
         detail["site_error"] = link.get("site_error")
     if link.get("site_errors"):

@@ -132,3 +132,63 @@ def test_run_sync_propagates_nested_exception() -> None:
             session.run_sync(fail())
 
     asyncio.run(outer())
+
+
+def test_site_success_message_extracts_agentrouter_toast() -> None:
+    assert session._site_success_message(["dom: 登录成功，今日奖励已发放"]) == "登录成功，今日奖励已发放"
+    assert session._site_success_message(["dom: 今日已签到", "dom: 登录失败，请重试"]) == ""
+
+
+def test_attach_site_errors_separates_success_toast_from_errors() -> None:
+    target: dict = {}
+
+    session._attach_site_errors(
+        target,
+        ["dom: 登录成功，今日奖励已发放", "response: HTTP 429 https://example.invalid/api/user"],
+    )
+
+    assert target["site_success_message"] == "登录成功，今日奖励已发放"
+    assert target["site_errors"] == ["response: HTTP 429 https://example.invalid/api/user"]
+    assert "登录成功" not in target["site_error"]
+
+
+def test_wait_for_site_success_message_captures_delayed_toast() -> None:
+    class FakePage:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def evaluate(self, _script: str) -> list[str]:
+            self.calls += 1
+            return [] if self.calls == 1 else ["登录成功，获得每日额度"]
+
+    page = FakePage()
+    target: dict = {}
+    message = asyncio.run(
+        session._wait_for_site_success_message(
+            page,
+            {"items": [], "tasks": []},
+            target,
+            timeout_ms=500,
+        )
+    )
+
+    assert message == "登录成功，获得每日额度"
+    assert target["site_success_message"] == message
+    assert page.calls == 2
+
+
+def test_oauth_result_uses_success_toast_when_quota_is_unchanged() -> None:
+    result = session._oauth_checkin_result(
+        1_000_000,
+        1_000_000,
+        {"landed_back": True, "site_success_message": "登录成功，今日奖励已发放"},
+    )
+
+    assert result["status"] == "success"
+    assert result["message"] == "签到成功（站点弹窗：登录成功，今日奖励已发放）。"
+
+
+def test_oauth_result_without_success_toast_remains_already_done() -> None:
+    result = session._oauth_checkin_result(1_000_000, 1_000_000, {"landed_back": True})
+
+    assert result["status"] == "already_done"
