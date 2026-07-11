@@ -116,24 +116,25 @@ def _site_cookie_string(cookies: list[dict[str, Any]], base_url: str) -> str:
     return "; ".join(f"{k}={v}" for k, v in pairs.items())
 
 
+# 驱动/浏览器已关闭的错误特征（模块级常量，避免每次调用重建元组）
+_DRIVER_CLOSED_MARKERS = (
+    "connection closed",
+    "target closed",
+    "browser has been closed",
+    "browser closed",
+    "page closed",
+    "socket.send()",
+    "closed while reading from the driver",
+    "playwright driver",
+    "pipe closed by peer",
+    "os.write(pipe",
+    "cannot read properties of undefined (reading 'url')",
+)
+
+
 def _is_driver_closed_error(exc: BaseException | str) -> bool:
     text = str(exc).lower()
-    return any(
-        marker in text
-        for marker in (
-            "connection closed",
-            "target closed",
-            "browser has been closed",
-            "browser closed",
-            "page closed",
-            "socket.send()",
-            "closed while reading from the driver",
-            "playwright driver",
-            "pipe closed by peer",
-            "os.write(pipe",
-            "cannot read properties of undefined (reading 'url')",
-        )
-    )
+    return any(marker in text for marker in _DRIVER_CLOSED_MARKERS)
 
 
 async def _safe_close_page(page) -> None:

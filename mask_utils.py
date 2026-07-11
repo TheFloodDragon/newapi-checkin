@@ -47,62 +47,53 @@ def _mask_value(value: str) -> str:
     return f"{value[:4]}{'•' * 6}{value[-4:]}"
 
 
+# 预编译脱敏正则：mask_secrets 会被每行输出/每个结果字段调用，
+# 预编译避免每次重复编译，降低脱敏开销。
+_COOKIE_PATTERNS = tuple(
+    re.compile(rf"({re.escape(key)}=)([^;\s\"',]+)", re.IGNORECASE) for key in _COOKIE_KEYS
+)
+_BEARER_RE = re.compile(r"(Bearer\s+)([A-Za-z0-9._\-]+)", re.IGNORECASE)
+_FIELD_RE = re.compile(
+    r"(?i)([\"']?(?:access_token|refresh_token|browser_state|oauth_state|password|secret|token|cookie|state)[\"']?\s*[:=]\s*[\"']?)([^\s,;\"'&}]+)"
+)
+_AUTH_RE = re.compile(r"(Authorization[\"']?\s*[:=]\s*[\"']?)(\S+)", re.IGNORECASE)
+_URL_CRED_RE = re.compile(r"(?i)(https?://)([^\s/@:]+):([^\s/@]+)@")
+_JWT_RE = re.compile(r"\b(eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{8,})?)\b")
+_SK_RE = re.compile(r"\b(sk-[A-Za-z0-9_-]{12,})\b", re.IGNORECASE)
+
+
+def _mask_group2(m: re.Match) -> str:
+    return m.group(1) + _mask_value(m.group(2))
+
+
+def _mask_group1(m: re.Match) -> str:
+    return _mask_value(m.group(1))
+
+
 def mask_secrets(text: str) -> str:
     """掩码文本中的 Cookie 值、Bearer token、Authorization 头等。"""
     if not text:
         return text
 
     # 1) key=value 形式的敏感 Cookie 字段
-    for key in _COOKIE_KEYS:
-        text = re.sub(
-            rf"({re.escape(key)}=)([^;\s\"',]+)",
-            lambda m: m.group(1) + _mask_value(m.group(2)),
-            text,
-            flags=re.IGNORECASE,
-        )
+    for pattern in _COOKIE_PATTERNS:
+        text = pattern.sub(_mask_group2, text)
 
     # 2) Bearer <token>
-    text = re.sub(
-        r"(Bearer\s+)([A-Za-z0-9._\-]+)",
-        lambda m: m.group(1) + _mask_value(m.group(2)),
-        text,
-        flags=re.IGNORECASE,
-    )
+    text = _BEARER_RE.sub(_mask_group2, text)
 
     # 3) JSON / repr / query-string 中的常见敏感字段。
-    text = re.sub(
-        r"(?i)([\"']?(?:access_token|refresh_token|browser_state|oauth_state|password|secret|token|cookie|state)[\"']?\s*[:=]\s*[\"']?)([^\s,;\"'&}]+)",
-        lambda m: m.group(1) + _mask_value(m.group(2)),
-        text,
-    )
+    text = _FIELD_RE.sub(_mask_group2, text)
 
     # 4) Authorization 头整行（含可能的 sk-... token）
-    text = re.sub(
-        r"(Authorization[\"']?\s*[:=]\s*[\"']?)(\S+)",
-        lambda m: m.group(1) + _mask_value(m.group(2)),
-        text,
-        flags=re.IGNORECASE,
-    )
+    text = _AUTH_RE.sub(_mask_group2, text)
 
     # 5) URL 中的 user:password@ 认证信息（代理或误配的站点 URL）。
-    text = re.sub(
-        r"(?i)(https?://)([^\s/@:]+):([^\s/@]+)@",
-        lambda m: f"{m.group(1)}{m.group(2)}:<redacted>@",
-        text,
-    )
+    text = _URL_CRED_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}:<redacted>@", text)
 
     # 6) 即使没有字段名，也掩码常见 JWT 和 sk-* 凭据。
-    text = re.sub(
-        r"\b(eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{8,})?)\b",
-        lambda m: _mask_value(m.group(1)),
-        text,
-    )
-    text = re.sub(
-        r"\b(sk-[A-Za-z0-9_-]{12,})\b",
-        lambda m: _mask_value(m.group(1)),
-        text,
-        flags=re.IGNORECASE,
-    )
+    text = _JWT_RE.sub(_mask_group1, text)
+    text = _SK_RE.sub(_mask_group1, text)
 
     return text
 

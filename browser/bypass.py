@@ -94,14 +94,12 @@ def _normalize_proxy(proxy: Any) -> dict[str, str] | None:
     host = parts.hostname
     server = f"{scheme}://{host}:{parts.port}" if parts.port else f"{scheme}://{host}"
 
+    from urllib.parse import unquote
+
     result: dict[str, str] = {"server": server}
     if parts.username:
-        from urllib.parse import unquote
-
         result["username"] = unquote(parts.username)
     if parts.password:
-        from urllib.parse import unquote
-
         result["password"] = unquote(parts.password)
     return result
 
