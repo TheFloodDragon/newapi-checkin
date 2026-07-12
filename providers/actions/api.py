@@ -91,11 +91,12 @@ def _checkin_once(site: SiteConfig, client: ProfileClient, turnstile: str) -> Ch
         _inject_current_quota(client, detail)
         return result
 
-    # 3) 需要 Turnstile 但未提供
+    # 3) 需要人机验证（Cloudflare Turnstile 或图形验证码）但未提供
     if status.turnstile_required and not turnstile:
         return CheckinResult(
             site.name, base_url, "need_verification",
-            "签到需要 Cloudflare Turnstile 人机验证，请在浏览器手动完成签到，或传入 --turnstile。",
+            "签到需要人机验证（Cloudflare Turnstile 或图形验证码），纯 HTTP 无法自动识别，"
+            "请在浏览器手动完成签到，或传入 --turnstile。",
             detail=status.raw,
         )
 

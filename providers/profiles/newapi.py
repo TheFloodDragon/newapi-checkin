@@ -134,7 +134,11 @@ class NewApiClient(ProfileClient):
         data = unwrap_data(self.get_checkin_status_raw())
         stats = data.get("stats", {}) if isinstance(data, dict) else {}
         checked_in = stats.get("checked_in_today") if "checked_in_today" in stats else None
-        return StatusInfo(checked_in_today=checked_in, raw=data)
+        # 部分 New API fork（如 jianzhile）签到需图形验证码：先 POST /api/user/checkin/captcha
+        # 取 captcha_id + captcha_image，人工/OCR 识别后带 captcha_answer 再签到。纯 HTTP
+        # 无法自动识别图片，这里标记为需人机验证，交由 action 层给出清晰的“需手动签到”结论。
+        captcha_required = bool(data.get("captcha_enabled")) if isinstance(data, dict) else False
+        return StatusInfo(checked_in_today=checked_in, turnstile_required=captcha_required, raw=data)
 
     def fetch_user(self) -> UserInfo:
         try:
