@@ -175,8 +175,9 @@ async def run_browser_script(
     script_path: str,
     script_args: dict[str, Any] | None = None,
     timeout: int = 120,
+    oauth_provider: str = "",
 ) -> BrowserScriptResult:
-    """启动 Camoufox、恢复登录态、执行用户脚本并归一化结果。"""
+    """启动 Camoufox、恢复登录态、按需完成 OAuth，然后执行用户脚本。"""
     try:
         script_file = resolve_script_path(script_path)
     except BrowserScriptError as exc:
@@ -208,7 +209,27 @@ async def run_browser_script(
         )
         await state.restore_storage_state(context, storage_state)
         page = await context.new_page()
-        await popups.setup_popup_guard(page, allowed_origin=_origin_from_url(site_view.base_url))
+        allowed_origin = _origin_from_url(site_view.base_url)
+        await popups.setup_popup_guard(page, allowed_origin=allowed_origin)
+
+        if oauth_provider:
+            # 共享 OAuth state 只包含第三方 provider 登录态；先完成站点 OAuth 回跳，
+            # 再把已认证的站点页面交给自定义脚本。
+            await page.goto(site_view.base_url, wait_until="domcontentloaded", timeout=60000)
+            await popups.dismiss_popups(page)
+            oauth_link = await session._trigger_oauth(page, site_view.base_url.rstrip("/"), oauth_provider)
+            if not oauth_link.get("landed_back") or oauth_link.get("need_human") or oauth_link.get("cloudflare"):
+                detail = {
+                    "checkin_source": "browser_script",
+                    "oauth_provider": oauth_provider,
+                    "oauth_landed_back": bool(oauth_link.get("landed_back")),
+                    "oauth_need_human": bool(oauth_link.get("need_human")),
+                    "oauth_cloudflare": bool(oauth_link.get("cloudflare")),
+                }
+                detail.update({key: value for key, value in oauth_link.items() if key not in detail})
+                return BrowserScriptResult("need_login", "OAuth 自动登录未完成，请检查共享登录态或站点 OAuth 配置。", detail)
+            await popups.dismiss_popups(page)
+
         helpers = ScriptHelpers(page, context, site_view, SCREENSHOT_DIR)
 
         maybe_result = run_func(page, context, site_view, helpers)

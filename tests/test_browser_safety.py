@@ -29,6 +29,102 @@ def _valid_state() -> dict:
     }
 
 
+def test_oauth_capture_auto_finishes_only_with_authenticated_cookie(monkeypatch) -> None:
+    class FakePage:
+        url = "https://linux.do"
+
+        async def goto(self, *_args, **_kwargs) -> None:
+            return None
+
+        async def title(self) -> str:
+            return "Linux.do"
+
+        async def close(self) -> None:
+            return None
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.page = FakePage()
+
+        async def new_page(self):
+            return self.page
+
+        async def cookies(self):
+            return [{"name": "_t", "value": "token", "domain": ".linux.do", "path": "/"}]
+
+        async def storage_state(self):
+            return {"cookies": await self.cookies(), "origins": []}
+
+    class FakeBrowser:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    browser = FakeBrowser()
+    context = FakeContext()
+
+    async def launch(**_kwargs):
+        return browser, context
+
+    async def wait_forever() -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(session.bypass, "launch_camoufox", launch)
+
+    result = asyncio.run(session.capture_oauth_state("linuxdo", wait_for_close=wait_forever))
+
+    assert result["ok"] is True
+    assert state.decode_state(result["state"])["cookies"][0]["name"] == "_t"
+    assert browser.closed is True
+
+
+def test_oauth_capture_rejects_anonymous_provider_cookie(monkeypatch) -> None:
+    class FakePage:
+        url = "https://linux.do"
+
+        async def goto(self, *_args, **_kwargs) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+    class FakeContext:
+        async def new_page(self):
+            return FakePage()
+
+        async def cookies(self):
+            return [{"name": "_forum_session", "value": "anonymous", "domain": ".linux.do"}]
+
+        async def storage_state(self):
+            raise AssertionError("匿名状态不应被导出")
+
+    class FakeBrowser:
+        async def close(self) -> None:
+            return None
+
+    async def launch(**_kwargs):
+        return FakeBrowser(), FakeContext()
+
+    async def finish_now() -> None:
+        return None
+
+    original_sleep = asyncio.sleep
+
+    async def fast_sleep(_delay: float) -> None:
+        await original_sleep(0)
+
+    monkeypatch.setattr(session.bypass, "launch_camoufox", launch)
+    monkeypatch.setattr(session.asyncio, "sleep", fast_sleep)
+
+    result = asyncio.run(session.capture_oauth_state("linuxdo", wait_for_close=finish_now))
+
+    assert result["ok"] is False
+    assert result["state"] == ""
+    assert "有效认证 Cookie" in result["message"]
+
+
 def test_state_roundtrip_and_schema_validation() -> None:
     encoded = state.encode_state(_valid_state())
     assert state.decode_state(encoded) == _valid_state()

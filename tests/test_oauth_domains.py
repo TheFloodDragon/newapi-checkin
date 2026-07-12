@@ -90,3 +90,22 @@ def test_state_contains_site_domain_uses_cookie_scope_direction() -> None:
     assert not accounts_store.state_contains_site_domain(child_cookie, "https://example.com")
     assert not accounts_store.state_contains_site_domain(parent_cookie, "https://example.com.evil.invalid")
     assert not accounts_store.state_contains_site_domain(parent_cookie, "not a valid host")
+
+
+@pytest.mark.parametrize(
+    ("provider", "cookies", "expected"),
+    [
+        ("linuxdo", [{"name": "_t", "value": "token", "domain": ".linux.do"}], True),
+        ("linuxdo", [{"name": "_forum_session", "value": "anon", "domain": ".linux.do"}], False),
+        ("linuxdo", [{"name": "_t", "value": "token", "domain": "evil-linux.do"}], False),
+        ("github", [{"name": "user_session", "value": "token", "domain": "github.com"}], True),
+        ("github", [{"name": "logged_in", "value": "yes", "domain": "github.com"}], False),
+        ("github", [{"name": "user_session", "value": "token", "domain": "github.com.evil.invalid"}], False),
+    ],
+)
+def test_provider_requires_authenticated_cookie(
+    provider: str,
+    cookies: list[dict[str, object]],
+    expected: bool,
+) -> None:
+    assert oauth_providers.get_oauth_provider(provider).has_authenticated_state(cookies) is expected

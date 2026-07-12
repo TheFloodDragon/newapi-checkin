@@ -23,6 +23,17 @@ def run_action(site: SiteConfig, profile: SiteProfile, turnstile: str = "") -> C
         return CheckinResult(site.name, base_url, "need_config", "未配置 browser_script 脚本路径")
 
     auth_method = (site.auth_method or "").strip().lower()
+    fallback_provider = accounts_store.normalize_oauth_provider(
+        getattr(site, "oauth_fallback_provider", "")
+    )
+    fallback_account = accounts_store.normalize_oauth_account(
+        getattr(site, "oauth_fallback_account", "")
+    )
+    fallback_state = (
+        accounts_store.oauth_state_text(fallback_provider, fallback_account)
+        if fallback_provider else ""
+    )
+
     if auth_method == "oauth":
         oauth_provider = accounts_store.normalize_oauth_provider(site.oauth_provider) or "linuxdo"
         oauth_account = accounts_store.normalize_oauth_account(getattr(site, "oauth_account", ""))
@@ -33,9 +44,11 @@ def run_action(site: SiteConfig, profile: SiteProfile, turnstile: str = "") -> C
             "oauth_provider": oauth_provider,
             "oauth_account": oauth_account,
         }
+        initial_oauth_provider = oauth_provider
     elif auth_method == "browser":
         state_text = site.browser_state
         detail = {"checkin_source": "browser_script", "auth_method": auth_method}
+        initial_oauth_provider = ""
     else:
         return CheckinResult(
             site.name,
@@ -45,22 +58,56 @@ def run_action(site: SiteConfig, profile: SiteProfile, turnstile: str = "") -> C
             detail={"checkin_source": "browser_script", "auth_method": auth_method},
         )
 
+    use_fallback_first = not str(state_text or "").strip() and bool(fallback_provider)
+    if use_fallback_first:
+        state_text = fallback_state
+        initial_oauth_provider = fallback_provider
+        detail.update({
+            "oauth_fallback_used": True,
+            "oauth_provider": fallback_provider,
+            "oauth_account": fallback_account,
+        })
+
     if not str(state_text or "").strip():
-        return CheckinResult(site.name, base_url, "need_login", "缺少浏览器/OAuth 登录态", detail=detail)
+        if fallback_provider:
+            message = f"缺少可选 OAuth {fallback_provider}:{fallback_account} 登录态，签到失败"
+        else:
+            message = "站点登录态缓存不存在，且未配置 OAuth 兜底，签到失败"
+        return CheckinResult(site.name, base_url, "error", message, detail=detail)
 
     try:
         runner = _load_runner()
     except Exception as exc:
         return CheckinResult(site.name, base_url, "error", f"加载 browser_script 运行器失败：{exc}", detail=detail)
 
-    try:
-        result = runner.run_sync(
+    def _run(state_value: str, provider_value: str = ""):
+        return runner.run_sync(
             site=site,
-            browser_state_text=state_text,
+            browser_state_text=state_value,
             script_path=site.script,
             script_args=site.script_args,
             timeout=site.script_timeout,
+            oauth_provider=provider_value,
         )
+
+    try:
+        result = _run(state_text, initial_oauth_provider)
+        if (
+            result.status == "need_login"
+            and fallback_provider
+            and not use_fallback_first
+            and fallback_state.strip()
+            and initial_oauth_provider != fallback_provider
+        ):
+            result = _run(fallback_state, fallback_provider)
+            detail.update({
+                "oauth_fallback_used": True,
+                "oauth_provider": fallback_provider,
+                "oauth_account": fallback_account,
+            })
+        elif result.status == "need_login" and auth_method == "browser" and not fallback_provider:
+            result.status = "error"
+            result.message = "站点登录态缓存已失效，且未配置 OAuth 兜底，签到失败"
     except Exception as exc:
         return CheckinResult(site.name, base_url, "error", f"浏览器脚本运行异常：{exc}", detail=detail)
 

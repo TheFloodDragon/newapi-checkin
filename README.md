@@ -247,6 +247,8 @@ Windows 可双击 `run_all_checkin.bat`。
 
 适合没有稳定接口、但页面上有「签到/领取」按钮的站点。程序按 `auth_method` 恢复登录态、启动 Camoufox、**只允许加载仓库内相对路径 Python 文件**（禁止绝对路径、`..`、URL），调用脚本的 `run(page, context, site, helpers)` 并返回 `{status, message, detail}`。内置示例：`scripts/checkin/100xlabs.py`。脚本可直接用 Playwright 的 `page/context`，也可用 `helpers.goto()` / `helpers.click_text()` / `helpers.screenshot()` / `helpers.success()` 等便捷方法。
 
+`auth_method=browser` 时可额外选择 `oauth_fallback_provider` + `oauth_fallback_account`，也可保持“不使用”：程序始终优先使用站点级 `browser_state`，登录态缺失或脚本明确返回 `need_login` 时，最多用共享 OAuth 登录态自动完成一次站点登录并重试脚本；若未选择 OAuth，则直接报告站点登录态失效、签到失败。OAuth 登录期间会在目标站点自动关闭公告、协议、守则、须知等遮挡弹窗，但不会在 Linux.do / GitHub 授权页启用该规则。
+
 ## 图形界面（GUI）
 
 ```bash
@@ -255,8 +257,8 @@ uv run python manage_accounts.py
 ```
 
 - 左侧站点列表，右侧编辑「站点配置 + 凭据」：选择站点类型、登录方式与签到方式（三维字段）；
-- `auth_method=oauth` 或 `checkin_action=relogin` 时出现 OAuth 提供商 + 账号控件，可**捕获 / 检测 OAuth 登录态**（写入顶层 `oauth_states`）；relogin 站点不保存站点级 `browser_state`；
-- `auth_method=browser` 时出现站点级「浏览器登录态」输入区；
+- `auth_method=oauth` 或 `checkin_action=relogin` 时出现 OAuth 提供商 + 账号控件，可**捕获 / 检测 OAuth 登录态**；捕获结果先加入当前内存配置并显示“未保存”，点击 `保存全部` 后写入顶层 `oauth_states`；relogin 站点不保存站点级 `browser_state`；
+- `auth_method=browser` 时出现站点级「浏览器登录态」输入区；自定义浏览器脚本还会显示「可选 OAuth」，直接列出顶层共享 `oauth_states` 中已有的账号；
 - `checkin_action=browser_script` 时出现脚本路径 / 参数 JSON / 超时控件（路径必须是仓库内相对路径）；
 - **测试签到 / 查询额度**：按当前三维字段跑一次，当场看结果；
 - **代理**：在「认证凭据」区填 `proxy`；
@@ -305,7 +307,7 @@ uv run python browser/poc_oauth.py run --base-url https://agentrouter.org --oaut
 
 ### Playwright Firefox 驱动崩溃补丁
 
-Playwright 1.6x Firefox 驱动在处理缺少 `location` 的 pageError 时会崩溃整个 Node 进程。`ci/patch_playwright.py`（`python -m ci.patch_playwright`）把驱动里 `pageError.location.url` 等改为空安全形式。脚本幂等、best-effort；`uv sync` 重装会还原驱动，故 CI 每次运行前都会执行。
+Playwright 1.6x Firefox 驱动在处理缺少 `location` 的 pageError，或在请求结束事件中拿到空的 `_existingResponse()` 时，可能崩溃整个 Node 进程。`ci/patch_playwright.py`（`python -m ci.patch_playwright`）会同时修复 `pageError.location` 与 `response2.setTransferSize` 空引用；补丁幂等、best-effort，并会在本地启动 Camoufox 前自动尝试一次。`uv sync` 重装会还原驱动，故 CI 每次运行前仍会执行。
 
 ## 开发与验证
 

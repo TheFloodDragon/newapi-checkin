@@ -31,6 +31,10 @@ const modalSelectors = [
   'div.semi-modal[aria-modal="true"]',
   '.modal[style*="display: block"]',
   '.ant-modal-wrap',
+  '.ant-drawer-content-wrapper',
+  '.semi-sidesheet[role="dialog"]',
+  '.semi-sidesheet',
+  '[data-testid*="modal"]',
 ];
 const closeSelectors = [
   'button.semi-modal-close',
@@ -39,6 +43,8 @@ const closeSelectors = [
   '.semi-modal-footer button.semi-button-primary',
   '.semi-modal-footer button:last-child',
   '.ant-modal-close',
+  '.ant-drawer-close',
+  'button.semi-sidesheet-close',
   '.modal-header button.close',
 ];
 const loginFieldSelectors = [
@@ -72,7 +78,7 @@ const findCloseButton = (modal) => {
     const btn = modal.querySelector(sel);
     if (btn && isVisible(btn)) return btn;
   }
-  const confirmText = /^(确认|确定|我知道了?|知道了|同意|接受|继续|OK|Got it|I understand)$/i;
+  const confirmText = /^(确认|确定|关闭|我知道了?|知道了|同意|接受|继续|我已阅读|已阅读|阅读并同意|同意并继续|接受并继续|不再提示|OK|Got it|I understand|Accept|Agree|Continue|Close)$/i;
   for (const btn of modal.querySelectorAll('button, [role="button"]')) {
     const text = (btn.innerText || btn.textContent || '').trim();
     if (btn && isVisible(btn) && confirmText.test(text)) return btn;

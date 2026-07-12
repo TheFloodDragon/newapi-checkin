@@ -56,6 +56,8 @@ class OAuthProvider(ABC):
     capture_url: str = ""
     # 用于判断 storage_state 是否包含该 provider 登录态的域名特征
     state_domain_hints: tuple[str, ...] = ()
+    # 只有这些认证 Cookie 才代表真正登录；普通匿名/CSRF Cookie 不能判成功。
+    authenticated_cookie_names: tuple[str, ...] = ()
     # 授权 URL 附加 scope（github 需要）
     scope: str = ""
 
@@ -78,12 +80,25 @@ class OAuthProvider(ABC):
         """当前 HTTPS URL 是否处于该 provider 的授权域名边界下。"""
         return url_matches_domains(url, self.state_domain_hints)
 
+    def has_authenticated_state(self, cookies: list[dict[str, object]]) -> bool:
+        """storage/context cookies 是否包含当前 provider 的真实认证会话。"""
+        for cookie in cookies:
+            name = str(cookie.get("name") or "")
+            domain = str(cookie.get("domain") or "")
+            value = str(cookie.get("value") or "")
+            if name not in self.authenticated_cookie_names or not value:
+                continue
+            if any(hostname_matches_domain(domain, hint) for hint in self.state_domain_hints):
+                return True
+        return False
+
 
 class LinuxDoProvider(OAuthProvider):
     key = "linuxdo"
     authorize_endpoint = "https://connect.linux.do/oauth2/authorize"
     capture_url = "https://linux.do"
     state_domain_hints = ("linux.do", "connect.linux.do")
+    authenticated_cookie_names = ("_t",)
     approve_selectors = ['a[href^="/oauth2/approve"]', 'button:has-text("允许")', 'button:has-text("Authorize")']
     login_markers = ["#login-account-name", "#login-account-password", "#login-button"]
 
@@ -93,6 +108,7 @@ class GitHubProvider(OAuthProvider):
     authorize_endpoint = "https://github.com/login/oauth/authorize"
     capture_url = "https://github.com/login"
     state_domain_hints = ("github.com",)
+    authenticated_cookie_names = ("user_session", "__Host-user_session_same_site")
     scope = "user:email"
     approve_selectors = ['button[name="authorize"][value="1"]', 'button[type="submit"]']
     login_markers = ["#login_field", "#password"]

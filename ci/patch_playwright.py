@@ -59,16 +59,15 @@ def log(msg: str) -> None:
     print(f"[patch_playwright] {msg}")
 
 
-# Marker proving the unsafe form is still present. If gone, assume patched.
-UNSAFE_MARKER = "pageError.location.url"
+# 每个 marker 对应一个可独立修复的 Playwright Firefox 驱动缺陷。
+PAGE_ERROR_UNSAFE_MARKER = "pageError.location.url"
+NETWORK_RESPONSE_UNSAFE_MARKER = """const response2 = request2.request._existingResponse();
+        response2.setTransferSize(event.transferSize);"""
 
-# Each entry maps the original (unsafe) field expression to a null-safe form
-# that also yields a validator-acceptable value ("" for url, 0 for line/column).
+# Each entry maps the original unsafe snippet to a safe form.
 #
-# CRITICAL: the replacement text must NOT contain the exact substring
-# "pageError.location.url" (that is UNSAFE_MARKER, used for idempotency and the
-# post-patch sanity check). Writing "(pageError.location && pageError.location.url)"
-# would still contain that substring and make the marker check fail forever.
+# CRITICAL: pageError replacement text must NOT contain PAGE_ERROR_UNSAFE_MARKER，
+# 否则幂等检查会一直认为它尚未修复。
 # Using the "(pageError.location||{})" prefix breaks the substring: the text
 # becomes "(pageError.location||{}).url" -- no ".location.url" run anywhere.
 # When location is undefined this yields ({}).url === undefined, so we still need
@@ -86,7 +85,18 @@ REPLACEMENTS = (
         "pageError.location.columnNumber",
         "((pageError.location||{}).columnNumber||0)",
     ),
+    (
+        NETWORK_RESPONSE_UNSAFE_MARKER,
+        """const response2 = request2.request._existingResponse();
+        if (!response2) {
+          this._requests.delete(request2._id);
+          return;
+        }
+        response2.setTransferSize(event.transferSize);""",
+    ),
 )
+
+UNSAFE_MARKERS = (PAGE_ERROR_UNSAFE_MARKER, NETWORK_RESPONSE_UNSAFE_MARKER)
 
 
 def find_core_bundle() -> Path | None:
@@ -138,10 +148,10 @@ def main() -> int:
         log(f"cannot read {target}: {exc}; skipping (exit 0).")
         return 0
 
-    # Idempotency: if the unsafe form is already gone, assume patched. The
-    # replacement text does not contain UNSAFE_MARKER, so re-runs are safe.
-    if UNSAFE_MARKER not in text:
-        log(f"already patched (no unsafe '{UNSAFE_MARKER}' found); skipping.")
+    # 两类缺陷独立判断；即使旧 pageError 补丁已应用，也不能跳过新的网络补丁。
+    present_markers = [marker for marker in UNSAFE_MARKERS if marker in text]
+    if not present_markers:
+        log("already patched (no known unsafe markers found); skipping.")
         return 0
 
     patched, total = apply_replacements(text)
@@ -149,11 +159,10 @@ def main() -> int:
         log("no expected snippets matched; skipping (exit 0).")
         return 0
 
-    # Sanity check: the unsafe marker must be gone after patching, otherwise we
-    # would loop forever across CI runs. If it is somehow still present, bail
-    # without writing so we do not corrupt the bundle.
-    if UNSAFE_MARKER in patched:
-        log("unsafe marker still present after patch; aborting write (exit 0).")
+    # 所有本次检测到的 marker 都必须消失，否则不写文件，避免半修复。
+    remaining = [marker for marker in present_markers if marker in patched]
+    if remaining:
+        log(f"unsafe marker(s) still present after patch: {len(remaining)}; aborting write (exit 0).")
         return 0
 
     try:

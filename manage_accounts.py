@@ -861,9 +861,10 @@ class App(QMainWindow):
         self.cur: int | None = None
         self._lock = False
         self._dirty = False
-        self._saved_snapshot: list[dict[str, Any]] = []
+        self._saved_snapshot: dict[str, Any] = {"accounts": [], "oauth_states": {}}
         self._type_buttons: dict[str, QPushButton] = {}
         self._worker: BrowserWorker | None = None
+        self._capture_dialog: QMessageBox | None = None
         self._thread_pool = QThreadPool.globalInstance()
         self._thread_pool.setMaxThreadCount(5)
         # 站点状态缓存：{base_url|name: {"quota_usd":..., "checked_in":..., "ok":..., "status":..., "message":...}}
@@ -1241,14 +1242,21 @@ class App(QMainWindow):
         self.oauth_state_status.setWordWrap(True)
         self.state_wrap.layout().addWidget(self.oauth_state_status)
 
-        # 可选 OAuth 兜底：Token/Cookie 失效时是否用共享 OAuth 登录态自动刷新。
+        # 可选 OAuth 兜底：从已保存的共享 OAuth provider/account 中选择。
         # 选“不使用”时失效直接报错，不启动浏览器。
         self.oauth_fallback_wrap = self._field(cred_layout, "可选 OAuth")
+        fallback_row = QHBoxLayout()
+        fallback_row.setContentsMargins(0, 0, 0, 0)
+        fallback_row.setSpacing(8)
         self.oauth_fallback_combo = NoWheelComboBox()
         self.oauth_fallback_combo.setObjectName("input")
         self.oauth_fallback_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.oauth_fallback_combo.addItem("不使用", "")
-        self.oauth_fallback_wrap.layout().addWidget(self.oauth_fallback_combo)
+        fallback_row.addWidget(self.oauth_fallback_combo, 1)
+        self.btn_oauth_fallback_refresh = _button("刷新账号", "tool")
+        self.btn_oauth_fallback_refresh.clicked.connect(self._reload_oauth_accounts)
+        fallback_row.addWidget(self.btn_oauth_fallback_refresh)
+        self.oauth_fallback_wrap.layout().addLayout(fallback_row)
 
         # 浏览器登录态操作（捕获 / 检测），整体随 state_wrap 显隐
         self.browser_ops = QWidget()
@@ -2195,11 +2203,23 @@ class App(QMainWindow):
         self.oauth_fallback_combo.blockSignals(True)
         self.oauth_fallback_combo.clear()
         self.oauth_fallback_combo.addItem("不使用", "")
+        saved_count = 0
         for provider in OAUTH_PROVIDERS:
             accounts = dict(((self.oauth_states.get(provider) or {}).get("accounts") or {}))
-            for account in sorted(accounts):
+            names = sorted(accounts)
+            if accounts_store.DEFAULT_OAUTH_ACCOUNT in names:
+                names.remove(accounts_store.DEFAULT_OAUTH_ACCOUNT)
+                names.insert(0, accounts_store.DEFAULT_OAUTH_ACCOUNT)
+            for account in names:
+                entry = accounts.get(account) or {}
+                username = str(entry.get("username") or "").strip()
                 label = f"{OAUTH_PROVIDER_LABELS.get(provider, provider)} / {account}"
+                if username and username != account:
+                    label += f" · {username}"
                 self.oauth_fallback_combo.addItem(label, f"{provider}:{account}")
+                saved_count += 1
+        if not saved_count:
+            self.oauth_fallback_combo.addItem("暂无共享 OAuth 登录态（请先捕获）", "")
         idx = self.oauth_fallback_combo.findData(selected_data)
         self.oauth_fallback_combo.setCurrentIndex(max(idx, 0))
         self.oauth_fallback_combo.blockSignals(False)
@@ -2321,7 +2341,10 @@ class App(QMainWindow):
         self.script_timeout_wrap.setVisible(is_script)
         self.oauth_provider_wrap.setVisible(needs_oauth)
         self.oauth_account_wrap.setVisible(needs_oauth)
-        can_optional_oauth = t == "sub2api" and action == "api" and auth_method == "access_token"
+        can_optional_oauth = (
+            (t == "sub2api" and action == "api" and auth_method == "access_token")
+            or (is_script and auth_method == "browser")
+        )
         self.oauth_fallback_wrap.setVisible(can_optional_oauth)
         fallback_provider, fallback_account = self._current_oauth_fallback()
         fallback_enabled = can_optional_oauth and bool(fallback_provider)
@@ -2353,12 +2376,29 @@ class App(QMainWindow):
             else:
                 self.mode_hint.setText("💡 OAuth 登录态按“提供商 + 账号”保存，可被多个站点复用；浏览器重登会自动使用 OAuth 登录方式。")
         elif is_browser:
-            self.oauth_state_status.setText("")
             self.btn_capture.setText("浏览器登录捕获")
             self.btn_verify.setText("检测登录态")
-            if is_script:
-                self.mode_hint.setText("💡 自定义脚本会用当前站点的浏览器登录态启动浏览器，并由脚本控制页面点击。脚本路径请使用仓库内相对路径。")
+            if is_script and can_optional_oauth:
+                if fallback_enabled:
+                    saved = self._oauth_state_entry(fallback_provider, fallback_account)
+                    state_len = len(str(saved.get("state") or ""))
+                    label = f"{OAUTH_PROVIDER_LABELS.get(fallback_provider, fallback_provider)} / {fallback_account}"
+                    self.oauth_state_status.setText(
+                        f"可选 OAuth：{label}（{state_len} 字符）"
+                        if state_len else f"可选 OAuth：{label}（未保存登录态）"
+                    )
+                else:
+                    has_shared_oauth = any(
+                        ((self.oauth_states.get(provider) or {}).get("accounts") or {})
+                        for provider in OAUTH_PROVIDERS
+                    )
+                    self.oauth_state_status.setText(
+                        "暂无共享 OAuth 登录态；请切换登录方式为“OAuth 登录态（共享账号）”后捕获，或点击“刷新账号”。"
+                        if not has_shared_oauth else "可选 OAuth 当前未启用；可从已保存的共享账号中选择。"
+                    )
+                self.mode_hint.setText("💡 自定义脚本始终先使用当前站点浏览器登录态；失效后最多通过可选 OAuth 自动登录并重试一次。不选择 OAuth 时将直接提示签到失败。可选账号来自顶层共享 OAuth 登录态。")
             else:
+                self.oauth_state_status.setText("")
                 self.mode_hint.setText("💡 站点浏览器登录态仅用于当前站点，不会作为共享 OAuth 账号使用。")
         elif can_optional_oauth:
             if fallback_enabled:
@@ -2367,8 +2407,18 @@ class App(QMainWindow):
                 label = f"{OAUTH_PROVIDER_LABELS.get(fallback_provider, fallback_provider)} / {fallback_account}"
                 self.oauth_state_status.setText(f"{label}（{state_len} 字符）" if state_len else f"{label}（未保存登录态）")
             else:
-                self.oauth_state_status.setText("")
-            self.mode_hint.setText("")
+                has_shared_oauth = any(
+                    ((self.oauth_states.get(provider) or {}).get("accounts") or {})
+                    for provider in OAUTH_PROVIDERS
+                )
+                self.oauth_state_status.setText(
+                    "暂无共享 OAuth 登录态；请切换登录方式为“OAuth 登录态（共享账号）”后捕获，或点击“刷新账号”。"
+                    if not has_shared_oauth else ""
+                )
+            if is_script:
+                self.mode_hint.setText("💡 自定义脚本始终先使用当前站点浏览器登录态；失效后最多通过可选 OAuth 自动登录并重试一次。不选择 OAuth 时将直接提示签到失败。可选账号来自顶层共享 OAuth 登录态。")
+            else:
+                self.mode_hint.setText("")
         else:
             self.oauth_state_status.setText("")
             self.btn_capture.setText("浏览器登录捕获")
@@ -2403,8 +2453,12 @@ class App(QMainWindow):
         row["oauth_provider"] = self._current_oauth_provider()
         row["oauth_account"] = self._current_oauth_account()
         fallback_provider, fallback_account = self._current_oauth_fallback()
-        row["oauth_fallback_provider"] = fallback_provider
-        row["oauth_fallback_account"] = fallback_account
+        can_optional_oauth = (
+            (row["type"] == "sub2api" and row["checkin_action"] == "api" and row["auth_method"] == "access_token")
+            or (row["checkin_action"] == "browser_script" and row["auth_method"] == "browser")
+        )
+        row["oauth_fallback_provider"] = fallback_provider if can_optional_oauth else ""
+        row["oauth_fallback_account"] = fallback_account if can_optional_oauth and fallback_provider else ""
         row["user_id"] = self.uid_edit.text().strip()
         row["access_token"] = self.token_edit.text().strip()
         row["cookie"] = self.cookie_edit.toPlainText().strip()
@@ -2415,6 +2469,24 @@ class App(QMainWindow):
         self._sync_dirty_state()
 
     # ── 脏标记 ──
+    @staticmethod
+    def _normalized_fallback(row: dict[str, Any], *, auth_method: str, checkin_action: str, site_type: str) -> tuple[str, str]:
+        """返回当前流程实际会持久化的 OAuth 兜底配置。
+
+        隐藏控件留下的 OAuth fallback 不属于非 browser_script/browser 流程的有效配置；
+        在脏状态比较时忽略它们，避免仅切换渠道就显示“未保存”。
+        """
+        enabled = (
+            (site_type == "sub2api" and checkin_action == "api" and auth_method == "access_token")
+            or (checkin_action == "browser_script" and auth_method == "browser")
+        )
+        if not enabled:
+            return "", ""
+        provider = accounts_store.normalize_oauth_provider(row.get("oauth_fallback_provider"))
+        if not provider:
+            return "", ""
+        return provider, accounts_store.normalize_oauth_account(row.get("oauth_fallback_account"))
+
     def _rows_snapshot(self) -> list[dict[str, Any]]:
         snapshot: list[dict[str, Any]] = []
         for row in self.rows:
@@ -2428,6 +2500,12 @@ class App(QMainWindow):
             api_variant = row.get("api_variant") if row.get("api_variant") in API_VARIANTS else "auto"
             oauth_provider = accounts_store.normalize_oauth_provider(row.get("oauth_provider")) or "linuxdo"
             oauth_account = accounts_store.normalize_oauth_account(row.get("oauth_account") or row.get("oauth_account_id"))
+            fallback_provider, fallback_account = self._normalized_fallback(
+                row,
+                auth_method=auth_method,
+                checkin_action=checkin_action,
+                site_type=site_type,
+            )
             snapshot.append(
                 {
                     "name": str(row.get("name") or "").strip(),
@@ -2441,8 +2519,8 @@ class App(QMainWindow):
                     "api_variant": api_variant,
                     "oauth_provider": oauth_provider,
                     "oauth_account": oauth_account,
-                    "oauth_fallback_provider": str(row.get("oauth_fallback_provider") or ""),
-                    "oauth_fallback_account": str(row.get("oauth_fallback_account") or ""),
+                    "oauth_fallback_provider": fallback_provider,
+                    "oauth_fallback_account": fallback_account,
                     "enabled": bool(row.get("enabled", True)),
                     "user_id": str(row.get("user_id") or "").strip(),
                     "access_token": str(row.get("access_token") or "").strip(),
@@ -2452,6 +2530,13 @@ class App(QMainWindow):
                 }
             )
         return snapshot
+
+    def _config_snapshot(self) -> dict[str, Any]:
+        """生成完整内存配置快照，包含站点与共享 OAuth 登录态。"""
+        return {
+            "accounts": self._rows_snapshot(),
+            "oauth_states": accounts_store.normalize_oauth_states(copy.deepcopy(self.oauth_states)),
+        }
 
     def _set_dirty(self, dirty: bool) -> None:
         if self._dirty == dirty:
@@ -2463,10 +2548,10 @@ class App(QMainWindow):
         self.status.style().polish(self.status)
 
     def _sync_dirty_state(self) -> None:
-        self._set_dirty(self._rows_snapshot() != self._saved_snapshot)
+        self._set_dirty(self._config_snapshot() != self._saved_snapshot)
 
     def _mark_saved(self) -> None:
-        self._saved_snapshot = self._rows_snapshot()
+        self._saved_snapshot = self._config_snapshot()
         self._set_dirty(False)
 
     def _shutdown_workers(self) -> None:
@@ -2753,10 +2838,17 @@ class App(QMainWindow):
             if auth_method == "oauth" or checkin_action == "relogin":
                 acct["oauth_provider"] = accounts_store.normalize_oauth_provider(row.get("oauth_provider")) or "linuxdo"
                 acct["oauth_account"] = accounts_store.normalize_oauth_account(row.get("oauth_account") or row.get("oauth_account_id"))
-            fallback_provider = accounts_store.normalize_oauth_provider(row.get("oauth_fallback_provider"))
+            fallback_provider, fallback_account = self._normalized_fallback(
+                row,
+                auth_method=auth_method,
+                checkin_action=checkin_action,
+                site_type=t,
+            )
+            row["oauth_fallback_provider"] = fallback_provider
+            row["oauth_fallback_account"] = fallback_account
             if fallback_provider:
                 acct["oauth_fallback_provider"] = fallback_provider
-                acct["oauth_fallback_account"] = accounts_store.normalize_oauth_account(row.get("oauth_fallback_account"))
+                acct["oauth_fallback_account"] = fallback_account
             # 接口变体仅 newapi + 接口签到 时有意义
             if t == "newapi" and checkin_action == "api":
                 variant = row.get("api_variant") if row.get("api_variant") in API_VARIANTS else "auto"
@@ -2847,6 +2939,10 @@ class App(QMainWindow):
     def _on_browser_failed(self, msg: str) -> None:
         self._set_browser_buttons(True)
         action = getattr(getattr(self, "_worker", None), "action", "")
+        if action == "capture":
+            dlg = self._capture_dialog
+            if dlg is not None and dlg.isVisible():
+                dlg.done(0)
         title = {
             "query": "查询失败",
             "site_checkin": "签到失败",
@@ -2882,17 +2978,18 @@ class App(QMainWindow):
         dlg.setWindowTitle("OAuth 登录态捕获" if is_oauth else "浏览器登录捕获")
         if is_oauth:
             dlg.setText(
-                f"已打开浏览器窗口。\n\n请在其中登录 {provider_label}（账号：{account}），完成可能出现的验证后，"
-                "点下方「我已完成登录」。"
+                f"已打开浏览器窗口。\n\n请在其中登录 {provider_label}（账号：{account}）。"
+                "检测到有效登录态后窗口会自动关闭；若需提前检查，可点击下方按钮。"
             )
         else:
             dlg.setText(
                 "已打开浏览器窗口。\n\n请在其中完成登录并回到站点控制台，"
                 "然后点下方「我已完成登录」。"
             )
-        done_btn = dlg.addButton("我已完成登录", QMessageBox.AcceptRole)
+        done_btn = dlg.addButton("手动检查登录态" if is_oauth else "我已完成登录", QMessageBox.AcceptRole)
         dlg.setStandardButtons(QMessageBox.NoButton)
         dlg.setIcon(QMessageBox.Information)
+        self._capture_dialog = dlg
 
         def _on_capture_done(result: dict[str, Any]) -> None:
             if dlg.isVisible():
@@ -2902,20 +2999,32 @@ class App(QMainWindow):
                     provider = result.get("provider") or params.get("oauth_provider") or "linuxdo"
                     account = accounts_store.normalize_oauth_account(params.get("oauth_account"))
                     try:
-                        accounts_store.save_oauth_state(provider, account, result["state"], result.get("username", ""))
-                        self.oauth_states = accounts_store.load_oauth_states()
+                        provider = accounts_store.normalize_oauth_provider(provider)
+                        if not provider:
+                            raise ValueError("未知 OAuth 提供商")
+                        provider_bucket = self.oauth_states.setdefault(provider, {"accounts": {}})
+                        provider_accounts = provider_bucket.setdefault("accounts", {})
+                        provider_accounts[account] = {
+                            "state": str(result["state"] or "").strip(),
+                            "username": str(result.get("username") or ""),
+                            "updated_at": datetime.now().isoformat(timespec="seconds"),
+                        }
+                        self.oauth_states = accounts_store.normalize_oauth_states(self.oauth_states)
                     except Exception as exc:
-                        _bg_log("ERROR", "保存 OAuth 登录态失败", oauth_provider=provider, oauth_account=account, error=exc)
-                        QMessageBox.critical(self, "保存 OAuth 登录态失败", mask_secrets(str(exc)))
+                        _bg_log("ERROR", "暂存 OAuth 登录态失败", oauth_provider=provider, oauth_account=account, error=exc)
+                        QMessageBox.critical(self, "暂存 OAuth 登录态失败", mask_secrets(str(exc)))
                         return
-                    _bg_log("INFO", "保存 OAuth 登录态", oauth_provider=provider, oauth_account=account, username=result.get("username", ""), state_chars=len(str(result.get("state") or "")))
+                    _bg_log("INFO", "暂存 OAuth 登录态", oauth_provider=provider, oauth_account=account, username=result.get("username", ""), state_chars=len(str(result.get("state") or "")))
                     self._refresh_oauth_account_choices(account)
+                    fallback_provider, fallback_account = self._current_oauth_fallback()
+                    self._refresh_oauth_fallback_choices(fallback_provider, fallback_account)
                     self._sync_type()
+                    self._sync_dirty_state()
                     QMessageBox.information(
                         self, "捕获成功",
-                        result.get("message", "OAuth 登录态已保存。"),
+                        f"{result.get('message', 'OAuth 登录态已捕获。')}\n\n登录态已加入当前内存配置，请点击“保存全部”写入文件。",
                     )
-                    self._say(f"已保存 {provider}:{account} 登录态")
+                    self._say(f"已暂存 {provider}:{account} 登录态，请点“保存全部”")
                 else:
                     if self.cur is not None:
                         self._lock = True
@@ -2936,13 +3045,15 @@ class App(QMainWindow):
         worker.start()
 
         dlg.exec()
-        # 无论用户点「我已完成登录」还是用 Esc / 窗口 X 关闭对话框，都要通知 worker 收尾，
+        # 无论自动检测完成、用户手动检查，还是用 Esc / 窗口 X 关闭对话框，都通知 worker 收尾，
         # 否则 capture 的等待循环会空转最长 600s，期间浏览器按钮禁用、站点任务锁不释放。
         if dlg.clickedButton() is done_btn:
             self._say("正在读取并打包登录态…")
         else:
             self._say("已关闭登录窗口，正在收尾…")
         worker.request_close()
+        if self._capture_dialog is dlg:
+            self._capture_dialog = None
 
     def _delete_oauth_account(self) -> None:
         provider = self._current_oauth_provider()
@@ -2954,23 +3065,27 @@ class App(QMainWindow):
         ret = QMessageBox.question(
             self,
             "删除 OAuth 登录态",
-            f"删除 {provider}:{account} 的 OAuth 登录态？\n\n站点配置会保留账号名，但下次运行前需要重新捕获登录态。",
+            f"从当前配置删除 {provider}:{account} 的 OAuth 登录态？\n\n"
+            "站点配置会保留账号名；点击“保存全部”后才会写入文件。",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
         if ret != QMessageBox.Yes:
             return
-        try:
-            accounts_store.delete_oauth_state(provider, account)
-            self.oauth_states = accounts_store.load_oauth_states()
-        except Exception as exc:
-            _bg_log("ERROR", "删除 OAuth 登录态失败", oauth_provider=provider, oauth_account=account, error=exc)
-            QMessageBox.critical(self, "删除失败", mask_secrets(str(exc)))
-            return
-        _bg_log("INFO", "删除 OAuth 登录态", oauth_provider=provider, oauth_account=account)
+        provider_accounts = ((self.oauth_states.get(provider) or {}).get("accounts") or {})
+        provider_accounts.pop(account, None)
+        if provider_accounts:
+            self.oauth_states[provider] = {"accounts": provider_accounts}
+        else:
+            self.oauth_states.pop(provider, None)
+        self.oauth_states = accounts_store.normalize_oauth_states(self.oauth_states)
+        _bg_log("INFO", "暂存删除 OAuth 登录态", oauth_provider=provider, oauth_account=account)
+        fallback_provider, fallback_account = self._current_oauth_fallback()
         self._refresh_oauth_account_choices(account)
+        self._refresh_oauth_fallback_choices(fallback_provider, fallback_account)
         self._sync_type()
-        self._say(f"已删除 {provider}:{account} 登录态")
+        self._sync_dirty_state()
+        self._say(f"已从当前配置删除 {provider}:{account} 登录态，请点“保存全部”")
 
     def _browser_verify(self) -> None:
         if self._browser_busy():

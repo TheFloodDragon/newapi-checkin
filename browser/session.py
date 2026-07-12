@@ -1518,33 +1518,51 @@ async def capture_oauth_state(
         # provider 页面不安装通用站点公告守卫，避免误作用到 OAuth 授权/提示弹窗。
         await _safe_goto(page, provider.capture_url, wait_until="domcontentloaded", timeout=30000, log=log)
 
+        # 自动轮询真正的认证 Cookie。访问 provider 登录页本身也会产生匿名/CSRF Cookie，
+        # 因此不能再以“存在 provider 域 Cookie”作为登录成功依据。
         if wait_for_close:
             import inspect
             ret = wait_for_close()
-            if inspect.isawaitable(ret):
-                await ret
+            close_task = asyncio.create_task(ret) if inspect.isawaitable(ret) else None
         else:
-            log("等待 60 秒后自动关闭浏览器...")
-            await asyncio.sleep(60)
+            log("等待登录成功，最长 60 秒后自动结束...")
+            close_task = asyncio.create_task(asyncio.sleep(60))
+
+        authenticated = False
+        try:
+            while True:
+                cookies = await context.cookies()
+                if provider.has_authenticated_state(cookies):
+                    authenticated = True
+                    log(f"已自动检测到 {provider.key} 有效登录态，正在关闭浏览器并保存...")
+                    break
+                if close_task is None or close_task.done():
+                    if close_task is not None:
+                        close_task.result()
+                    break
+                await asyncio.sleep(0.4)
+        finally:
+            if close_task is not None and not close_task.done():
+                close_task.cancel()
+                try:
+                    await close_task
+                except asyncio.CancelledError:
+                    pass
+
+        if not authenticated:
+            msg = f"未检测到 {provider.key} 有效认证 Cookie，请确认登录成功后重试。"
+            log(msg)
+            return {"ok": False, "message": msg, "state": "", "username": "", "provider": provider.key}
 
         storage_state_dict = await _safe_storage_state(context, log)
         encoded_state = state.encode_state(storage_state_dict)
         cookies = storage_state_dict.get("cookies", [])
         domains = {str(c.get("domain", "")).lstrip(".") for c in cookies if c.get("domain")}
-        has_provider_state = any(
-            any(hint in domain for hint in provider.state_domain_hints)
-            for domain in domains
-        )
         username = ""
         try:
             username = (await page.title()) or ""
         except Exception:
             pass
-
-        if not has_provider_state:
-            msg = f"未检测到 {provider.key} 登录态 Cookie，请确认已在浏览器中完成登录。"
-            log(msg)
-            return {"ok": False, "message": msg, "state": "", "username": "", "provider": provider.key}
 
         log(f"{provider.key} 登录态捕获成功，域名：{','.join(sorted(domains))}")
         return {
