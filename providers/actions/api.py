@@ -31,6 +31,28 @@ from ._common import build_http_client, credentials_ready, usd_str
 VERIFICATION_PATTERNS = ["Turnstile", "Cloudflare", "Just a moment", "安全验证", "challenge-platform", "人机", "验证", "captcha"]
 
 
+def _need_login_message(site: SiteConfig) -> str:
+    """按认证方式生成可操作的登录失效提示。"""
+    auth_method = (site.auth_method or "").strip().lower()
+    fallback_provider = str(getattr(site, "oauth_fallback_provider", "") or "").strip()
+    if fallback_provider:
+        account = str(getattr(site, "oauth_fallback_account", "") or "default").strip()
+        return (
+            f"账号缓存已失效，可选 OAuth {fallback_provider}:{account} 自动登录刷新未成功；"
+            "请检查对应 OAuth 登录态，或在站点登录状态中取消可选 OAuth。"
+        )
+    if auth_method == "oauth":
+        provider = str(getattr(site, "oauth_provider", "") or "linuxdo").strip()
+        account = str(getattr(site, "oauth_account", "") or "default").strip()
+        return (
+            f"账号缓存已失效，已尝试通过 {provider}:{account} OAuth 自动登录刷新但未成功；"
+            "请在管理界面重新捕获对应 OAuth 登录态。"
+        )
+    if auth_method == "browser":
+        return "账号缓存已失效，浏览器登录态自动刷新未成功；请重新捕获该站点登录态。"
+    return "登录态无效或已过期，请重新导出凭据。"
+
+
 def _build_detail(client: ProfileClient, reward: CheckinReward) -> dict[str, Any]:
     detail: dict[str, Any] = {"checkin_source": "api", "quota_is_usd": client.quota_is_usd}
     detail.update(reward.extra)
@@ -75,7 +97,7 @@ def _checkin_once(site: SiteConfig, client: ProfileClient, turnstile: str) -> Ch
         if kind == "already_done":
             return CheckinResult(site.name, base_url, "already_done", exc.message, detail=exc.payload)
         if kind == "need_login":
-            return CheckinResult(site.name, base_url, "need_login", "登录态无效或已过期，请重新导出凭据。", detail=exc.payload)
+            return CheckinResult(site.name, base_url, "need_login", _need_login_message(site), detail=exc.payload)
         if kind == "need_verification":
             return CheckinResult(site.name, base_url, "need_verification", exc.message, detail=exc.payload)
         # 状态接口失败不致命：继续尝试签到
@@ -116,7 +138,7 @@ def _checkin_once(site: SiteConfig, client: ProfileClient, turnstile: str) -> Ch
         if kind == "already_done":
             return CheckinResult(site.name, base_url, "already_done", exc.message, detail=exc.payload)
         if kind == "need_login":
-            return CheckinResult(site.name, base_url, "need_login", "登录态无效或已过期，请重新导出凭据。", detail=exc.payload)
+            return CheckinResult(site.name, base_url, "need_login", _need_login_message(site), detail=exc.payload)
         if kind == "need_verification":
             return CheckinResult(site.name, base_url, "need_verification", exc.message, detail=exc.payload)
         return CheckinResult(site.name, base_url, "error", exc.message, detail=exc.payload)
@@ -166,7 +188,7 @@ def query_action(site: SiteConfig, profile: SiteProfile) -> QueryStatus:
                 return QueryStatus(ok=False, message=f"站点暂时不可达或接口限流：{exc.message}", status="network_error", detail=exc.payload)
             kind = client.classify(exc)
             if kind == "need_login":
-                return QueryStatus(ok=False, message="登录态无效或已过期", status="need_login", detail=exc.payload)
+                return QueryStatus(ok=False, message=_need_login_message(site), status="need_login", detail=exc.payload)
             if kind == "need_verification":
                 return QueryStatus(ok=False, message=exc.message, status="need_verification", detail=exc.payload)
             return QueryStatus(ok=False, message=exc.message, status="error", detail=exc.payload)

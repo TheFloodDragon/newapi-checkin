@@ -54,12 +54,19 @@ class FakeProfile:
         *,
         refresh_result: AuthInfo | None = None,
         refresh_error: BrowserAuthError | None = None,
+        lazy_result: FakeClient | None = None,
     ) -> None:
         self.client = client
         self.refresh_result = refresh_result
         self.refresh_error = refresh_error
+        self.lazy_result = lazy_result
         self.refresh_calls = 0
         self.build_calls = 0
+        self.lazy_calls = 0
+
+    def build_lazy_refresh_client(self, site: SiteConfig) -> FakeClient | None:
+        self.lazy_calls += 1
+        return self.lazy_result
 
     def supports_browser_refresh(self) -> bool:
         return True
@@ -145,6 +152,36 @@ def test_http_credentials_never_trigger_browser_refresh(auth_method: str) -> Non
     assert profile.build_calls == 1
     assert client.user_calls == 1
     assert client.status_calls == 1
+
+
+def test_access_token_expiry_reports_error_without_oauth_refresh() -> None:
+    client = FakeClient(login_error_on="user")
+    profile = FakeProfile(client, refresh_result=AuthInfo(access_token="should-not-be-used"))
+
+    result = api.query_action(_site("access_token"), profile)
+
+    assert result.status == "need_login"
+    assert "重新导出凭据" in result.message
+    assert profile.lazy_calls == 0
+    assert profile.refresh_calls == 0
+    assert profile.build_calls == 1
+    assert client.user_calls == 1
+
+
+def test_optional_oauth_selection_enables_lazy_fallback_client() -> None:
+    client = FakeClient()
+    profile = FakeProfile(client, lazy_result=client)
+    site = _site("access_token")
+    site.oauth_fallback_provider = "linuxdo"
+    site.oauth_fallback_account = "default"
+
+    result = api.query_action(site, profile)
+
+    assert result.ok is True
+    assert profile.lazy_calls == 1
+    assert profile.refresh_calls == 0
+    assert profile.build_calls == 0
+    assert client.user_calls == 1
 
 
 @pytest.mark.parametrize("query", [False, True])

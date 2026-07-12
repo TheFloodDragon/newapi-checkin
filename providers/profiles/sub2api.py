@@ -144,12 +144,38 @@ def _extract_username(data: Any) -> str:
 class Sub2ApiClient(ProfileClient):
     quota_is_usd = True
 
-    def __init__(self, site: SiteConfig, auth: AuthInfo) -> None:
+    def __init__(
+        self,
+        site: SiteConfig,
+        auth: AuthInfo,
+        token_refresher: Any = None,
+    ) -> None:
         self.site = site
         self.base_url = normalize_base_url(site.base_url)
         self.access_token = normalize_access_token(auth.access_token or site.access_token)
         self.cookie = normalize_cookie(auth.cookie or site.cookie)
         self._user_cache: UserInfo | None = None
+        # 缓存优先的惰性刷新：仅当接口返回登录失效时，才调用一次刷新出新 token。
+        self._token_refresher = token_refresher
+        self._refresh_used = False
+
+    def _maybe_refresh_token(self, error: ApiError) -> bool:
+        """接口返回登录失效时，按需刷新一次 access_token；成功刷新返回 True。"""
+        if self._token_refresher is None or self._refresh_used:
+            return False
+        if error.transient or self.classify(error) != "need_login":
+            return False
+        self._refresh_used = True
+        try:
+            new_token = self._token_refresher()
+        except Exception:
+            return False
+        token = normalize_access_token(str(new_token or ""))
+        if not token or token == self.access_token:
+            return False
+        self.access_token = token
+        self._user_cache = None
+        return True
 
     def _headers(self) -> dict[str, str]:
         headers = {
@@ -167,28 +193,38 @@ class Sub2ApiClient(ProfileClient):
 
     def request(self, method: str, path: str, body: dict | None = None, *, retry_non_idempotent: bool = False) -> Any:
         url = self.base_url + API_PREFIX + path
-        headers = self._headers()
 
         raw_body: bytes | None = None
         if method.upper() in {"POST", "PUT", "PATCH"}:
-            headers["Content-Type"] = "application/json"
             raw_body = json.dumps(body or {}).encode("utf-8")
 
-        payload = http_request(
-            url,
-            method=method,
-            headers=headers,
-            body=raw_body,
-            proxy=self.site.proxy,
-            retry_non_idempotent=retry_non_idempotent,
-            verify_ssl=getattr(self.site, "verify_ssl", True),
-        )
-        # Sub2API 统一响应：{code:0, data:{...}}；code != 0 视为失败
-        if isinstance(payload, dict) and "code" in payload:
-            code = payload.get("code")
-            if code not in (0, "0", None):
-                raise ApiError(None, payload, extract_message(payload))
-        return payload
+        def _once() -> Any:
+            headers = self._headers()
+            if raw_body is not None:
+                headers["Content-Type"] = "application/json"
+            payload = http_request(
+                url,
+                method=method,
+                headers=headers,
+                body=raw_body,
+                proxy=self.site.proxy,
+                retry_non_idempotent=retry_non_idempotent,
+                verify_ssl=getattr(self.site, "verify_ssl", True),
+            )
+            # Sub2API 统一响应：{code:0, data:{...}}；code != 0 视为失败
+            if isinstance(payload, dict) and "code" in payload:
+                code = payload.get("code")
+                if code not in (0, "0", None):
+                    raise ApiError(None, payload, extract_message(payload))
+            return payload
+
+        try:
+            return _once()
+        except ApiError as exc:
+            # 登录失效（如 JWT 过期）时，用浏览器 OAuth 刷新一次新 token 再重试。
+            if self._maybe_refresh_token(exc):
+                return _once()
+            raise
 
     def request_usage(self) -> Any:
         """按用户提供的余额脚本请求 {base_url}/v1/usage。"""
@@ -230,7 +266,40 @@ class Sub2ApiClient(ProfileClient):
 
     # ── ProfileClient 接口 ──
     def fetch_status(self) -> StatusInfo:
-        # 标准 Sub2API 源码没有 check-in 状态接口；用用户资料/用量接口验证登录态并读取余额。
+        # 带签到扩展的 fork（如 100xLabs）提供 GET /api/v1/check-in/status，返回今日是否已签、
+        # 余额等。先尝试它；不存在（404/405）或非标准 fork 时回落到用户资料/用量接口。
+        try:
+            data = unwrap_data(self.request("GET", "/check-in/status"))
+        except ApiError as exc:
+            if exc.transient:
+                raise
+            if not self._is_unsupported_checkin_error(exc):
+                # 401 等登录失效已在 request 内触发过刷新重试；这里若仍失败按需向上暴露。
+                kind = self.classify(exc)
+                if kind in {"need_login", "need_verification"}:
+                    raise
+            data = None
+
+        if isinstance(data, dict):
+            checked_in = data.get("checked_in_today")
+            if checked_in is None:
+                checked_in = data.get("checked_in")
+            balance = _extract_standard_balance(data)
+            quota_usd = self.quota_to_usd(balance) if balance is not None else None
+            if quota_usd is None:
+                try:
+                    user = self.fetch_user()
+                    quota_usd = self.quota_to_usd(user.quota_raw)
+                except ApiError:
+                    quota_usd = None
+            return StatusInfo(
+                checked_in_today=bool(checked_in) if checked_in is not None else None,
+                turnstile_required=False,
+                quota_usd=quota_usd,
+                raw={"source": "/check-in/status", "payload": data},
+            )
+
+        # 标准 Sub2API（无签到扩展）：用用户资料/用量接口验证登录态并读取余额。
         user = self.fetch_user()
         return StatusInfo(
             checked_in_today=None,
@@ -390,6 +459,22 @@ class Sub2ApiProfile(SiteProfile):
     def build_client(self, site: SiteConfig, auth: AuthInfo) -> ProfileClient:
         return Sub2ApiClient(site, auth)
 
+    def build_lazy_refresh_client(self, site: SiteConfig) -> ProfileClient | None:
+        """oauth/browser 场景下的缓存优先客户端：先用已缓存 access_token 调接口，
+        仅当接口返回登录失效（如 JWT 过期）时，才用浏览器 OAuth 刷新一次新 token。
+
+        避免每次签到都启动浏览器：只有缓存 token 已存在时才走此路径；无缓存 token 时
+        返回 None，交由 build_http_client 回落到及早浏览器刷新。
+        """
+        cached = normalize_access_token(site.access_token)
+        if not cached:
+            return None
+        return Sub2ApiClient(
+            site,
+            AuthInfo(access_token=cached),
+            token_refresher=lambda: self.refresh_token_via_browser(site),
+        )
+
     def supports_browser_refresh(self) -> bool:
         return True
 
@@ -398,7 +483,19 @@ class Sub2ApiProfile(SiteProfile):
         candidates: list[tuple[str, str]] = []
         auth_method = (site.auth_method or "cookie").strip().lower()
         site_state = (site.browser_state or "").strip()
-        if auth_method == "browser":
+        fallback_provider = str(getattr(site, "oauth_fallback_provider", "") or "").strip()
+        if fallback_provider:
+            # 独立的可选 OAuth 兜底：不改变 auth_method；只有缓存 Token 失效时才会调用到这里。
+            try:
+                import accounts_store
+                provider = accounts_store.normalize_oauth_provider(fallback_provider)
+                account = accounts_store.normalize_oauth_account(getattr(site, "oauth_fallback_account", ""))
+                text = accounts_store.oauth_state_text(provider, account).strip()
+                if text:
+                    candidates.append((f"可选 OAuth {provider}:{account}", text))
+            except Exception:
+                pass
+        elif auth_method == "browser":
             if site_state:
                 candidates.append(("站点 browser_state", site_state))
         elif auth_method == "oauth":

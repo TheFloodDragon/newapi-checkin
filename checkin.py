@@ -133,6 +133,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--login-selector", default="", help="旧兼容字段：OAuth 登录入口选择器（当前 relogin 不再使用）")
     parser.add_argument("--oauth-provider", default="linuxdo", choices=accounts_store.KNOWN_OAUTH_PROVIDERS, help="OAuth 提供商：linuxdo / github")
     parser.add_argument("--oauth-account", default=accounts_store.DEFAULT_OAUTH_ACCOUNT, help="OAuth 账号名（同一 provider 下多账号，默认 default）")
+    parser.add_argument("--oauth-fallback-provider", default="", choices=("", *accounts_store.KNOWN_OAUTH_PROVIDERS), help=argparse.SUPPRESS)
+    parser.add_argument("--oauth-fallback-account", default=accounts_store.DEFAULT_OAUTH_ACCOUNT, help=argparse.SUPPRESS)
     parser.add_argument("--proxy", default="", help="代理 URL（HTTP API 支持 http/https；浏览器流程可使用 socks5）")
     parser.add_argument("--turnstile", default="", help="如站点要求 Turnstile，可临时传入验证值")
     parser.add_argument("--workers", type=int, default=0, help="同时执行的最大任务数，默认最多 8 个")
@@ -183,6 +185,8 @@ def _execute(args: argparse.Namespace) -> tuple[dict[str, object] | list[dict[st
             "login_selector": args.login_selector,
             "oauth_provider": args.oauth_provider,
             "oauth_account": args.oauth_account,
+            "oauth_fallback_provider": args.oauth_fallback_provider,
+            "oauth_fallback_account": args.oauth_fallback_account,
             "browser_state": os.environ.get("CHECKIN_BROWSER_STATE", ""),
             "proxy": args.proxy or os.environ.get("CHECKIN_PROXY", ""),
         }

@@ -115,6 +115,8 @@ def build_site_tasks() -> list[CheckinTask]:
             continue
         oauth_provider = site_config.oauth_provider
         oauth_account = site_config.oauth_account
+        oauth_fallback_provider = site_config.oauth_fallback_provider
+        oauth_fallback_account = site_config.oauth_fallback_account
 
         command = [
             sys.executable, str(CHECKIN_SCRIPT),
@@ -152,6 +154,11 @@ def build_site_tasks() -> list[CheckinTask]:
             env_values["CHECKIN_USER_ID"] = user_id
         if auth_method == "oauth" or checkin_action == "relogin":
             command.extend(["--oauth-provider", oauth_provider, "--oauth-account", oauth_account])
+        if oauth_fallback_provider:
+            command.extend([
+                "--oauth-fallback-provider", oauth_fallback_provider,
+                "--oauth-fallback-account", oauth_fallback_account,
+            ])
         # 站点未配 proxy 时，回退到全局 CHECKIN_PROXY（CI 可从 Secret 注入住宅代理，
         # 用于绕过阿里云 WAF 对数据中心/CI 出口 IP 的持续风控）。
         proxy = str(site.get("proxy") or "").strip() or os.environ.get("CHECKIN_PROXY", "").strip()
@@ -181,7 +188,7 @@ def build_site_tasks() -> list[CheckinTask]:
         if checkin_action == "browser_script":
             script_timeout = accounts_store.parse_script_timeout(site.get("script_timeout"), Timeouts.BROWSER_SCRIPT_DEFAULT)
             task_timeout = float(script_timeout) + Timeouts.BROWSER_STARTUP_OVERHEAD
-        elif auth_method in {"browser", "oauth"} or checkin_action == "relogin":
+        elif auth_method in {"browser", "oauth"} or checkin_action == "relogin" or oauth_fallback_provider:
             task_timeout = Timeouts.BROWSER_TASK
         else:
             task_timeout = Timeouts.HTTP_TASK

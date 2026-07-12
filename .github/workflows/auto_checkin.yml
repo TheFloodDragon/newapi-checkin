@@ -24,6 +24,15 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v7
 
+      - name: 恢复上次签到结果缓存
+        id: results_cache
+        uses: actions/cache/restore@v6
+        with:
+          path: results
+          key: ${{ runner.os }}-checkin-results-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ${{ runner.os }}-checkin-results-
+
       - name: 设置 uv
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
         with:
@@ -148,6 +157,13 @@ jobs:
       - name: 生成签到报告
         if: always()
         run: uv run python -m ci.report
+
+      - name: 保存本次签到结果缓存
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: results
+          key: ${{ runner.os }}-checkin-results-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: 输出报告
         if: always()

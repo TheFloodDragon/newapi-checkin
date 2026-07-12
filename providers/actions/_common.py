@@ -81,16 +81,42 @@ def build_http_client(site: SiteConfig, profile: SiteProfile) -> ProfileClient:
     成 need_verification 等状态；刷新无结果时直接返回 need_login，不构造空凭据客户端。
     """
     auth_method = (site.auth_method or "cookie").strip().lower()
+    build_lazy = getattr(profile, "build_lazy_refresh_client", None)
+    # 独立的「可选 OAuth」只在明确选择时启用；未选择时完全沿用普通 Token/Cookie 流程。
+    fallback_provider = accounts_store.normalize_oauth_provider(
+        getattr(site, "oauth_fallback_provider", "")
+    )
+    if fallback_provider and auth_method == "access_token" and callable(build_lazy):
+        lazy_client = build_lazy(site)
+        if lazy_client is not None:
+            return lazy_client
     if auth_method in {"browser", "oauth"}:
+        # OAuth/浏览器登录方式本身仍支持缓存优先。
+        lazy_client = build_lazy(site) if callable(build_lazy) else None
+        if lazy_client is not None:
+            return lazy_client
         if profile.supports_browser_refresh():
             auth = profile.refresh_auth_via_browser(site)
             if auth is not None:
                 persist_refreshed_auth(site, auth)
                 return profile.build_client(site, auth)
-        raise BrowserAuthError(
-            "need_login",
-            f"auth_method={auth_method} 登录态刷新失败，请重新捕获对应登录态。",
-        )
+        if auth_method == "oauth":
+            provider = accounts_store.normalize_oauth_provider(getattr(site, "oauth_provider", "")) or "linuxdo"
+            account = accounts_store.normalize_oauth_account(getattr(site, "oauth_account", ""))
+            message = (
+                f"账号缓存已失效，且通过 {provider}:{account} OAuth 自动登录刷新失败；"
+                "请在管理界面重新捕获对应 OAuth 登录态。"
+            )
+            detail = {
+                "cache_expired": True,
+                "auth_method": auth_method,
+                "oauth_provider": provider,
+                "oauth_account": account,
+            }
+        else:
+            message = "账号缓存已失效，浏览器登录态自动刷新失败；请重新捕获该站点登录态。"
+            detail = {"cache_expired": True, "auth_method": auth_method}
+        raise BrowserAuthError("need_login", message, detail=detail)
     if auth_method in {"access_token", "cookie"}:
         return profile.build_client(site, load_auth(site))
     return profile.build_client(site, AuthInfo())

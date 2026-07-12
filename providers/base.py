@@ -79,8 +79,10 @@ class SiteConfig:
     # ── 浏览器 / 网络 ──
     browser_profile: str = ".browser_profile"
     login_selector: str = ""  # 旧字段，仅兼容保留；relogin 已改用 oauth_provider 拼授权 URL
-    oauth_provider: str = "linuxdo"  # OAuth 共享第三方登录态：linuxdo / github
-    oauth_account: str = "default"   # OAuth 账号名（provider 内多账号）
+    oauth_provider: str = "linuxdo"  # auth_method=oauth 时使用的共享登录态
+    oauth_account: str = "default"
+    oauth_fallback_provider: str = ""  # Token 失效后的可选 OAuth；空表示禁用
+    oauth_fallback_account: str = "default"
     proxy: str = ""
     referer_path: str = "/profile"
     # ── 其它 ──
@@ -238,6 +240,19 @@ class SiteProfile(ABC):
     def supports_browser_refresh(self) -> bool:
         """该 profile 是否支持用浏览器登录态刷新认证（browser + api 组合）。"""
         return False
+
+    def build_lazy_refresh_client(self, site: SiteConfig) -> ProfileClient | None:
+        """缓存优先的惰性刷新客户端（oauth / browser 场景）。
+
+        与 refresh_auth_via_browser 的「每次都先启动浏览器刷新」不同：这里用配置里
+        已缓存的 access_token 直接构造客户端，仅当接口返回登录失效（401/token 过期）
+        时，才在请求层按需启动一次浏览器 OAuth/refresh_token 刷新并重试。
+        这样有效期内的 token 可纯 HTTP 直调，避免每次签到都拉起浏览器。
+
+        不支持或没有可用缓存 token 时返回 None，由 build_http_client 回退到
+        refresh_auth_via_browser 的即时刷新路径。
+        """
+        return None
 
     def refresh_token_via_browser(self, site: SiteConfig) -> str | None:
         """用 browser_state 刷新出最新 access_token；不支持或失败返回 None。"""

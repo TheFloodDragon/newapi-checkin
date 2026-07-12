@@ -17,6 +17,7 @@ import os
 import sys
 import time
 import traceback
+from datetime import datetime
 from typing import Any
 
 try:
@@ -235,6 +236,8 @@ def _rows() -> list[dict[str, Any]]:
                 "api_variant": api_variant,
                 "oauth_provider": oauth_provider,
                 "oauth_account": oauth_account,
+                "oauth_fallback_provider": accounts_store.normalize_oauth_provider(row.get("oauth_fallback_provider")),
+                "oauth_fallback_account": accounts_store.normalize_oauth_account(row.get("oauth_fallback_account")),
                 "enabled": accounts_store.parse_enabled(row.get("enabled"), True),
                 "user_id": row.get("user_id", ""),
                 "access_token": row.get("access_token", ""),
@@ -269,6 +272,13 @@ def _badge(text: str, fg: str, bg: str) -> QLabel:
         """
     )
     return label
+
+
+class NoWheelComboBox(QComboBox):
+    """禁止滚轮直接改变选项；下拉框仍可正常点击选择。"""
+
+    def wheelEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
+        event.ignore()
 
 
 def _query_failure_label(status: str, *, compact: bool = False) -> str:
@@ -438,15 +448,24 @@ class SiteItemWidget(QWidget):
                 self.status_pill.setText("—")
                 self.status_pill.setProperty("kind", "unknown")
             self.status_pill.setToolTip(message)
+
+            def _fmt(value: float) -> str:
+                # 自适应格式：>=0.01 显示 2 位小数，<0.01 显示 4 位小数
+                return f"${value:.2f}" if value >= 0.01 else f"${value:.4f}"
+
             if quota is not None:
                 suffix = "" if not status.get("cached") else " (缓存)"
-                # 自适应格式：>=0.01 显示 2 位小数，<0.01 显示 4 位小数
-                fmt = f"${quota:.2f}" if quota >= 0.01 else f"${quota:.4f}"
-                self.quota_label.setText(f"{fmt}{suffix}")
+                self.quota_label.setText(f"{_fmt(quota)}{suffix}")
                 self.quota_label.setToolTip(message)
             else:
-                self.quota_label.setText("")
-                self.quota_label.setToolTip(message)
+                # 失效/未取到实时额度时，回退展示失效前的历史额度（灰显标注）。
+                last_quota = status.get("last_quota_usd")
+                if isinstance(last_quota, (int, float)):
+                    self.quota_label.setText(f"{_fmt(last_quota)} (失效前)")
+                    self.quota_label.setToolTip(f"失效前的最后额度\n{message}" if message else "失效前的最后额度")
+                else:
+                    self.quota_label.setText("")
+                    self.quota_label.setToolTip(message)
         self.status_pill.style().unpolish(self.status_pill)
         self.status_pill.style().polish(self.status_pill)
 
@@ -1119,7 +1138,7 @@ class App(QMainWindow):
 
         # 登录方式（auth_method）：如何获得已认证会话
         auth_wrap = self._field(site_layout, "登录方式")
-        self.auth_combo = QComboBox()
+        self.auth_combo = NoWheelComboBox()
         self.auth_combo.setObjectName("input")
         self.auth_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         for m in AUTH_METHODS:
@@ -1128,7 +1147,7 @@ class App(QMainWindow):
 
         # 签到方式（checkin_action）：如何触发发额度
         action_wrap = self._field(site_layout, "签到方式")
-        self.action_combo = QComboBox()
+        self.action_combo = NoWheelComboBox()
         self.action_combo.setObjectName("input")
         self.action_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         for m in CHECKIN_ACTIONS:
@@ -1137,7 +1156,7 @@ class App(QMainWindow):
 
         # OAuth provider/account：OAuth 登录方式可见，决定使用哪份共享第三方登录态
         self.oauth_provider_wrap = self._field(site_layout, "OAuth 提供商", "共享登录态来源")
-        self.oauth_provider_combo = QComboBox()
+        self.oauth_provider_combo = NoWheelComboBox()
         self.oauth_provider_combo.setObjectName("input")
         self.oauth_provider_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         for m in OAUTH_PROVIDERS:
@@ -1148,7 +1167,7 @@ class App(QMainWindow):
         account_row = QHBoxLayout()
         account_row.setContentsMargins(0, 0, 0, 0)
         account_row.setSpacing(8)
-        self.oauth_account_combo = QComboBox()
+        self.oauth_account_combo = NoWheelComboBox()
         self.oauth_account_combo.setObjectName("input")
         self.oauth_account_combo.setEditable(True)
         self.oauth_account_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -1163,7 +1182,7 @@ class App(QMainWindow):
 
         # 接口变体（api_variant）：仅 newapi + 接口签到 时可见
         self.variant_wrap = self._field(site_layout, "接口变体", "仅 New API 接口签到")
-        self.variant_combo = QComboBox()
+        self.variant_combo = NoWheelComboBox()
         self.variant_combo.setObjectName("input")
         self.variant_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         for m in API_VARIANTS:
@@ -1210,7 +1229,7 @@ class App(QMainWindow):
 
         # 登录态：browser 保存站点级登录态；oauth 使用 provider/account 共享登录态
         self.state_wrap = self._field(
-            cred_layout, "浏览器登录态", "poc_oauth.py setup 产物，用于自动登录 / 刷新 token"
+            cred_layout, "站点登录状态", "poc_oauth.py setup 产物，用于自动登录 / 刷新 token"
         )
         self.state_edit = QPlainTextEdit()
         self.state_edit.setObjectName("textInput")
@@ -1221,6 +1240,15 @@ class App(QMainWindow):
         self.oauth_state_status.setObjectName("hintText")
         self.oauth_state_status.setWordWrap(True)
         self.state_wrap.layout().addWidget(self.oauth_state_status)
+
+        # 可选 OAuth 兜底：Token/Cookie 失效时是否用共享 OAuth 登录态自动刷新。
+        # 选“不使用”时失效直接报错，不启动浏览器。
+        self.oauth_fallback_wrap = self._field(cred_layout, "可选 OAuth")
+        self.oauth_fallback_combo = NoWheelComboBox()
+        self.oauth_fallback_combo.setObjectName("input")
+        self.oauth_fallback_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.oauth_fallback_combo.addItem("不使用", "")
+        self.oauth_fallback_wrap.layout().addWidget(self.oauth_fallback_combo)
 
         # 浏览器登录态操作（捕获 / 检测），整体随 state_wrap 显隐
         self.browser_ops = QWidget()
@@ -1262,6 +1290,7 @@ class App(QMainWindow):
         self.action_combo.currentIndexChanged.connect(self._on_combo_changed)
         self.oauth_provider_combo.currentIndexChanged.connect(self._on_oauth_provider_changed)
         self.oauth_account_combo.currentIndexChanged.connect(self._on_oauth_account_changed)
+        self.oauth_fallback_combo.currentIndexChanged.connect(self._on_oauth_fallback_changed)
         if self.oauth_account_combo.lineEdit():
             self.oauth_account_combo.lineEdit().editingFinished.connect(self._on_combo_changed)
         self.variant_combo.currentIndexChanged.connect(self._on_combo_changed)
@@ -1439,41 +1468,112 @@ class App(QMainWindow):
         return float(cq) if detail.get("quota_is_usd") else float(cq) / 500000
 
     def _load_cached_status(self) -> None:
-        """从 results/checkin_result.json 预填状态缓存（上次签到结果）。"""
+        """预填状态缓存：先读 results/checkin_result.json（批量签到结果），
+        再合并 results/gui_status_cache.json（GUI 内实时查询/签到的最新额度）。
+
+        GUI 缓存里带 saved_at 时间戳的条目更"新"（可能来自关程序前的手动查询），
+        与批量结果按时间取新者，让重开程序仍能显示上次看到的额度。"""
         path = accounts_store.SCRIPT_DIR / "results" / "checkin_result.json"
+        if path.exists():
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8-sig"))
+                rows = payload.get("results", []) if isinstance(payload, dict) else []
+                batch_saved_at = str(payload.get("generated_at") or "") if isinstance(payload, dict) else ""
+            except Exception:
+                rows, batch_saved_at = [], ""
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+                base = accounts_store.normalize_base_url(str(item.get("base_url") or ""))
+                name = str(item.get("site") or "")
+                if not base and not name:
+                    continue
+                key = f"{base}|{name}"
+                # 解析额度字符串（如 "$246.1"）为 float
+                quota_usd = None
+                cq = str(item.get("current_quota") or "").lstrip("$")
+                try:
+                    quota_usd = float(cq) if cq else None
+                except ValueError:
+                    quota_usd = None
+                cached_status = str(item.get("status") or "")
+                ok = cached_status in ("success", "already_done")
+                checked_in = True if ok else None
+                self._status_cache[key] = {
+                    "quota_usd": quota_usd if ok else None,
+                    # 失效结果也保留解析到的历史额度，供渲染层灰显「失效前额度」。
+                    "last_quota_usd": quota_usd,
+                    "checked_in": checked_in,
+                    "ok": ok,
+                    "status": cached_status or ("success" if ok else "error"),
+                    "message": item.get("note") or item.get("message") or "",
+                    "cached": True,  # 标记为缓存（非实时）
+                    "saved_at": batch_saved_at,
+                }
+        self._merge_gui_status_cache()
+
+    def _merge_gui_status_cache(self) -> None:
+        """读取 GUI 状态缓存，与已有缓存按 saved_at 取新者合并。"""
+        path = accounts_store.SCRIPT_DIR / "results" / "gui_status_cache.json"
         if not path.exists():
             return
         try:
             payload = json.loads(path.read_text(encoding="utf-8-sig"))
-            rows = payload.get("results", []) if isinstance(payload, dict) else []
         except Exception:
             return
-        for item in rows:
-            if not isinstance(item, dict):
+        entries = payload.get("entries") if isinstance(payload, dict) else None
+        if not isinstance(entries, dict):
+            return
+        for key, entry in entries.items():
+            if not isinstance(entry, dict):
                 continue
-            base = accounts_store.normalize_base_url(str(item.get("base_url") or ""))
-            name = str(item.get("site") or "")
-            if not base and not name:
-                continue
-            key = f"{base}|{name}"
-            # 解析额度字符串（如 "$246.1"）为 float
-            quota_usd = None
-            cq = str(item.get("current_quota") or "").lstrip("$")
-            try:
-                quota_usd = float(cq) if cq else None
-            except ValueError:
-                quota_usd = None
-            cached_status = str(item.get("status") or "")
-            ok = cached_status in ("success", "already_done")
-            checked_in = True if ok else None
-            self._status_cache[key] = {
-                "quota_usd": quota_usd if ok else None,
-                "checked_in": checked_in,
-                "ok": ok,
-                "status": cached_status or ("success" if ok else "error"),
-                "message": item.get("note") or item.get("message") or "",
-                "cached": True,  # 标记为缓存（非实时）
+            existing = self._status_cache.get(key)
+            if existing is not None:
+                # 已有批量结果：仅当 GUI 缓存更新（saved_at 更大）时才覆盖。
+                if str(entry.get("saved_at") or "") <= str(existing.get("saved_at") or ""):
+                    continue
+            merged = {
+                "quota_usd": entry.get("quota_usd"),
+                "last_quota_usd": entry.get("last_quota_usd") if entry.get("last_quota_usd") is not None else entry.get("quota_usd"),
+                "checked_in": entry.get("checked_in"),
+                "ok": bool(entry.get("ok")),
+                "status": str(entry.get("status") or "error"),
+                "message": str(entry.get("message") or ""),
+                "cached": True,
+                "saved_at": str(entry.get("saved_at") or ""),
             }
+            self._status_cache[key] = merged
+
+    def _save_gui_status_cache(self) -> None:
+        """把当前 GUI 状态缓存中的实时结果落盘，供下次启动预填。"""
+        results_dir = accounts_store.SCRIPT_DIR / "results"
+        path = results_dir / "gui_status_cache.json"
+        entries: dict[str, Any] = {}
+        for key, status in self._status_cache.items():
+            if not isinstance(status, dict):
+                continue
+            # 只持久化有额度或明确状态的条目，避免写入空占位。
+            if status.get("quota_usd") is None and status.get("last_quota_usd") is None and not status.get("status"):
+                continue
+            entries[key] = {
+                "quota_usd": status.get("quota_usd"),
+                "last_quota_usd": status.get("last_quota_usd"),
+                "checked_in": status.get("checked_in"),
+                "ok": bool(status.get("ok")),
+                "status": str(status.get("status") or ""),
+                "message": str(status.get("message") or ""),
+                "saved_at": str(status.get("saved_at") or ""),
+            }
+        payload = {"entries": entries}
+        try:
+            results_dir.mkdir(parents=True, exist_ok=True)
+            with accounts_store.file_lock(path):
+                accounts_store.atomic_write_text(
+                    path, json.dumps(payload, ensure_ascii=False, indent=2)
+                )
+        except Exception:
+            # 持久化失败不影响 GUI 运行。
+            pass
 
     def _matches_filter(self, row: dict[str, Any], query: str) -> bool:
         if not query:
@@ -1599,6 +1699,10 @@ class App(QMainWindow):
         )
         self._set_oauth_provider(accounts_store.normalize_oauth_provider(row.get("oauth_provider")) or "linuxdo")
         self._refresh_oauth_account_choices(row.get("oauth_account") or accounts_store.DEFAULT_OAUTH_ACCOUNT)
+        self._refresh_oauth_fallback_choices(
+            str(row.get("oauth_fallback_provider") or ""),
+            str(row.get("oauth_fallback_account") or ""),
+        )
         self.script_edit.setText(str(row.get("script") or ""))
         script_args_text = row.get("_script_args_text")
         if script_args_text is None:
@@ -1625,6 +1729,7 @@ class App(QMainWindow):
         self._set_combos("cookie", "api", "auto")
         self._set_oauth_provider("linuxdo")
         self._refresh_oauth_account_choices(accounts_store.DEFAULT_OAUTH_ACCOUNT)
+        self._refresh_oauth_fallback_choices()
         self.script_edit.clear()
         self.script_args_edit.setPlainText("{}")
         self.script_timeout_edit.setText("120")
@@ -1681,14 +1786,26 @@ class App(QMainWindow):
         else:
             quota = status.get("quota_usd")
             cached = status.get("cached")
+            failed = status.get("ok") is False
             message = str(status.get("message") or "")
             if quota is not None:
                 fmt = f"${quota:.2f}" if quota >= 0.01 else f"${quota:.4f}"
                 self.quota_value.setText(fmt)
+                self.quota_value.setToolTip(
+                    ("上次签到缓存（点🔄实时刷新）" if cached else "实时查询结果")
+                    + (f"\n{message}" if message else "")
+                )
+            elif failed and status.get("last_quota_usd") is not None:
+                # 登录失效等失败：仍展示失效前的最后额度（灰显 + 标注），比清空更有参考价值。
+                last = status.get("last_quota_usd")
+                fmt = f"${last:.2f}" if last >= 0.01 else f"${last:.4f}"
+                self.quota_value.setText(f"{fmt} ⚠")
+                self.quota_value.setToolTip(
+                    f"这是失效前的最后额度，非当前实时值。\n{_query_failure_toast(str(status.get('status') or 'error'), message)}"
+                )
             else:
                 self.quota_value.setText("—")
-            source_tip = "上次签到缓存（点🔄实时刷新）" if cached else "实时查询结果"
-            self.quota_value.setToolTip(f"{source_tip}\n{message}" if message else source_tip)
+                self.quota_value.setToolTip(message)
             checked_in = status.get("checked_in")
             if checked_in is True:
                 self.checkin_pill.setText("🎁 今日已签到")
@@ -1697,14 +1814,17 @@ class App(QMainWindow):
             elif checked_in is False:
                 self.checkin_pill.setText("○ 今日待签到")
                 self.checkin_pill.setProperty("kind", "todo")
-            elif status.get("ok") is False:
+            elif failed:
                 self.checkin_pill.setText(_query_failure_label(str(status.get("status") or "error")))
                 self.checkin_pill.setProperty("kind", "fail")
             else:
                 self.checkin_pill.setText("—")
                 self.checkin_pill.setProperty("kind", "unknown")
-            self.checkin_pill.setToolTip(message)
-            if cached:
+            # 失效时把原因写进 tooltip，方便悬停查看具体信息（如需重新捕获 OAuth 登录态）。
+            self.checkin_pill.setToolTip(
+                _query_failure_toast(str(status.get("status") or "error"), message) if failed else message
+            )
+            if cached and not failed:
                 self.checkin_pill.setText(self.checkin_pill.text() + " (缓存)")
         self.checkin_pill.style().unpolish(self.checkin_pill)
         self.checkin_pill.style().polish(self.checkin_pill)
@@ -1753,18 +1873,27 @@ class App(QMainWindow):
         ok = bool(result.get("ok"))
         status = str(result.get("status") or ("success" if ok else "error"))
         message = result.get("message") or ("查询成功" if ok else "查询失败")
+        # 失效时保留上次已知额度作为 last_quota_usd：登录失效不代表账户余额归零，
+        # 仍向用户展示「失效前的最后额度」比直接清空更有参考价值。
+        prev = self._status_cache.get(key) or {}
+        prev_quota = prev.get("quota_usd")
+        if prev_quota is None:
+            prev_quota = prev.get("last_quota_usd")
         self._status_cache[key] = {
             "quota_usd": result.get("quota_usd") if ok else None,
+            "last_quota_usd": result.get("quota_usd") if ok else prev_quota,
             "checked_in": result.get("checked_in") if ok else None,
             "ok": ok,
             "status": status,
             "message": message,
             "detail": result.get("detail"),
             "cached": False,
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
         }
         self._refresh_row(cur_idx)
         if cur_idx == self.cur:
             self._update_summary(self.rows[cur_idx])
+        self._save_gui_status_cache()
         self._say(message if ok else _query_failure_toast(status, str(message)))
 
     def _apply_checkin_result(self, idx: int, key: str, result: dict[str, Any]) -> None:
@@ -1773,14 +1902,22 @@ class App(QMainWindow):
         detail = result.get("detail") if isinstance(result.get("detail"), dict) else {}
         quota_usd = self._detail_quota_usd(detail)
         message = str(result.get("message") or status or "签到完成")
+        # 签到失败时保留失效前的历史额度，供渲染层灰显参考（不误导为当前实时值）。
+        prev = self._status_cache.get(key) or {}
+        last_quota = quota_usd if quota_usd is not None else (
+            prev.get("quota_usd") if prev.get("quota_usd") is not None else prev.get("last_quota_usd")
+        )
         self._status_cache[key] = {
             "quota_usd": quota_usd,
+            "last_quota_usd": last_quota,
             "checked_in": True if ok else None,
             "ok": ok,
             "status": status,
             "message": message,
             "cached": False,
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
         }
+        self._save_gui_status_cache()
         self._refresh_row(idx)
         if idx == self.cur:
             self._update_summary(self.rows[idx])
@@ -1842,6 +1979,8 @@ class App(QMainWindow):
             "user_id": row.get("user_id", ""),
             "oauth_provider": oauth_provider,
             "oauth_account": oauth_account,
+            "oauth_fallback_provider": row.get("oauth_fallback_provider", ""),
+            "oauth_fallback_account": row.get("oauth_fallback_account", ""),
             "browser_state": browser_state,
             "proxy": row.get("proxy", ""),
         }
@@ -1954,6 +2093,8 @@ class App(QMainWindow):
                 "user_id": row.get("user_id", ""),
                 "oauth_provider": oauth_provider,
                 "oauth_account": oauth_account,
+                "oauth_fallback_provider": row.get("oauth_fallback_provider", ""),
+                "oauth_fallback_account": row.get("oauth_fallback_account", ""),
                 "browser_state": browser_state,
                 "proxy": row.get("proxy", ""),
             }
@@ -2035,6 +2176,34 @@ class App(QMainWindow):
     def _set_oauth_provider(self, oauth_provider: str) -> None:
         self._set_combo_value(self.oauth_provider_combo, oauth_provider, "linuxdo")
 
+    def _current_oauth_fallback(self) -> tuple[str, str]:
+        """返回可选 OAuth 兜底的 (provider, account)；空元组值表示不使用。"""
+        data = str(self.oauth_fallback_combo.currentData() or "")
+        if ":" not in data:
+            return "", ""
+        provider, account = data.split(":", 1)
+        provider = accounts_store.normalize_oauth_provider(provider)
+        if not provider:
+            return "", ""
+        return provider, accounts_store.normalize_oauth_account(account)
+
+    def _refresh_oauth_fallback_choices(self, selected_provider: str = "", selected_account: str = "") -> None:
+        """用已保存的 OAuth 登录态填充可选下拉框。"""
+        selected_provider = accounts_store.normalize_oauth_provider(selected_provider)
+        selected_account = accounts_store.normalize_oauth_account(selected_account) if selected_provider else ""
+        selected_data = f"{selected_provider}:{selected_account}" if selected_provider else ""
+        self.oauth_fallback_combo.blockSignals(True)
+        self.oauth_fallback_combo.clear()
+        self.oauth_fallback_combo.addItem("不使用", "")
+        for provider in OAUTH_PROVIDERS:
+            accounts = dict(((self.oauth_states.get(provider) or {}).get("accounts") or {}))
+            for account in sorted(accounts):
+                label = f"{OAUTH_PROVIDER_LABELS.get(provider, provider)} / {account}"
+                self.oauth_fallback_combo.addItem(label, f"{provider}:{account}")
+        idx = self.oauth_fallback_combo.findData(selected_data)
+        self.oauth_fallback_combo.setCurrentIndex(max(idx, 0))
+        self.oauth_fallback_combo.blockSignals(False)
+
     def _oauth_accounts_for_provider(self, provider: str | None = None) -> dict[str, dict[str, Any]]:
         prov = provider or self._current_oauth_provider()
         return dict(((self.oauth_states.get(prov) or {}).get("accounts") or {}))
@@ -2077,8 +2246,10 @@ class App(QMainWindow):
             return
         provider = self._current_oauth_provider()
         account_count = len(self._oauth_accounts_for_provider(provider))
+        fallback_provider, fallback_account = self._current_oauth_fallback()
         _bg_log("INFO", "刷新 OAuth 账号列表", oauth_provider=provider, oauth_account=selected, account_count=account_count)
         self._refresh_oauth_account_choices(selected)
+        self._refresh_oauth_fallback_choices(fallback_provider, fallback_account)
         self._sync_type()
         self._flush()
         self._say("已刷新 OAuth 账号列表")
@@ -2107,6 +2278,10 @@ class App(QMainWindow):
                 line.setText(label)
                 line.blockSignals(False)
         self._on_combo_changed()
+
+    def _on_oauth_fallback_changed(self, *_args: Any) -> None:
+        self._sync_type()
+        self._flush()
 
     def _on_combo_changed(self, *_args: Any) -> None:
         """登录方式 / 签到方式变化时同步显隐，再回写。"""
@@ -2146,16 +2321,20 @@ class App(QMainWindow):
         self.script_timeout_wrap.setVisible(is_script)
         self.oauth_provider_wrap.setVisible(needs_oauth)
         self.oauth_account_wrap.setVisible(needs_oauth)
+        can_optional_oauth = t == "sub2api" and action == "api" and auth_method == "access_token"
+        self.oauth_fallback_wrap.setVisible(can_optional_oauth)
+        fallback_provider, fallback_account = self._current_oauth_fallback()
+        fallback_enabled = can_optional_oauth and bool(fallback_provider)
         self.uid_edit.setEnabled(needs_cred)
         self.cookie_edit.setEnabled(needs_cred)
         self.token_edit.setEnabled(needs_cred)
-        # 站点级浏览器登录态只属于 browser；OAuth 登录态统一按 provider/account 管理
-        show_state = is_browser or needs_oauth
+        # 可选 OAuth 放在站点登录状态下；不选择时仅显示登录状态，且不会启动浏览器。
+        show_state = is_browser or needs_oauth or can_optional_oauth
         self.state_wrap.setVisible(show_state)
         self.state_edit.setVisible(is_browser)
         self.state_edit.setEnabled(is_browser)
-        self.oauth_state_status.setVisible(needs_oauth)
-        self.browser_ops.setVisible(show_state)
+        self.oauth_state_status.setVisible(needs_oauth or can_optional_oauth)
+        self.browser_ops.setVisible(is_browser or needs_oauth)
         self.btn_oauth_delete.setVisible(needs_oauth)
         if needs_oauth:
             prov = self._current_oauth_provider()
@@ -2181,6 +2360,15 @@ class App(QMainWindow):
                 self.mode_hint.setText("💡 自定义脚本会用当前站点的浏览器登录态启动浏览器，并由脚本控制页面点击。脚本路径请使用仓库内相对路径。")
             else:
                 self.mode_hint.setText("💡 站点浏览器登录态仅用于当前站点，不会作为共享 OAuth 账号使用。")
+        elif can_optional_oauth:
+            if fallback_enabled:
+                saved = self._oauth_state_entry(fallback_provider, fallback_account)
+                state_len = len(str(saved.get("state") or ""))
+                label = f"{OAUTH_PROVIDER_LABELS.get(fallback_provider, fallback_provider)} / {fallback_account}"
+                self.oauth_state_status.setText(f"{label}（{state_len} 字符）" if state_len else f"{label}（未保存登录态）")
+            else:
+                self.oauth_state_status.setText("")
+            self.mode_hint.setText("")
         else:
             self.oauth_state_status.setText("")
             self.btn_capture.setText("浏览器登录捕获")
@@ -2214,6 +2402,9 @@ class App(QMainWindow):
         row["api_variant"] = self._current_variant()
         row["oauth_provider"] = self._current_oauth_provider()
         row["oauth_account"] = self._current_oauth_account()
+        fallback_provider, fallback_account = self._current_oauth_fallback()
+        row["oauth_fallback_provider"] = fallback_provider
+        row["oauth_fallback_account"] = fallback_account
         row["user_id"] = self.uid_edit.text().strip()
         row["access_token"] = self.token_edit.text().strip()
         row["cookie"] = self.cookie_edit.toPlainText().strip()
@@ -2250,6 +2441,8 @@ class App(QMainWindow):
                     "api_variant": api_variant,
                     "oauth_provider": oauth_provider,
                     "oauth_account": oauth_account,
+                    "oauth_fallback_provider": str(row.get("oauth_fallback_provider") or ""),
+                    "oauth_fallback_account": str(row.get("oauth_fallback_account") or ""),
                     "enabled": bool(row.get("enabled", True)),
                     "user_id": str(row.get("user_id") or "").strip(),
                     "access_token": str(row.get("access_token") or "").strip(),
@@ -2355,6 +2548,8 @@ class App(QMainWindow):
                 "api_variant": "auto",
                 "oauth_provider": "linuxdo",
                 "oauth_account": accounts_store.DEFAULT_OAUTH_ACCOUNT,
+                "oauth_fallback_provider": "",
+                "oauth_fallback_account": "",
                 "enabled": True,
                 "user_id": "",
                 "access_token": "",
@@ -2558,6 +2753,10 @@ class App(QMainWindow):
             if auth_method == "oauth" or checkin_action == "relogin":
                 acct["oauth_provider"] = accounts_store.normalize_oauth_provider(row.get("oauth_provider")) or "linuxdo"
                 acct["oauth_account"] = accounts_store.normalize_oauth_account(row.get("oauth_account") or row.get("oauth_account_id"))
+            fallback_provider = accounts_store.normalize_oauth_provider(row.get("oauth_fallback_provider"))
+            if fallback_provider:
+                acct["oauth_fallback_provider"] = fallback_provider
+                acct["oauth_fallback_account"] = accounts_store.normalize_oauth_account(row.get("oauth_fallback_account"))
             # 接口变体仅 newapi + 接口签到 时有意义
             if t == "newapi" and checkin_action == "api":
                 variant = row.get("api_variant") if row.get("api_variant") in API_VARIANTS else "auto"
@@ -2621,6 +2820,8 @@ class App(QMainWindow):
             "browser_state": browser_state,
             "oauth_provider": oauth_provider,
             "oauth_account": oauth_account,
+            "oauth_fallback_provider": str(row.get("oauth_fallback_provider") or ""),
+            "oauth_fallback_account": str(row.get("oauth_fallback_account") or ""),
             "login_selector": str(row.get("login_selector") or "").strip(),
             "proxy": str(row.get("proxy") or "").strip(),
             "fallback_uid": str(row.get("user_id") or "").strip(),

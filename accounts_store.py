@@ -309,6 +309,8 @@ CONFIG_FIELDS = (
     "oauth_provider",
     "oauth_account",
     "oauth_account_id",
+    "oauth_fallback_provider",
+    "oauth_fallback_account",
     "proxy",
 )
 
@@ -543,6 +545,8 @@ def site_config_from_mapping(
         login_selector=str(row.get("login_selector") or ""),
         oauth_provider=normalize_oauth_provider(row.get("oauth_provider")) or "linuxdo",
         oauth_account=normalize_oauth_account(row.get("oauth_account") or row.get("oauth_account_id")),
+        oauth_fallback_provider=normalize_oauth_provider(row.get("oauth_fallback_provider")),
+        oauth_fallback_account=normalize_oauth_account(row.get("oauth_fallback_account")),
         proxy=str(row.get("proxy") or ""),
         referer_path=str(row.get("referer_path") or "/profile"),
         enabled=parse_enabled(row.get("enabled"), True),
@@ -840,6 +844,8 @@ _PERSIST_ORDER = (
     "script_timeout",
     "oauth_provider",
     "oauth_account",
+    "oauth_fallback_provider",
+    "oauth_fallback_account",
     "api_variant",
     "enabled",
     "user_id",
@@ -1113,6 +1119,13 @@ def build_github_secret_payload(
             out["oauth_provider"] = oauth_provider
             out["oauth_account"] = oauth_account
             needed_oauth.add((oauth_provider, oauth_account))
+
+        fallback_provider = normalize_oauth_provider(row.get("oauth_fallback_provider"))
+        if fallback_provider:
+            fallback_account = normalize_oauth_account(row.get("oauth_fallback_account"))
+            out["oauth_fallback_provider"] = fallback_provider
+            out["oauth_fallback_account"] = fallback_account
+            needed_oauth.add((fallback_provider, fallback_account))
 
         proxy = str(row.get("proxy") or "").strip()
         if proxy:
