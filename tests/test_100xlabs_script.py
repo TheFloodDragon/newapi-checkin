@@ -30,12 +30,14 @@ class FakeElement:
         visible: bool = True,
         disabled: bool = False,
         on_click: Callable[["FakePage", "FakeElement"], None] | None = None,
+        normal_click_failures: int = 0,
     ) -> None:
         self.text = text
         self.role = role
         self.visible = visible
         self.disabled = disabled
         self.on_click = on_click
+        self.normal_click_failures = normal_click_failures
 
 
 class FakeElementHandle:
@@ -78,14 +80,27 @@ class FakeLocator:
         element = self._element()
         return bool(element and element.disabled)
 
-    async def click(self, timeout: int = 5000) -> None:
+    async def scroll_into_view_if_needed(self, timeout: int = 5000) -> None:
+        del timeout
+
+    async def click(self, timeout: int = 5000, force: bool = False) -> None:
         del timeout
         element = self._element()
         if element is None or not element.visible or element.disabled:
             raise RuntimeError("element is not clickable")
+        if not force and element.normal_click_failures > 0:
+            element.normal_click_failures -= 1
+            raise RuntimeError("element is temporarily covered")
         self.page.clicked.append(element.text)
         if element.on_click is not None:
             element.on_click(self.page, element)
+
+    async def dispatch_event(self, event: str) -> None:
+        assert event == "click"
+        await self.click(force=True)
+
+    async def evaluate(self, _expression: str) -> None:
+        await self.click(force=True)
 
 
 class FakeResponse:
@@ -183,6 +198,25 @@ def test_clicks_checkin_now_and_now_buttons() -> None:
         assert result["detail"]["completion_signal"] == "checkin_response"
         assert page.clicked == [label]
         assert page.waits == []
+
+
+def test_force_click_recovers_from_temporary_overlay() -> None:
+    page = FakePage(
+        [
+            FakeElement(
+                "签到",
+                role="button",
+                on_click=_emit_success,
+                normal_click_failures=1,
+            )
+        ]
+    )
+
+    result, _ = _run(page)
+
+    assert result["status"] == "success"
+    assert result["detail"]["click_strategy"] == "force"
+    assert page.clicked == ["签到"]
 
 
 def test_prefers_clickable_control_over_matching_page_text() -> None:

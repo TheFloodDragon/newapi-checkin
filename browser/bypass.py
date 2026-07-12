@@ -20,6 +20,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import io
 import random
 import sys
 from typing import Any
@@ -50,7 +52,9 @@ def _ensure_playwright_driver_patched() -> None:
     try:
         from ci import patch_playwright
 
-        patch_playwright.main()
+        # 自动补丁属于启动前维护动作，不应污染签到 worker 的原始输出。
+        with contextlib.redirect_stdout(io.StringIO()):
+            patch_playwright.main()
     except Exception as exc:
         print(f"[patch_playwright] automatic patch failed: {exc}", file=sys.stderr, flush=True)
 

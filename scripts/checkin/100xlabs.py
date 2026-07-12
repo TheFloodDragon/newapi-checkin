@@ -126,20 +126,42 @@ async def run(page: Any, context: Any, site: Any, helpers: Any) -> dict[str, Any
             return text, locator, "text"
         return None
 
-    async def _click_checkin() -> tuple[str, Any, str]:
-        control = await _find_checkin_control()
-        if control is None:
-            return "", None, ""
-        text, locator, kind = control
-        try:
-            element = await locator.element_handle()
-        except Exception:
-            element = None
-        try:
-            await locator.click(timeout=click_timeout)
-            return text, element, kind
-        except Exception:
-            return "", None, ""
+    async def _click_checkin(
+        initial: tuple[str, Any, str] | None = None,
+    ) -> tuple[str, Any, str, str]:
+        """多轮重新定位并点击，抵抗 SPA 重渲染、遮罩和元素抖动。"""
+        for attempt in range(3):
+            control = initial if attempt == 0 and initial is not None else await _find_checkin_control()
+            if control is None:
+                await page.wait_for_timeout(min(150, poll_interval_ms))
+                continue
+            text, locator, kind = control
+            try:
+                element = await locator.element_handle()
+            except Exception:
+                element = None
+
+            try:
+                await locator.scroll_into_view_if_needed(timeout=click_timeout)
+            except Exception:
+                pass
+
+            click_attempts = (
+                ("normal", lambda: locator.click(timeout=click_timeout)),
+                ("force", lambda: locator.click(timeout=click_timeout, force=True)),
+                ("dispatch", lambda: locator.dispatch_event("click")),
+                ("dom", lambda: locator.evaluate("el => el.click()")),
+            )
+            for strategy, click in click_attempts:
+                try:
+                    await click()
+                    return text, element or locator, kind, strategy
+                except Exception:
+                    continue
+
+            # 元素可能在点击期间被 React 替换；下一轮重新创建 locator。
+            await page.wait_for_timeout(min(200, max(50, poll_interval_ms)))
+        return "", None, "", ""
 
     await helpers.goto(target_url, timeout=goto_timeout, wait_until=str(args.get("wait_until") or "commit"))
     try:
@@ -220,19 +242,8 @@ async def run(page: Any, context: Any, site: Any, helpers: Any) -> dict[str, Any
         pass
 
     try:
-        # 点击轮询阶段已定位到的签到控件（避免重新扫描再次遇到 SPA 渲染时序问题）。
-        found_text, found_locator, found_kind = checkin_control
-        clicked_text, clicked_locator, clicked_kind = "", found_locator, found_kind
-        try:
-            clicked_element = await found_locator.element_handle()
-        except Exception:
-            clicked_element = None
-        try:
-            await found_locator.click(timeout=click_timeout)
-            clicked_text, clicked_locator = found_text, clicked_element or found_locator
-        except Exception:
-            # 定位到但点击失败（可能刚好被重渲染替换）：兜底重新扫描点击一次。
-            clicked_text, clicked_locator, clicked_kind = await _click_checkin()
+        # SPA 可能在“发现按钮”和“点击按钮”之间替换 DOM；点击器会重新定位并逐级降级。
+        clicked_text, clicked_locator, clicked_kind, click_strategy = await _click_checkin(checkin_control)
 
         if not clicked_text:
             screenshot = await helpers.screenshot("100xlabs-click-failed.png")
@@ -244,6 +255,7 @@ async def run(page: Any, context: Any, site: Any, helpers: Any) -> dict[str, Any
         base_detail = {
             "clicked_text": clicked_text,
             "clicked_kind": clicked_kind,
+            "click_strategy": click_strategy,
             "target_url": resolved_url,
         }
         deadline = loop.time() + max(0, completion_timeout_ms) / 1000
