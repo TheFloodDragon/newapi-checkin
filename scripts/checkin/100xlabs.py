@@ -41,8 +41,9 @@ async def run(page: Any, context: Any, site: Any, helpers: Any) -> dict[str, Any
     ready_timeout = int(args.get("ready_timeout", 10000) or 10000)
     click_timeout = int(args.get("click_timeout", 5000) or 5000)
     # SPA（React）站点：签到按钮要等前端拉取签到数据后才渲染，goto 后立即扫描会扑空。
-    # 在放弃前轮询等待「已签到状态」或「签到按钮」出现，默认最多 15s。
-    button_wait_ms = int(args.get("button_wait_ms", 15000) or 15000)
+    # 在放弃前轮询等待「已签到状态」或「签到按钮」出现，默认最多 25s（含浏览器/WAF 开销后，
+    # 15s 曾在慢网络下与渲染擦肩而过）。
+    button_wait_ms = int(args.get("button_wait_ms", 25000) or 25000)
     completion_timeout_ms = int(
         args.get("completion_timeout_ms", args.get("after_click_wait_ms", 10000)) or 10000
     )
@@ -104,7 +105,17 @@ async def run(page: Any, context: Any, site: Any, helpers: Any) -> dict[str, Any
                 continue
             return text, locator, "button"
 
-        # 兼容没有语义化 button 的旧页面，保留原有页面文本点击兜底。
+        # 部分 SPA 用 <a>/role=link 渲染签到入口（如 "Check in now" 链接按钮）。
+        for text in checkin_texts:
+            try:
+                locator = page.get_by_role("link", name=text, exact=False).first
+            except Exception:
+                continue
+            if not await _is_visible(locator) or await _is_disabled(locator):
+                continue
+            return text, locator, "link"
+
+        # 兼容没有语义化 button/link 的旧页面，保留原有页面文本点击兜底。
         for text in checkin_texts:
             try:
                 locator = page.get_by_text(text, exact=False).first
@@ -135,6 +146,14 @@ async def run(page: Any, context: Any, site: Any, helpers: Any) -> dict[str, Any
         await page.wait_for_load_state("domcontentloaded", timeout=ready_timeout)
     except Exception:
         # 部分站点/风控页不会按时触发 domcontentloaded；继续用页面可见文本判断。
+        pass
+
+    # React SPA 的签到按钮要等前端 XHR 拉完签到数据后才渲染。先尽力等一次 networkidle，
+    # 让首屏数据请求落地，明显降低「按钮刚要渲染、轮询窗口就到点」的临界竞态。失败/超时
+    # 不致命，后面仍有 button_wait_ms 轮询兜底。
+    try:
+        await page.wait_for_load_state("networkidle", timeout=min(ready_timeout, 8000))
+    except Exception:
         pass
 
     # SPA 站点签到按钮是前端拉取数据后才渲染的，goto 完成时通常还没出现。

@@ -181,6 +181,7 @@ class Sub2ApiClient(ProfileClient):
             body=raw_body,
             proxy=self.site.proxy,
             retry_non_idempotent=retry_non_idempotent,
+            verify_ssl=getattr(self.site, "verify_ssl", True),
         )
         # Sub2API 统一响应：{code:0, data:{...}}；code != 0 视为失败
         if isinstance(payload, dict) and "code" in payload:
@@ -198,6 +199,7 @@ class Sub2ApiClient(ProfileClient):
             method="GET",
             headers=self._headers(),
             proxy=self.site.proxy,
+            verify_ssl=getattr(self.site, "verify_ssl", True),
         )
 
     @staticmethod

@@ -49,11 +49,37 @@ SCRIPT_DIR = Path(__file__).resolve().parent.parent.parent
 CHALLENGE_HELPER_PATH = SCRIPT_DIR / "checkin_challenge.js"
 CHALLENGE_TIMEOUT = Timeouts.NODE_CHALLENGE  # Node 执行 WASM PoW 的超时（秒）
 
+# 阿里云/反爬 JS 挑战页特征（urllib 拿不到 JSON，只会拿到这段混淆 JS 或挑战 HTML）。
+ANTIBOT_BLOCK_PATTERNS = [
+    "接口返回非 JSON",
+    "var arg1=",
+    "acw_sc__",
+    "aliyun_waf",
+    "slidecaptcha",
+    "just a moment",
+    "cf-challenge",
+    "checking your browser",
+]
+
 ALREADY_DONE_PATTERNS = ["已签到", "今日已", "已领取", "明天再来", "already"]
 VERIFICATION_PATTERNS = ["Turnstile", "Cloudflare", "Just a moment", "安全验证", "challenge-platform"]
 LOGIN_PATTERNS = ["登录", "unauthorized", "token", "not logged in", "access token", "未登录", "无权", "权限不足"]
 UPGRADED_FLOW_PATTERNS = ["checkin_flow_upgraded", "新版流程", "签到接口已升级"]
 CHALLENGE_UNSUPPORTED_PATTERNS = ["404", "not found", "page not found", "no route", "unsupported"]
+
+
+def _is_antibot_block(error: ApiError) -> bool:
+    """判断 ApiError 是否为「urllib 命中阿里云/反爬 JS 挑战页」而非真实业务错误。
+
+    这类错误的特征：HTTP 200 但响应体是混淆 JS/挑战 HTML（parse_json 抛出「接口返回
+    非 JSON」），或 body 里出现 acw_sc__/aliyun_waf 等 WAF 标记。命中时可用浏览器
+    预取的额度兜底，而不是把它当成登录失效或站点异常。
+    """
+    haystacks = [str(error.message or "")]
+    if isinstance(error.payload, str):
+        haystacks.append(error.payload)
+    text = " ".join(haystacks)
+    return contains_any(text, ANTIBOT_BLOCK_PATTERNS)
 
 
 class NewApiClient(ProfileClient):
@@ -93,6 +119,7 @@ class NewApiClient(ProfileClient):
             body=body,
             proxy=self.site.proxy,
             retry_non_idempotent=retry_non_idempotent,
+            verify_ssl=getattr(self.site, "verify_ssl", True),
         )
         if isinstance(payload, dict) and payload.get("success") is False:
             raise ApiError(None, payload, extract_message(payload))
@@ -110,7 +137,18 @@ class NewApiClient(ProfileClient):
         return StatusInfo(checked_in_today=checked_in, raw=data)
 
     def fetch_user(self) -> UserInfo:
-        data = unwrap_data(self.request("GET", "/api/user/self"))
+        try:
+            data = unwrap_data(self.request("GET", "/api/user/self"))
+        except ApiError as exc:
+            # 阿里云 WAF 会对 urllib 这类无法执行 JS 挑战的客户端回一段混淆 JS 挑战页
+            # （非 JSON）。若浏览器过 WAF 时已读到用户信息，用它兜底，避免把「浏览器已
+            # 成功读到额度」误报成「接口返回非 JSON」。
+            prefetched = getattr(self.auth, "prefetched_user", None)
+            if isinstance(prefetched, dict) and _is_antibot_block(exc):
+                quota = prefetched.get("quota")
+                username = str(prefetched.get("username") or "")
+                return UserInfo(quota_raw=quota, username=username, raw=prefetched)
+            raise
         quota = data.get("quota") if isinstance(data, dict) else None
         username = ""
         if isinstance(data, dict):
@@ -299,4 +337,15 @@ class NewApiProfile(SiteProfile):
                 site.browser_state = refreshed_state
 
         new_api_user = str(outcome.get("new_api_user") or site.user_id or "").strip()
-        return AuthInfo(cookie=cookie, new_api_user=new_api_user)
+
+        # 浏览器过 WAF 时已读到的用户信息（含 quota/username）。作为 HTTP 再读被 WAF
+        # 重新挑战时的权威兜底：这类站点 urllib 无法执行 JS 挑战，浏览器读数才可靠。
+        prefetched_user: dict[str, Any] | None = None
+        quota = outcome.get("quota")
+        username = outcome.get("username")
+        if quota is not None or username:
+            prefetched_user = {"quota": quota, "username": username or ""}
+            if new_api_user:
+                prefetched_user["id"] = new_api_user
+
+        return AuthInfo(cookie=cookie, new_api_user=new_api_user, prefetched_user=prefetched_user)

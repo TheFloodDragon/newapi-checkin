@@ -10,7 +10,7 @@ from providers import base
 def test_http_retry_only_for_idempotent_methods(monkeypatch) -> None:
     calls: list[str] = []
 
-    def fake_once(url, *, method, headers, body, timeout, proxy):
+    def fake_once(url, *, method, headers, body, timeout, proxy, verify_ssl=True):
         calls.append(method)
         if len(calls) == 1:
             raise base.ApiError(503, None, "temporary", transient=True)
@@ -32,7 +32,7 @@ def test_http_retry_only_for_idempotent_methods(monkeypatch) -> None:
 def test_non_idempotent_retry_requires_opt_in(monkeypatch) -> None:
     calls = 0
 
-    def fake_once(url, *, method, headers, body, timeout, proxy):
+    def fake_once(url, *, method, headers, body, timeout, proxy, **_kwargs):
         nonlocal calls
         calls += 1
         if calls == 1:

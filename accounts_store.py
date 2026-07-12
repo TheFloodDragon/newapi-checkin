@@ -292,6 +292,7 @@ CONFIG_FIELDS = (
     "script_args",
     "script_timeout",
     "api_variant",
+    "verify_ssl",
     # 旧字段（向后兼容输入）
     "type",
     "provider",
@@ -546,6 +547,7 @@ def site_config_from_mapping(
         referer_path=str(row.get("referer_path") or "/profile"),
         enabled=parse_enabled(row.get("enabled"), True),
         auto_refresh_cookie=parse_enabled(row.get("auto_refresh_cookie"), True),
+        verify_ssl=parse_enabled(row.get("verify_ssl"), True),
     )
 
 
@@ -928,6 +930,9 @@ def _account_to_persist(row: dict[str, Any]) -> dict[str, Any]:
         value = str(row.get(field) or "").strip()
         if value:
             out[field] = value
+    # verify_ssl 默认 True，仅在显式关闭校验时落盘（避免给每个站点都写冗余字段）
+    if not parse_enabled(row.get("verify_ssl"), True):
+        out["verify_ssl"] = False
     return out
 
 

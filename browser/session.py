@@ -1049,15 +1049,38 @@ SITE_LOGIN_SELECTORS = [
 async def _maybe_click_with_popup(page, locator, log: LogFn, error_collector: dict[str, Any] | None = None, base_url: str = ""):
     popup_task = asyncio.create_task(page.wait_for_event("popup", timeout=10000))
     before_url = page.url
-    try:
-        await locator.click(timeout=7000)
-    except Exception:
+
+    async def _drain_popup_task() -> None:
         popup_task.cancel()
         try:
             await popup_task
         except BaseException:
             pass
-        raise
+
+    # 普通点击可能因不可见遮罩拦截指针事件而超时（Playwright 认为元素“可见/可用/稳定”
+    # 却卡在派发点击），此时不应让整轮 relogin 失败：依次尝试强制点击、DOM dispatch，
+    # 全部失败再返回 None，交由 _trigger_oauth 回退到直连授权 URL。仅真实驱动崩溃才上抛。
+    clicked = False
+    click_attempts = (
+        ("普通点击", lambda: locator.click(timeout=7000)),
+        ("强制点击", lambda: locator.click(timeout=3000, force=True)),
+        ("DOM dispatch", lambda: locator.dispatch_event("click")),
+    )
+    for label, do_click in click_attempts:
+        try:
+            await do_click()
+            clicked = True
+            break
+        except Exception as exc:
+            if _is_driver_closed_error(exc):
+                await _drain_popup_task()
+                raise
+            log(f"OAuth 入口{label}失败（{type(exc).__name__}）")
+
+    if not clicked:
+        log("OAuth 入口所有点击方式均失败，回退到直连授权 URL")
+        await _drain_popup_task()
+        return None
 
     popup = None
     try:

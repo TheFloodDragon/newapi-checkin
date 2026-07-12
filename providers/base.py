@@ -89,6 +89,9 @@ class SiteConfig:
     # newapi + api 专用：接口变体偏好（auto=challenge 优先，legacy=旧接口优先）。
     # 仅影响首次尝试顺序，两种都会在失败时互为兜底；其它 profile 忽略。
     api_variant: str = "auto"
+    # TLS 证书校验开关。默认开启；仅当站点证书过期/自签名导致 CERTIFICATE_VERIFY_FAILED
+    # 时，才在配置里显式设为 false 作为应急兜底（跳过校验有中间人风险，谨慎使用）。
+    verify_ssl: bool = True
 
 
 @dataclass
@@ -98,6 +101,11 @@ class AuthInfo:
     cookie: str = ""
     new_api_user: str = ""
     access_token: str = ""
+    # 浏览器刷新认证时顺便读到的用户信息（含 quota/username/id）。
+    # 阿里云 WAF 类站点（如 anyrouter）用浏览器执行 JS 挑战后能读到额度，但导出的
+    # WAF cookie 被 urllib 复用时常被重新挑战（urllib 不执行 JS）。此时把浏览器已
+    # 读到的用户信息作为 HTTP fetch_user 被 WAF 拦截时的权威兜底，避免误报失败。
+    prefetched_user: dict[str, Any] | None = None
 
 
 @dataclass
@@ -363,19 +371,30 @@ def unwrap_data(payload: Any) -> Any:
     return payload
 
 
-def _build_url_opener(proxy: str = "") -> urllib.request.OpenerDirector:
-    """构造不依赖进程隐式代理环境的 opener。"""
+def _build_url_opener(proxy: str = "", verify_ssl: bool = True) -> urllib.request.OpenerDirector:
+    """构造不依赖进程隐式代理环境的 opener。
+
+    verify_ssl=False 时禁用 TLS 证书与主机名校验（用于证书过期/自签名的应急兜底）。
+    """
+    handlers: list[urllib.request.BaseHandler] = []
+    if not verify_ssl:
+        import ssl
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        handlers.append(urllib.request.HTTPSHandler(context=ctx))
+
     proxy = str(proxy or "").strip()
     if not proxy:
-        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        handlers.append(urllib.request.ProxyHandler({}))
+        return urllib.request.build_opener(*handlers)
     parsed = urllib.parse.urlsplit(proxy)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         if parsed.scheme.startswith("socks"):
             raise ApiError(None, None, "标准库 HTTP 客户端不支持 SOCKS 代理，请改用 http/https 代理。")
         raise ApiError(None, None, "代理地址无效，必须是 http:// 或 https:// URL。")
-    return urllib.request.build_opener(
-        urllib.request.ProxyHandler({"http": proxy, "https": proxy})
-    )
+    handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    return urllib.request.build_opener(*handlers)
 
 
 def _http_request_once(
@@ -386,10 +405,11 @@ def _http_request_once(
     body: bytes | None,
     timeout: int,
     proxy: str,
+    verify_ssl: bool = True,
 ) -> Any:
     """单次 HTTP 请求并解析 JSON；HTTP 错误也尽量解析 body，统一抛 ApiError。"""
     req = urllib.request.Request(url, data=body, headers=headers, method=method.upper())
-    opener = _build_url_opener(proxy)
+    opener = _build_url_opener(proxy, verify_ssl=verify_ssl)
     try:
         with opener.open(req, timeout=timeout) as response:
             text = decode_response_body(response.read(), response.headers.get("content-encoding", ""))
@@ -427,6 +447,7 @@ def http_request(
     max_attempts: int = RETRY_MAX_ATTEMPTS,
     proxy: str = "",
     retry_non_idempotent: bool = False,
+    verify_ssl: bool = True,
 ) -> Any:
     """发送 HTTP 请求并解析 JSON，对可安全重放的瞬时性错误做退避重试。
 
@@ -448,6 +469,7 @@ def http_request(
                 body=body,
                 timeout=timeout,
                 proxy=proxy,
+                verify_ssl=verify_ssl,
             )
         except ApiError as exc:
             last_error = exc
