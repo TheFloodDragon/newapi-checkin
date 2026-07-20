@@ -27,6 +27,7 @@ try:
         QApplication,
         QAbstractItemView,
         QButtonGroup,
+        QCheckBox,
         QComboBox,
         QDialog,
         QFrame,
@@ -244,6 +245,7 @@ def _rows() -> list[dict[str, Any]]:
                 "cookie": row.get("cookie", ""),
                 "browser_state": "" if checkin_action == "relogin" or (checkin_action == "browser_script" and auth_method == "oauth") else row.get("browser_state", ""),
                 "proxy": row.get("proxy", ""),
+                "verify_ssl": accounts_store.parse_enabled(row.get("verify_ssl"), True),
             }
         )
     return out
@@ -1275,6 +1277,16 @@ class App(QMainWindow):
         # 代理（可选，支持 http/https/socks5）
         self.proxy_edit = self._line(cred_layout, "代理（可选）", "如 http://user:pass@host:port")
 
+        self.verify_ssl_wrap = self._field(
+            cred_layout,
+            "TLS 证书校验",
+            "默认开启；仅证书过期/链异常站点临时关闭",
+        )
+        self.verify_ssl_check = QCheckBox("校验 HTTPS 证书和主机名")
+        self.verify_ssl_check.setObjectName("plainCheck")
+        self.verify_ssl_check.setChecked(True)
+        self.verify_ssl_wrap.layout().addWidget(self.verify_ssl_check)
+
         actions = QHBoxLayout()
         actions.setContentsMargins(0, 4, 0, 0)
         imp_btn = _button("从剪贴板导入", "tool")
@@ -1311,6 +1323,7 @@ class App(QMainWindow):
         self.cookie_edit.textChanged.connect(self._flush)
         self.state_edit.textChanged.connect(self._flush)
         self.proxy_edit.textChanged.connect(self._flush)
+        self.verify_ssl_check.stateChanged.connect(self._flush)
 
     def _card(self, title: str, subtitle: str = "", parent_layout: QHBoxLayout | QVBoxLayout | None = None) -> QFrame:
         card = QFrame()
@@ -1720,6 +1733,7 @@ class App(QMainWindow):
         self.script_timeout_edit.setText(str(accounts_store.parse_script_timeout(row.get("script_timeout"), 120)))
         self.state_edit.setPlainText(row.get("browser_state", ""))
         self.proxy_edit.setText(row.get("proxy", ""))
+        self.verify_ssl_check.setChecked(accounts_store.parse_enabled(row.get("verify_ssl"), True))
         self.uid_edit.setText(row["user_id"])
         self.token_edit.setText(row["access_token"])
         self.cookie_edit.setPlainText(row["cookie"])
@@ -1743,6 +1757,7 @@ class App(QMainWindow):
         self.script_timeout_edit.setText("120")
         self.state_edit.clear()
         self.proxy_edit.clear()
+        self.verify_ssl_check.setChecked(True)
         self.uid_edit.clear()
         self.token_edit.clear()
         self.cookie_edit.clear()
@@ -1991,6 +2006,7 @@ class App(QMainWindow):
             "oauth_fallback_account": row.get("oauth_fallback_account", ""),
             "browser_state": browser_state,
             "proxy": row.get("proxy", ""),
+            "verify_ssl": accounts_store.parse_enabled(row.get("verify_ssl"), True),
         }
         self._start_task("checkin", params, on_done)
 
@@ -2105,6 +2121,7 @@ class App(QMainWindow):
                 "oauth_fallback_account": row.get("oauth_fallback_account", ""),
                 "browser_state": browser_state,
                 "proxy": row.get("proxy", ""),
+                "verify_ssl": accounts_store.parse_enabled(row.get("verify_ssl"), True),
             }
             self._start_task("checkin", params, on_done_for(idx))
 
@@ -2464,6 +2481,7 @@ class App(QMainWindow):
         row["cookie"] = self.cookie_edit.toPlainText().strip()
         row["browser_state"] = self.state_edit.toPlainText().strip() if row["auth_method"] == "browser" and row["checkin_action"] != "relogin" else ""
         row["proxy"] = self.proxy_edit.text().strip()
+        row["verify_ssl"] = self.verify_ssl_check.isChecked()
         self._update_summary(row)
         self._refresh_row(self.cur)
         self._sync_dirty_state()
@@ -2527,6 +2545,7 @@ class App(QMainWindow):
                     "cookie": str(row.get("cookie") or "").strip(),
                     "browser_state": str(row.get("browser_state") or "").strip() if auth_method == "browser" and checkin_action != "relogin" else "",
                     "proxy": str(row.get("proxy") or "").strip(),
+                    "verify_ssl": accounts_store.parse_enabled(row.get("verify_ssl"), True),
                 }
             )
         return snapshot
@@ -2640,6 +2659,8 @@ class App(QMainWindow):
                 "access_token": "",
                 "cookie": "",
                 "browser_state": "",
+                "proxy": "",
+                "verify_ssl": True,
             }
         )
         self.cur = len(self.rows) - 1
@@ -2739,6 +2760,8 @@ class App(QMainWindow):
             self.uid_edit.setText(str(data["user_id"]))
         if data.get("cookie"):
             self.cookie_edit.setPlainText(str(data["cookie"]))
+        if "verify_ssl" in data:
+            self.verify_ssl_check.setChecked(accounts_store.parse_enabled(data.get("verify_ssl"), True))
         self._lock = False
         self._sync_type()
         self._flush()
@@ -2856,6 +2879,9 @@ class App(QMainWindow):
             # 代理（所有类型可选）
             if str(row.get("proxy") or "").strip():
                 acct["proxy"] = str(row["proxy"]).strip()
+            # TLS 校验默认开启；仅显式关闭时落盘，便于证书过期/链异常站点临时兜底。
+            if not accounts_store.parse_enabled(row.get("verify_ssl"), True):
+                acct["verify_ssl"] = False
             # 站点浏览器登录态仅 auth_method=browser 时保存；OAuth 登录态统一存在顶层 oauth_states
             state_text = str(row.get("browser_state") or "").strip()
             if state_text and auth_method == "browser" and checkin_action != "relogin":
@@ -2916,6 +2942,7 @@ class App(QMainWindow):
             "oauth_fallback_account": str(row.get("oauth_fallback_account") or ""),
             "login_selector": str(row.get("login_selector") or "").strip(),
             "proxy": str(row.get("proxy") or "").strip(),
+            "verify_ssl": accounts_store.parse_enabled(row.get("verify_ssl"), True),
             "fallback_uid": str(row.get("user_id") or "").strip(),
         }
 

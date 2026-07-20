@@ -245,7 +245,24 @@ Windows 可双击 `run_all_checkin.bat`。
 
 ### `browser_script`：仓库内自定义浏览器脚本
 
-适合没有稳定接口、但页面上有「签到/领取」按钮的站点。程序按 `auth_method` 恢复登录态、启动 Camoufox、**只允许加载仓库内相对路径 Python 文件**（禁止绝对路径、`..`、URL），调用脚本的 `run(page, context, site, helpers)` 并返回 `{status, message, detail}`。内置示例：`scripts/checkin/100xlabs.py`。脚本可直接用 Playwright 的 `page/context`，也可用 `helpers.goto()` / `helpers.click_text()` / `helpers.screenshot()` / `helpers.success()` 等便捷方法。
+适合没有稳定接口、但页面上有「签到/领取」按钮的站点。程序按 `auth_method` 恢复登录态、启动 Camoufox、**只允许加载仓库内相对路径 Python 文件**（禁止绝对路径、`..`、URL），调用脚本的 `run(page, context, site, helpers)` 并返回 `{status, message, detail}`。内置示例：`scripts/checkin/100xlabs.py`、`scripts/checkin/jisudeng.py`。脚本可直接用 Playwright 的 `page/context`，也可用 `helpers.goto()` / `helpers.click_text()` / `helpers.screenshot()` / `helpers.success()` 等便捷方法。
+
+极速蹬配置示例（该站登录启用了 Cloudflare Turnstile，首次需在有头浏览器中手动登录并保存站点 `browser_state`，不要把邮箱密码写进脚本或仓库）：
+
+```json5
+{
+  "name": "极速蹬",
+  "base_url": "https://www.jisudeng.com",
+  "site_profile": "newapi",
+  "auth_method": "browser",
+  "checkin_action": "browser_script",
+  "script": "scripts/checkin/jisudeng.py",
+  "script_args": { "start_url": "/check-in" },
+  "script_timeout": 120,
+  "browser_state": "<完成邮箱登录和 Turnstile 后捕获的站点登录态>",
+  "enabled": true
+}
+```
 
 `auth_method=browser` 时可额外选择 `oauth_fallback_provider` + `oauth_fallback_account`，也可保持“不使用”：程序始终优先使用站点级 `browser_state`，登录态缺失或脚本明确返回 `need_login` 时，最多用共享 OAuth 登录态自动完成一次站点登录并重试脚本；若未选择 OAuth，则直接报告站点登录态失效、签到失败。OAuth 登录期间会在目标站点自动关闭公告、协议、守则、须知等遮挡弹窗，但不会在 Linux.do / GitHub 授权页启用该规则。
 
