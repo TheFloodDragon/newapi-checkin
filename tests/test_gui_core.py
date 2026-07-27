@@ -1,0 +1,296 @@
+# -*- coding: utf-8 -*-
+"""gui.core 纯逻辑层测试（不依赖 PySide6）。"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from gui import core
+
+
+def _mk_states(provider: str = "linuxdo", account: str = "default", state: str = "abc123") -> dict:
+    return {provider: {"accounts": {account: {"state": state, "username": "u"}}}}
+
+
+# ── effective_auth / can_optional_oauth ──────────────────────────────────────
+def test_effective_auth_relogin_forces_oauth() -> None:
+    assert core.effective_auth("relogin", "cookie") == "oauth"
+    assert core.effective_auth("relogin", "browser") == "oauth"
+
+
+def test_effective_auth_browser_script_allows_browser_and_oauth() -> None:
+    assert core.effective_auth("browser_script", "browser") == "browser"
+    assert core.effective_auth("browser_script", "oauth") == "oauth"
+    assert core.effective_auth("browser_script", "cookie") == "oauth"
+    assert core.effective_auth("api", "cookie") == "cookie"
+
+
+def test_can_optional_oauth_matrix() -> None:
+    assert core.can_optional_oauth("sub2api", "api", "access_token")
+    assert core.can_optional_oauth("newapi", "browser_script", "browser")
+    assert not core.can_optional_oauth("newapi", "api", "access_token")
+    assert not core.can_optional_oauth("sub2api", "api", "cookie")
+
+
+# ── row_from_store ───────────────────────────────────────────────────────────
+def test_row_from_store_coerces_and_blanks_state() -> None:
+    row = core.row_from_store(
+        {
+            "name": "s",
+            "base_url": "https://Example.com/",
+            "checkin_action": "relogin",
+            "auth_method": "cookie",
+            "browser_state": "SHOULD-DROP",
+        }
+    )
+    assert row.auth_method == "oauth"
+    assert row.browser_state == ""
+    assert row.base_url == "https://Example.com"  # normalize 去尾斜杠，不改大小写
+
+
+def test_row_from_store_infers_auth_from_token() -> None:
+    row = core.row_from_store({"name": "s", "base_url": "https://a.com", "access_token": "tok", "auth_method": "??"})
+    assert row.auth_method == "access_token"
+    row2 = core.row_from_store({"name": "s", "base_url": "https://a.com", "auth_method": "??"})
+    assert row2.auth_method == "cookie"
+
+
+def test_row_from_store_script_args_text() -> None:
+    row = core.row_from_store(
+        {"name": "s", "base_url": "https://a.com", "script_args": {"k": "v"}, "checkin_action": "browser_script",
+         "auth_method": "browser"}
+    )
+    assert row.script_args == {"k": "v"}
+    assert json.loads(row.script_args_text) == {"k": "v"}
+    empty = core.row_from_store({"name": "s", "base_url": "https://a.com"})
+    assert empty.script_args_text == "{}"
+
+
+# ── task_params ──────────────────────────────────────────────────────────────
+def test_task_params_oauth_pulls_shared_state() -> None:
+    row = core.SiteRow(name="s", base_url="https://a.com", checkin_action="relogin", auth_method="cookie")
+    params = core.task_params(row, _mk_states(state="STATE-X"))
+    assert params["auth_method"] == "oauth"
+    assert params["browser_state"] == "STATE-X"
+    assert params["fallback_uid"] == params["user_id"] == ""
+    assert params["verify_ssl"] is True
+
+
+def test_task_params_browser_keeps_row_state_and_fallback_gating() -> None:
+    row = core.SiteRow(
+        name="s",
+        base_url="https://a.com",
+        type="sub2api",
+        auth_method="access_token",
+        checkin_action="api",
+        browser_state="row-state",
+        oauth_fallback_provider="linuxdo",
+        oauth_fallback_account="default",
+        verify_ssl=False,
+    )
+    params = core.task_params(row, {})
+    assert params["browser_state"] == "row-state"
+    assert params["oauth_fallback_provider"] == "linuxdo"
+    assert params["verify_ssl"] is False
+    # 不满足可选 OAuth 条件时兜底键归空
+    row2 = core.SiteRow(
+        name="s", base_url="https://a.com", auth_method="cookie", checkin_action="api",
+        oauth_fallback_provider="linuxdo",
+    )
+    assert core.task_params(row2, {})["oauth_fallback_provider"] == ""
+
+
+# ── build_form_plan ──────────────────────────────────────────────────────────
+def test_form_plan_relogin() -> None:
+    row = core.SiteRow(name="s", base_url="https://a.com", checkin_action="relogin", auth_method="oauth")
+    plan = core.build_form_plan(row, _mk_states())
+    assert plan.show_oauth and plan.show_browser_ops and plan.show_delete_oauth
+    assert not plan.creds_enabled and not plan.show_fallback
+    assert plan.capture_text == "捕获 OAuth 登录态"
+    assert "已保存" in plan.oauth_status
+
+
+def test_form_plan_sub2api_token_fallback() -> None:
+    row = core.SiteRow(
+        name="s", base_url="https://a.com", type="sub2api", auth_method="access_token", checkin_action="api"
+    )
+    plan = core.build_form_plan(row, {})
+    assert plan.show_fallback and plan.creds_enabled and plan.show_state_box
+    assert not plan.show_browser_ops and not plan.state_editable
+    assert "暂无共享 OAuth 登录态" in plan.oauth_status
+
+
+def test_form_plan_browser_script_browser_auth() -> None:
+    row = core.SiteRow(
+        name="s", base_url="https://a.com", auth_method="browser", checkin_action="browser_script",
+        oauth_fallback_provider="linuxdo", oauth_fallback_account="default",
+    )
+    plan = core.build_form_plan(row, _mk_states())
+    assert plan.show_script and plan.show_fallback and plan.state_editable
+    assert plan.oauth_status.startswith("可选 OAuth：")
+
+
+def test_form_plan_newapi_api_variant_visible() -> None:
+    row = core.SiteRow(name="s", base_url="https://a.com")
+    plan = core.build_form_plan(row, {})
+    assert plan.show_variant
+    assert not plan.show_state_box
+
+
+# ── 校验 / 持久化 ────────────────────────────────────────────────────────────
+def test_validate_rows_errors() -> None:
+    assert core.validate_rows([core.SiteRow(name="", base_url="https://a.com")]) is not None
+    assert core.validate_rows([core.SiteRow(name="a", base_url="")]) is not None
+    dup = [core.SiteRow(name="a", base_url="https://a.com"), core.SiteRow(name="a", base_url="https://b.com")]
+    assert "重复" in (core.validate_rows(dup) or "")
+    bad_script = core.SiteRow(
+        name="a", base_url="https://a.com", checkin_action="browser_script", auth_method="browser",
+        script="x.py", script_args_text="not json",
+    )
+    assert "JSON" in (core.validate_rows([bad_script]) or "")
+    ok = core.SiteRow(name="a", base_url="https://a.com")
+    assert core.validate_rows([ok]) is None
+
+
+def test_persist_accounts_shapes() -> None:
+    rows = [
+        core.SiteRow(
+            name="script-site", base_url="https://a.com", auth_method="browser",
+            checkin_action="browser_script", script="scripts/x.py", script_args_text='{"a": 1}',
+            browser_state="ST", verify_ssl=False,
+        ),
+        core.SiteRow(name="api-site", base_url="https://b.com", checkin_action="relogin", auth_method="cookie"),
+    ]
+    accts = core.persist_accounts(rows)
+    first, second = accts
+    assert first["script"] == "scripts/x.py" and first["script_args"] == {"a": 1}
+    assert first["browser_state"] == "ST" and first["verify_ssl"] is False
+    # relogin：auth 矫正为 oauth、不落 browser_state、带 oauth 字段、无 api_variant
+    assert second["auth_method"] == "oauth"
+    assert "browser_state" not in second and "api_variant" not in second
+    assert second["oauth_provider"] == "linuxdo"
+
+
+def test_config_snapshot_stable_and_sensitive_to_changes() -> None:
+    rows = [core.SiteRow(name="a", base_url="https://a.com")]
+    snap1 = core.config_snapshot(rows, {})
+    snap2 = core.config_snapshot([r.copy() for r in rows], {})
+    assert snap1 == snap2
+    rows[0].cookie = "changed"
+    assert core.config_snapshot(rows, {}) != snap1
+
+
+# ── 剪贴板 / 格式化 ──────────────────────────────────────────────────────────
+def test_parse_clipboard_site_variants() -> None:
+    data, err = core.parse_clipboard_site('{"name": "x", "base_url": "https://a.com"}')
+    assert err == "" and data["name"] == "x"
+    data, err = core.parse_clipboard_site('[{"name": "x"}]')
+    assert err == "" and data["name"] == "x"
+    data, err = core.parse_clipboard_site('{"wrapped": {"cookie": "c"}}')
+    assert err == "" and data["name"] == "wrapped" and data["cookie"] == "c"
+    _, err = core.parse_clipboard_site("not json")
+    assert err
+    _, err = core.parse_clipboard_site("")
+    assert err
+
+
+def test_format_usd_and_detail_quota() -> None:
+    assert core.format_usd(246.1) == "$246.10"
+    assert core.format_usd(0.004) == "$0.0040"
+    assert core.detail_quota_usd({"current_quota": 500000}) == 1.0
+    assert core.detail_quota_usd({"current_quota": 2.5, "quota_is_usd": True}) == 2.5
+    assert core.detail_quota_usd({"current_quota": "n/a"}) is None
+    assert core.detail_quota_usd(None) is None
+
+
+# ── StatusStore ──────────────────────────────────────────────────────────────
+def _write(path: Path, payload: dict) -> None:
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def test_status_store_merges_by_saved_at(tmp_path: Path) -> None:
+    _write(
+        tmp_path / "checkin_result.json",
+        {
+            "generated_at": "2026-07-27T08:00:00",
+            "results": [
+                {"site": "a", "base_url": "https://a.com", "status": "success", "current_quota": "$5.0"},
+                {"site": "b", "base_url": "https://b.com", "status": "need_login", "current_quota": "$9.9"},
+            ],
+        },
+    )
+    _write(
+        tmp_path / "gui_status_cache.json",
+        {
+            "entries": {
+                # 更新的手动查询应覆盖批量结果
+                "https://a.com|a": {
+                    "quota_usd": 7.5, "checked_in": False, "ok": True, "status": "success",
+                    "message": "", "saved_at": "2026-07-27T09:00:00",
+                },
+                # 更旧的条目不应覆盖
+                "https://b.com|b": {
+                    "quota_usd": 1.0, "checked_in": True, "ok": True, "status": "success",
+                    "message": "", "saved_at": "2026-07-26T09:00:00",
+                },
+            }
+        },
+    )
+    store = core.StatusStore(results_dir=tmp_path)
+    store.load()
+    a = store.get("https://a.com|a")
+    assert a["quota_usd"] == 7.5 and a["checked_in"] is False
+    b = store.get("https://b.com|b")
+    assert b["status"] == "need_login" and b["quota_usd"] is None and b["last_quota_usd"] == 9.9
+
+
+def test_status_store_apply_query_keeps_last_quota_on_failure(tmp_path: Path) -> None:
+    store = core.StatusStore(results_dir=tmp_path)
+    store.apply_query("k", {"ok": True, "quota_usd": 3.0, "checked_in": True, "status": "success", "message": "m"})
+    entry = store.apply_query("k", {"ok": False, "status": "need_login", "message": "expired"})
+    assert entry["quota_usd"] is None
+    assert entry["last_quota_usd"] == 3.0
+    # 落盘 + 重载后仍可读回
+    store2 = core.StatusStore(results_dir=tmp_path)
+    store2.load()
+    assert store2.get("k")["last_quota_usd"] == 3.0
+
+
+def test_status_store_apply_checkin_extracts_detail_quota(tmp_path: Path) -> None:
+    store = core.StatusStore(results_dir=tmp_path)
+    entry = store.apply_checkin("k", {"status": "success", "detail": {"current_quota": 1000000}})
+    assert entry["quota_usd"] == 2.0 and entry["checked_in"] is True
+    entry = store.apply_checkin("k", {"status": "need_verification", "message": "ts"})
+    assert entry["checked_in"] is None and entry["last_quota_usd"] == 2.0
+
+
+def test_summarize(tmp_path: Path) -> None:
+    store = core.StatusStore(results_dir=tmp_path)
+    rows = [
+        core.SiteRow(name="a", base_url="https://a.com"),
+        core.SiteRow(name="b", base_url="https://b.com", enabled=False),
+    ]
+    store.apply_query(core.StatusStore.status_key(rows[0]), {"ok": True, "quota_usd": 4.0, "checked_in": True})
+    store.apply_query(core.StatusStore.status_key(rows[1]), {"ok": False, "status": "need_login"})
+    stats = core.summarize(rows, store)
+    assert stats.total == 2 and stats.enabled == 1
+    assert stats.done == 1 and stats.failed == 1
+    assert stats.quota_sum == 4.0 and stats.quota_known == 1
+
+
+# ── 脱敏日志 ─────────────────────────────────────────────────────────────────
+def test_safe_log_value_redacts_sensitive_keys() -> None:
+    assert "redacted" in core._safe_log_value("secret-token-value", "access_token")
+    nested = core._safe_log_value({"cookie": "abc", "plain": "ok"}, "result")
+    assert "abc" not in nested and "ok" in nested
+
+
+def test_log_sink_receives_lines() -> None:
+    lines: list[str] = []
+    core.add_log_sink(lines.append)
+    try:
+        core.bg_log("INFO", "hello", site="x")
+    finally:
+        core.remove_log_sink(lines.append)
+    assert lines and "hello" in lines[0] and "site=x" in lines[0]

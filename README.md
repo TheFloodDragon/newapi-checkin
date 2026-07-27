@@ -273,13 +273,17 @@ uv sync --extra gui
 uv run python manage_accounts.py
 ```
 
-- 左侧站点列表，右侧编辑「站点配置 + 凭据」：选择站点类型、登录方式与签到方式（三维字段）；
+实现位于 `gui/` 包（`manage_accounts.py` 为薄壳入口）：`core.py` 纯逻辑层（行归一化 / auth 矫正 / 任务参数装配 / 状态缓存，均有单测）、`theme.py` 深浅双主题、`workers.py` 后台任务、`app.py` 主窗口。
+
+- **概览条**：站点数 / 今日已签 / 已知总额度 / 异常数，右侧「全部查询」「全部签到」批量操作（结果以摘要 toast + 日志明细呈现）；
+- 左侧站点列表（搜索 / 拖拽排序 / 启停），右侧编辑「站点配置 + 凭据」：选择站点类型、登录方式与签到方式（三维字段）；
 - `auth_method=oauth` 或 `checkin_action=relogin` 时出现 OAuth 提供商 + 账号控件，可**捕获 / 检测 OAuth 登录态**；捕获结果先加入当前内存配置并显示“未保存”，点击 `保存全部` 后写入顶层 `oauth_states`；relogin 站点不保存站点级 `browser_state`；
 - `auth_method=browser` 时出现站点级「浏览器登录态」输入区；自定义浏览器脚本还会显示「可选 OAuth」，直接列出顶层共享 `oauth_states` 中已有的账号；
 - `checkin_action=browser_script` 时出现脚本路径 / 参数 JSON / 超时控件（路径必须是仓库内相对路径）；
-- **测试签到 / 查询额度**：按当前三维字段跑一次，当场看结果；
+- **测试签到 / 查询额度 / 立即签到**：按当前三维字段跑一次，当场看结果；
+- 底部「日志」面板实时展示脱敏后台日志；顶栏可切换深 / 浅主题（默认深色，偏好自动记忆）；
 - **代理**：在「认证凭据」区填 `proxy`；
-- `保存全部` 写回 `ACCOUNTS.json`（原子写 + 锁）；`导出 Secret` 把整份 JSON 复制到剪贴板。
+- `保存全部` 写回 `ACCOUNTS.json`（原子写 + 锁）；`导出 Secret` 把最小化 JSON 复制到剪贴板。
 
 ## 浏览器一键采集凭据（collector.js）
 
