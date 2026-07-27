@@ -42,10 +42,13 @@ from ..base import (
     normalize_cookie,
     unwrap_data,
 )
+from ..base import VERIFICATION_PATTERNS as _BASE_VERIFICATION_PATTERNS
 
 API_PREFIX = "/api/v1"
 LOGIN_PATTERNS = ["unauthorized", "登录", "token", "expired", "invalid", "forbidden", "无效", "过期"]
-VERIFICATION_PATTERNS = ["turnstile", "cloudflare", "captcha", "verify", "人机", "验证"]
+# 在唯一词表基础上追加「验证 / verify」：sub2api 的 classify 先判 LOGIN 再判验证，
+# token 失效类消息已被 need_login 拦截，宽泛词在此语境安全（保持既有行为）。
+VERIFICATION_PATTERNS = [*_BASE_VERIFICATION_PATTERNS, "验证", "verify"]
 ALREADY_DONE_PATTERNS = ["already", "已签到", "今日已", "已领取"]
 UNSUPPORTED_CHECKIN_PATTERNS = ["404", "405", "not found", "no route", "route not found", "method not allowed", "不存在", "未找到"]
 

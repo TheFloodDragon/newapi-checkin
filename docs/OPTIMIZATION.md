@@ -91,7 +91,10 @@ manage_accounts.py  # from gui.app import main
 ## 四、建议实施顺序
 
 1. ✅ GUI 重构（`gui/` 包 + 薄壳入口）— 覆盖 §二 4-13
-2. P0-1/2/3：providers 层词表与格式化收敛（小改动、独立提交）
+2. ✅ P0-1/2/3 已收敛（tests/test_convergence.py 守护）：
+   - `normalize_base_url` 唯一实现在 `accounts_store`（最底层，避免循环导入），`providers/base` 与 `checkin` re-export；
+   - `VERIFICATION_PATTERNS` 唯一词表在 `providers/base`（高置信标记），`visit`/`sub2api` 按语境追加「验证 / verify」，api 动作层死词表删除；`run__all_checkin` 里第四份 `QUOTA_UNIT` 一并清理；
+   - 额度换算/展示/detail 提取收敛到 `providers.base`（`format_usd` / `detail_quota_usd` / `find_first_value` 等），CLI/GUI/browser 全部委托，展示统一为自适应两位小数（`$246.10`）。
 3. P2 按需
 
-*本报告由代码分析产出；GUI 重构随本次一并落地，其余项待后续提交。*
+*本报告由代码分析产出；§二 1-13 已全部落地，其余 P2 项待后续提交。*

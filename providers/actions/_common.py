@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""HTTP 签到动作（api / visit）的共享辅助：认证准备、客户端构造、额度格式化。"""
+"""HTTP 签到动作（api / visit）的共享辅助：认证准备、客户端构造。"""
 
 from __future__ import annotations
-
-from typing import Any
 
 import accounts_store
 
@@ -13,23 +11,10 @@ from ..base import (
     AuthInfo,
     BrowserAuthError,
     ProfileClient,
-    QUOTA_UNIT,
     SiteConfig,
     SiteProfile,
     normalize_access_token,
 )
-
-
-def usd_str(value: Any, *, is_usd: bool) -> str:
-    """把额度数值格式化为 $x USD 字符串；非数字原样返回。
-
-    is_usd=True 表示值本身已是美元（sub2api）；False 表示内部 quota，需 /500000（newapi）。
-    """
-    try:
-        usd = float(value) if is_usd else float(value) / QUOTA_UNIT
-        return f"${usd:.4g}"
-    except (TypeError, ValueError):
-        return str(value) if value is not None else ""
 
 
 def oauth_state_text_for_site(site: SiteConfig) -> str:

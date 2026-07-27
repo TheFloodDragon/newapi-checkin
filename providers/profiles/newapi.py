@@ -62,7 +62,9 @@ ANTIBOT_BLOCK_PATTERNS = [
 ]
 
 ALREADY_DONE_PATTERNS = ["已签到", "今日已", "已领取", "明天再来", "already"]
-VERIFICATION_PATTERNS = ["Turnstile", "Cloudflare", "Just a moment", "安全验证", "challenge-platform"]
+# 人机验证词表用 providers.base 唯一实现（newapi 的 classify 先判验证再判登录，
+# 不追加宽泛的「验证」，避免「token 验证失败」类登录报错被误分类）。
+from ..base import VERIFICATION_PATTERNS  # noqa: E402, F401
 LOGIN_PATTERNS = ["登录", "unauthorized", "token", "not logged in", "access token", "未登录", "无权", "权限不足"]
 UPGRADED_FLOW_PATTERNS = ["checkin_flow_upgraded", "新版流程", "签到接口已升级"]
 CHALLENGE_UNSUPPORTED_PATTERNS = ["404", "not found", "page not found", "no route", "unsupported"]

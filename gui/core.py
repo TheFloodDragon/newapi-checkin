@@ -566,18 +566,17 @@ def cred_json(row: SiteRow) -> str | None:
 
 # ── 额度 / 状态文案 ──────────────────────────────────────────────────────────
 def format_usd(value: float) -> str:
-    """自适应格式：>=0.01 两位小数，否则四位小数。"""
-    return f"${value:.2f}" if value >= 0.01 else f"${value:.4f}"
+    """美元展示（唯一实现在 providers.base；GUI 侧输入已是 USD 数值）。"""
+    from providers.base import format_usd as _format_usd
+
+    return _format_usd(value, is_usd=True)
 
 
 def detail_quota_usd(detail: dict[str, Any] | None) -> float | None:
-    """从签到结果 detail 提取美元额度（newapi 内部 quota 需 /500000）。"""
-    if not isinstance(detail, dict):
-        return None
-    cq = detail.get("current_quota")
-    if not isinstance(cq, (int, float)):
-        return None
-    return float(cq) if detail.get("quota_is_usd") else float(cq) / 500000
+    """从签到结果 detail 提取美元额度（唯一实现在 providers.base）。"""
+    from providers.base import detail_quota_usd as _detail_quota_usd
+
+    return _detail_quota_usd(detail)
 
 
 _FAILURE_LABELS = {

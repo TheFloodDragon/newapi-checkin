@@ -28,14 +28,18 @@ from ..base import (
     SiteConfig,
     SiteProfile,
     contains_any,
+    format_usd,
     normalize_base_url,
 )
-from ._common import build_http_client, credentials_ready, usd_str
+from ..base import VERIFICATION_PATTERNS as _BASE_VERIFICATION_PATTERNS
+from ._common import build_http_client, credentials_ready
 
 SCRIPT_DIR = Path(__file__).resolve().parent.parent.parent
 STATE_PATH = SCRIPT_DIR / "login_grant_state.json"
 
-VERIFICATION_PATTERNS = ["turnstile", "cloudflare", "just a moment", "安全验证", "challenge-platform", "人机", "验证"]
+# 在唯一词表基础上追加宽泛的「验证」：保活响应多为完整页面/提示文案，
+# 语境里出现「验证」基本就是人机验证，误伤登录报错的风险低（保持既有行为）。
+VERIFICATION_PATTERNS = [*_BASE_VERIFICATION_PATTERNS, "验证"]
 
 
 # ── 本地状态持久化（跨次运行对比额度变化）────────────────────────────────────
@@ -141,20 +145,20 @@ def run_action(site: SiteConfig, profile: SiteProfile, turnstile: str = "") -> C
         detail["quota_awarded"] = quota_delta
         return CheckinResult(
             site.name, base_url, "success",
-            f"保活成功，额度增加：{usd_str(quota_delta, is_usd=is_usd)}（登录已触发发放）",
+            f"保活成功，额度增加：{format_usd(quota_delta, is_usd=is_usd)}（登录已触发发放）",
             detail=detail,
         )
 
     if prev_quota is None:
         return CheckinResult(
             site.name, base_url, "already_done",
-            f"保活成功，已记录当前额度：{usd_str(quota, is_usd=is_usd)}（下次运行可对比增量）",
+            f"保活成功，已记录当前额度：{format_usd(quota, is_usd=is_usd)}（下次运行可对比增量）",
             detail=detail,
         )
 
     return CheckinResult(
         site.name, base_url, "already_done",
-        f"保活成功，额度无变化：{usd_str(quota, is_usd=is_usd)}（该站靠 OAuth 登录发放，额度可能已于近期登录时发放）",
+        f"保活成功，额度无变化：{format_usd(quota, is_usd=is_usd)}（该站靠 OAuth 登录发放，额度可能已于近期登录时发放）",
         detail=detail,
     )
 

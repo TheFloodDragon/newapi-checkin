@@ -26,6 +26,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -38,13 +39,29 @@ IDEMPOTENT_METHODS = {"GET", "HEAD", "OPTIONS", "PUT", "DELETE"}
 
 SESSION_COOKIE_NAMES = {"session", "newapi_session", "new-api-session", "new_api_session"}
 
-VERIFICATION_PATTERNS = ["Turnstile", "Cloudflare", "Just a moment", "安全验证", "challenge-platform"]
+# 人机验证特征唯一词表（contains_any 匹配时双方都转小写，大小写无关）。
+# 只收高置信标记；「验证」「verify」这类宽泛词交由个别 profile/action 按需追加
+# （见 profiles/sub2api.py、actions/visit.py），避免把「token 验证失败」这类
+# 登录问题误分类为 need_verification。
+VERIFICATION_PATTERNS = [
+    "turnstile",
+    "cloudflare",
+    "just a moment",
+    "安全验证",
+    "challenge-platform",
+    "人机",
+    "captcha",
+]
 
 # 网络层重试：对瞬时性错误（429 / 5xx / 连接超时）做指数退避重试。
 # 不重试 4xx（除 429）这类确定性错误，避免无意义的重复请求。
 # 具体数值集中在 config，这里保留同名别名以兼容既有引用。
 from config import RetryConfig as _RetryConfig  # noqa: E402
 from config import Timeouts as _Timeouts  # noqa: E402
+
+# base_url 归一化唯一实现在 accounts_store（最底层模块，避免反向循环导入）；
+# 这里 re-export 供 profiles/actions 继续从 providers.base 引用。
+from accounts_store import normalize_base_url  # noqa: E402, F401
 
 RETRY_MAX_ATTEMPTS = _RetryConfig.MAX_ATTEMPTS   # 含首次在内的总尝试次数
 RETRY_BACKOFF_BASE = _RetryConfig.BACKOFF_BASE   # 退避基数（秒）：第 n 次失败后等待约 base * 2**n
@@ -54,6 +71,94 @@ HTTP_REQUEST_TIMEOUT = _Timeouts.HTTP_REQUEST    # 单次 HTTP 请求默认超�
 
 # New API 内部 quota 与 USD 换算系数：quota / 500000 = $
 QUOTA_UNIT = 500_000
+
+
+# ── 额度换算 / 展示 / detail 提取（唯一实现；CLI、GUI、browser 共用）────────────
+def quota_usd_value(value: Any, *, is_usd: bool = False) -> float | None:
+    """把站点额度数值换算为美元；非数字（含 bool）返回 None。"""
+    if isinstance(value, bool):
+        return None
+    try:
+        usd = float(value)
+    except (TypeError, ValueError):
+        return None
+    return usd if is_usd else usd / QUOTA_UNIT
+
+
+def format_usd(value: Any, *, is_usd: bool = False, fallback: str | None = None) -> str:
+    """美元展示：>=0.01 两位小数，否则四位小数；非数字返回 fallback（默认原样字符串）。"""
+    usd = quota_usd_value(value, is_usd=is_usd)
+    if usd is None:
+        if fallback is not None:
+            return fallback
+        return str(value) if value is not None else ""
+    return f"${usd:.2f}" if abs(usd) >= 0.01 else f"${usd:.4f}"
+
+
+def find_first_value(data: Any, keys: list[str]) -> Any:
+    """在嵌套 dict/list 中按键名（不区分大小写）BFS 查找第一个非空值。
+
+    使用 deque 做队列，popleft() 为 O(1)，避免 list.pop(0) 的 O(n) 开销；
+    seen 记录已访问对象 id，防止循环引用导致的无限遍历。
+    """
+    wanted = {key.lower() for key in keys}
+    queue: deque[Any] = deque([data])
+    seen: set[int] = set()
+
+    while queue:
+        item = queue.popleft()
+        if item is None:
+            continue
+        marker = id(item)
+        if marker in seen:
+            continue
+        seen.add(marker)
+
+        if isinstance(item, dict):
+            for key, value in item.items():
+                if str(key).lower() in wanted and value not in (None, ""):
+                    return value
+            queue.extend(item.values())
+        elif isinstance(item, list):
+            queue.extend(item)
+    return None
+
+
+_QUOTA_AWARDED_KEYS = [
+    "quota_awarded",
+    "awarded_quota",
+    "award_quota",
+    "reward_quota",
+    "checkin_quota",
+    "quota_reward",
+]
+_CURRENT_QUOTA_KEYS = [
+    "current_quota",   # checkin.py 注入的标准字段
+    "remaining_quota",
+    "available_quota",
+    "quota_remaining",
+    "user_quota",
+    "quota",
+    "balance",
+]
+
+
+def detail_is_usd(detail: Any) -> bool:
+    """provider 在 detail 里标记 quota_is_usd=true 时，额度无需 /500000 换算。"""
+    return bool(find_first_value(detail, ["quota_is_usd"]))
+
+
+def detail_quota_awarded(detail: Any) -> Any:
+    return find_first_value(detail, _QUOTA_AWARDED_KEYS)
+
+
+def detail_current_quota(detail: Any) -> Any:
+    return find_first_value(detail, _CURRENT_QUOTA_KEYS)
+
+
+def detail_quota_usd(detail: Any) -> float | None:
+    """从签到/查询结果 detail 提取当前余额（美元）；未知返回 None。"""
+    return quota_usd_value(detail_current_quota(detail), is_usd=detail_is_usd(detail))
 
 
 @dataclass
@@ -333,15 +438,6 @@ def strip_session_cookie(cookie: str) -> str:
         for key, value in cookie_items(cookie)
         if key.lower() not in SESSION_COOKIE_NAMES
     )
-
-
-def normalize_base_url(value: str) -> str:
-    value = value.strip().rstrip("/")
-    if not value:
-        return value
-    if not value.startswith(("http://", "https://")):
-        value = "https://" + value
-    return value
 
 
 # ── HTTP / JSON ────────────────────────────────────────────────────────────

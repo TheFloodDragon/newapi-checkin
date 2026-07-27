@@ -19,7 +19,6 @@ import sys
 import textwrap
 import threading
 import time
-from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +27,7 @@ from typing import Any
 import accounts_store
 from config import Timeouts, OutputConfig
 from mask_utils import mask_secrets, sanitize_data
+from providers import base as providers_base
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -49,7 +49,6 @@ VALID_RESULT_STATUSES = OK_STATUSES | {
     "network_error",
     "error",
 }
-QUOTA_UNIT = 500_000  # New API 内部 quota 与 USD 的换算系数：quota / 500000 = $
 # 子任务因超时被强制终止时使用的约定退出码（与 GNU timeout 一致）。
 TIMEOUT_EXIT_CODE = 124
 # 新三维字段：站点适配器 / 登录方式 / 签到方式
@@ -348,35 +347,6 @@ def is_blank(value: Any) -> bool:
     return value is None or value == ""
 
 
-def find_first_value(data: Any, keys: list[str]) -> Any:
-    """在嵌套 dict/list 中按键名（不区分大小写）BFS 查找第一个非空值。
-
-    使用 deque 做队列，popleft() 为 O(1)，避免 list.pop(0) 的 O(n) 开销；
-    seen 记录已访问对象 id，防止循环引用导致的无限遍历。
-    """
-    wanted = {key.lower() for key in keys}
-    queue: deque[Any] = deque([data])
-    seen: set[int] = set()
-
-    while queue:
-        item = queue.popleft()
-        if item is None:
-            continue
-        marker = id(item)
-        if marker in seen:
-            continue
-        seen.add(marker)
-
-        if isinstance(item, dict):
-            for key, value in item.items():
-                if str(key).lower() in wanted and not is_blank(value):
-                    return value
-            queue.extend(item.values())
-        elif isinstance(item, list):
-            queue.extend(item)
-    return None
-
-
 def value_to_text(value: Any) -> str:
     if value is None:
         return ""
@@ -393,57 +363,22 @@ def value_to_text(value: Any) -> str:
     return text.replace("\r", " ").replace("\n", " ").strip()
 
 
-def quota_to_usd(value: Any, *, already_usd: bool = False) -> str:
-    """把额度数值格式化为 $x USD 字符串；非数字原样返回。
+def format_quota(value: Any, *, already_usd: bool = False) -> str:
+    """把额度数值格式化为 $x USD 字符串（唯一实现在 providers.base.format_usd）。
 
     - already_usd=False：值是 New API 内部 quota，需 /500000 换算（如 newapi）
     - already_usd=True ：值本身已是 USD（如 sub2api 的 reward_amount），不换算
     """
     if is_blank(value):
         return ""
-    try:
-        usd = float(value) if already_usd else float(value) / QUOTA_UNIT
-        return f"${usd:.4g}"
-    except (TypeError, ValueError):
-        return value_to_text(value)
+    return providers_base.format_usd(value, is_usd=already_usd, fallback=value_to_text(value))
 
 
-def detail_is_usd(detail: Any) -> bool:
-    """provider 在 detail 里标记 quota_is_usd=true 时，额度无需 /500000 换算。"""
-    return bool(find_first_value(detail, ["quota_is_usd"]))
-
-
-def format_quota(value: Any, *, already_usd: bool = False) -> str:
-    return quota_to_usd(value, already_usd=already_usd)
-
-
-def extract_quota_awarded(detail: Any) -> Any:
-    return find_first_value(
-        detail,
-        [
-            "quota_awarded",
-            "awarded_quota",
-            "award_quota",
-            "reward_quota",
-            "checkin_quota",
-            "quota_reward",
-        ],
-    )
-
-
-def extract_current_quota(detail: Any) -> Any:
-    return find_first_value(
-        detail,
-        [
-            "current_quota",   # checkin.py 注入的标准字段
-            "remaining_quota",
-            "available_quota",
-            "quota_remaining",
-            "user_quota",
-            "quota",
-            "balance",
-        ],
-    )
+# detail 提取与 quota_is_usd 判定同样收敛到 providers.base；保留原名兼容既有调用。
+find_first_value = providers_base.find_first_value
+detail_is_usd = providers_base.detail_is_usd
+extract_quota_awarded = providers_base.detail_quota_awarded
+extract_current_quota = providers_base.detail_current_quota
 
 
 def append_part(parts: list[str], label: str, value: Any, *, skip_value: Any = None) -> None:

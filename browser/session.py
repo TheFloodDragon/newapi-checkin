@@ -35,7 +35,6 @@ from . import bypass, oauth_providers, popups, state
 from config import WAFConfig, Timeouts
 
 SCRIPT_DIR = Path(__file__).resolve().parent.parent  # checkin/
-QUOTA_UNIT = 500_000
 OAUTH_WAIT_SECONDS = Timeouts.OAUTH_WAIT
 WAF_RETRY = WAFConfig.RETRY_ATTEMPTS
 # 连续多少次「整轮」WAF 求解失败后，判定出口 IP 被阿里云 WAF 持续风控（熔断），
@@ -347,10 +346,10 @@ def run_sync(coro: Any) -> Any:
 
 
 def quota_to_usd(value: Any) -> str:
-    try:
-        return f"${float(value) / QUOTA_UNIT:.4g}"
-    except (TypeError, ValueError):
-        return str(value)
+    """内部 quota → $ 展示（唯一实现在 providers.base；懒加载避免装载顺序耦合）。"""
+    from providers.base import format_usd
+
+    return format_usd(value, is_usd=False, fallback=str(value))
 
 
 # ───────────────────────── 辅助函数：/api/user/self ────────────────────────

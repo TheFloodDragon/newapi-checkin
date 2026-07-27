@@ -25,10 +25,9 @@ from ..base import (
     SiteConfig,
     SiteProfile,
     StatusInfo,
+    format_usd,
 )
-from ._common import build_http_client, credentials_ready, usd_str
-
-VERIFICATION_PATTERNS = ["Turnstile", "Cloudflare", "Just a moment", "安全验证", "challenge-platform", "人机", "验证", "captcha"]
+from ._common import build_http_client, credentials_ready
 
 
 def _need_login_message(site: SiteConfig) -> str:
@@ -152,7 +151,7 @@ def _checkin_once(site: SiteConfig, client: ProfileClient, turnstile: str) -> Ch
     if detail.get("unsupported_checkin"):
         return CheckinResult(site.name, base_url, "success", "站点未提供签到接口，已完成余额查询。", detail=detail)
     if reward.quota_awarded is not None:
-        awarded = usd_str(reward.quota_awarded, is_usd=client.quota_is_usd)
+        awarded = format_usd(reward.quota_awarded, is_usd=client.quota_is_usd)
         return CheckinResult(site.name, base_url, "success", f"签到成功，获得额度：{awarded}", detail=detail)
     return CheckinResult(site.name, base_url, "success", "签到成功。", detail=detail)
 

@@ -49,13 +49,8 @@ DEFAULT_CONFIG_PATH = SCRIPT_DIR / "sites.json"
 OK_STATUSES = {"success", "already_done"}
 
 
-def normalize_base_url(value: str) -> str:
-    value = value.strip().rstrip("/")
-    if not value:
-        return value
-    if not value.startswith(("http://", "https://")):
-        value = "https://" + value
-    return value
+# base_url 归一化唯一实现在 accounts_store；保留模块级别名兼容既有引用。
+normalize_base_url = accounts_store.normalize_base_url
 
 
 def run_site_checkin(site: SiteConfig, turnstile: str = "") -> CheckinResult:
