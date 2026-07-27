@@ -127,10 +127,6 @@ jobs:
         if: steps.detect_browser.outputs.need_browser == 'true' && steps.camoufox-cache.outputs.cache-hit != 'true'
         run: uv run python -m camoufox fetch
 
-      - name: 修补 Playwright Firefox 驱动
-        if: steps.detect_browser.outputs.need_browser == 'true'
-        run: uv run python -m ci.patch_playwright
-
       - name: 启动 Clash 代理（可选）
         env:
           CLASH_CONFIG: ${{ secrets.CLASH_CONFIG }}

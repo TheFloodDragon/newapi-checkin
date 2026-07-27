@@ -20,10 +20,7 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import io
 import random
-import sys
 from typing import Any
 
 try:
@@ -38,25 +35,6 @@ except ImportError as e:
     Page = Any  # type: ignore
     Browser = Any  # type: ignore
     BrowserContext = Any  # type: ignore
-
-
-_DRIVER_PATCH_ATTEMPTED = False
-
-
-def _ensure_playwright_driver_patched() -> None:
-    """进程内只尝试一次 Firefox 驱动补丁；失败不阻塞浏览器启动。"""
-    global _DRIVER_PATCH_ATTEMPTED
-    if _DRIVER_PATCH_ATTEMPTED:
-        return
-    _DRIVER_PATCH_ATTEMPTED = True
-    try:
-        from ci import patch_playwright
-
-        # 自动补丁属于启动前维护动作，不应污染签到 worker 的原始输出。
-        with contextlib.redirect_stdout(io.StringIO()):
-            patch_playwright.main()
-    except Exception as exc:
-        print(f"[patch_playwright] automatic patch failed: {exc}", file=sys.stderr, flush=True)
 
 
 def _check_camoufox() -> None:
@@ -157,7 +135,6 @@ async def launch_camoufox(
         RuntimeError: Camoufox 未安装。
         Exception: 启动失败（如 camoufox 未安装、网络问题等）。
     """
-    _ensure_playwright_driver_patched()
     _check_camoufox()
 
     launch_options: dict[str, Any] = {

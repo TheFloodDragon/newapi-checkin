@@ -322,10 +322,6 @@ uv run python browser/poc_oauth.py run --base-url https://agentrouter.org --oaut
 
 新版阿里云 WAF（`aliyun_waf_aa` / `aliyun_waf_bb` 挑战）按「客户端信号 + 出口 IP 信誉」联合风控。数据中心 / CI 机房 IP（如 GitHub Actions）信誉极低，即使真实有头浏览器也常年过不了。表现为日志反复 `WAF 挑战求解失败`、`status=200 ... waf=True`。此时签到返回 `need_verification`（**不是登录态失效**）。代码内置 WAF 熔断：连续 2 次整轮失败即判定 IP 被风控，短路后续求解，快速失败。解法：为该账号配置**住宅代理**（优先中国大陆 / 亚太），或改在住宅 IP 环境运行。
 
-### Playwright Firefox 驱动崩溃补丁
-
-Playwright 1.6x Firefox 驱动在处理缺少 `location` 的 pageError，或在请求结束事件中拿到空的 `_existingResponse()` 时，可能崩溃整个 Node 进程。`ci/patch_playwright.py`（`python -m ci.patch_playwright`）会同时修复 `pageError.location` 与 `response2.setTransferSize` 空引用；补丁幂等、best-effort，并会在本地启动 Camoufox 前自动尝试一次。`uv sync` 重装会还原驱动，故 CI 每次运行前仍会执行。
-
 ## 开发与验证
 
 ```bash

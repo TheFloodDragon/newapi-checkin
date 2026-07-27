@@ -170,10 +170,15 @@ class NewApiClient(ProfileClient):
     def classify(self, error: ApiError) -> str:
         if contains_any(error.message, ALREADY_DONE_PATTERNS) or payload_code(error.payload) == "already_done":
             return "already_done"
-        if error.status == 401 or contains_any(error.message, LOGIN_PATTERNS):
+        # 验证特征（如「Turnstile token 为空」）比登录特征更具体，须先判定：
+        # 否则会因 message 含宽泛的 "token" 被 LOGIN_PATTERNS 误判为 need_login。
+        # HTTP 401 是明确的未授权状态，仍优先归为 need_login。
+        if error.status == 401:
             return "need_login"
         if contains_any(error.message, VERIFICATION_PATTERNS):
             return "need_verification"
+        if contains_any(error.message, LOGIN_PATTERNS):
+            return "need_login"
         return "error"
 
     # ── 签到接口变体 ──
