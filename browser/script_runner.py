@@ -16,12 +16,14 @@ from types import ModuleType
 from typing import Any
 from urllib.parse import urlparse
 
+from accounts_store import RESULTS_DIR_NAME
+
 from . import bypass, popups, session, state
 from .script_helpers import ScriptHelpers
 
 CHECKIN_DIR = Path(__file__).resolve().parents[1]
 REPO_ROOT = CHECKIN_DIR
-SCREENSHOT_DIR = CHECKIN_DIR / "results" / "browser_script"
+SCREENSHOT_DIR = CHECKIN_DIR / RESULTS_DIR_NAME / "browser_script"
 VALID_STATUSES = {"success", "already_done", "need_login", "need_verification", "need_config", "network_error", "error"}
 
 

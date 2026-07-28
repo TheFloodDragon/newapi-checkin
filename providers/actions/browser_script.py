@@ -68,6 +68,58 @@ def _api_log(site: SiteConfig, message: str) -> None:
     print(f"[api_first:{site.name}] {mask_secrets(str(message))}", file=sys.stderr, flush=True)
 
 
+def _describe_failure(exc: ApiError) -> str:
+    """把 ApiError 展开成「HTTP 状态 + 服务端判据 + 端点」的单行描述。
+
+    以前只打 exc.message，站点回的 401 与 403、以及 reason（如
+    REFRESH_TOKEN_INVALID / TOKEN_EXPIRED）都看不到，同一句「未能完成」既可能
+    是 token 过期也可能是账号被封，只能另写脚本手打接口才能区分。
+    """
+    parts: list[str] = []
+    status = getattr(exc, "status", None)
+    if status:
+        parts.append(f"HTTP {status}")
+    message = str(getattr(exc, "message", "") or "").strip()
+    if message:
+        parts.append(message)
+    # 响应体只在 ApiError.payload（providers/base.py 的 ApiError 只有
+    # status / payload / message / transient 四个字段，没有 body / url）。
+    payload = getattr(exc, "payload", None)
+    if isinstance(payload, dict):
+        for key in ("reason", "code", "error"):
+            value = str(payload.get(key) or "").strip()
+            if value and value not in message:
+                parts.append(f"{key}={value}")
+                break
+    if getattr(exc, "transient", False):
+        parts.append("（临时性错误，可重试）")
+    return " | ".join(parts) or "未提供失败详情"
+
+
+def _describe_missing_token(site: SiteConfig) -> str:
+    """说明「为什么没有可用 access_token」，区分留空 / 值损坏两种情形。
+
+    normalize_access_token 会把含非 ASCII 的值静默判为空（HTTP 头只能承载
+    latin-1），最常见来源是从站点后台的截断显示里复制、值中间带了 U+2026 省略号。
+    不区分的话日志只会说「未配置」，用户明明填了却查不出问题在哪。
+    """
+    raw = str(getattr(site, "access_token", "") or "").strip()
+    if not raw:
+        return "配置里 access_token 为空"
+    bad = sorted({ch for ch in raw if not ch.isascii()})
+    if bad:
+        shown = " ".join(f"{ch!r}(U+{ord(ch):04X})" for ch in bad[:3])
+        return (
+            f"access_token 含非 ASCII 字符 {shown}（共 {len(raw)} 字符），"
+            "无法用于 HTTP 头，已视为未配置——多半是从截断显示里复制的残缺值"
+        )
+    if raw.startswith("<") and raw.endswith(">"):
+        return "access_token 仍是占位文本，未填真实值"
+    if raw.count(".") != 2:
+        return f"access_token 不是 JWT 结构（{len(raw)} 字符，{raw.count('.') + 1} 段），可能复制不完整"
+    return f"access_token 被判定为不可用（{len(raw)} 字符）"
+
+
 def _persist_tokens(
     site: SiteConfig,
     access_token: str,
@@ -176,18 +228,32 @@ def _try_api_checkin(site: SiteConfig, profile: SiteProfile) -> CheckinResult | 
         """
         refresh_http = getattr(profile, "refresh_token_via_http", None)
         if not callable(refresh_http):
+            _api_log(site, f"{reason}，但站点适配器（{type(profile).__name__}）不支持纯 HTTP 续期")
             return ""
-        if not str(getattr(site, "refresh_token", "") or "").strip():
+        configured = str(getattr(site, "refresh_token", "") or "").strip()
+        if not configured:
+            # 明确指出「为什么没续期」：以前这里静默 return，日志上看不出是
+            # 没配 refresh_token 还是续期失败，两者的处理方式完全不同。
+            _api_log(
+                site,
+                f"{reason}，但未配置 refresh_token（{base_url}）——"
+                "请在管理界面「浏览器登录捕获」或手工填写 Refresh Token",
+            )
             return ""
-        _api_log(site, f"{reason}，尝试用 refresh_token 纯 HTTP 续期")
+        _api_log(site, f"{reason}，尝试用 refresh_token 纯 HTTP 续期（{base_url}，rt {len(configured)} 字符）")
         try:
             pair = refresh_http(site, log=lambda m: _api_log(site, m)) or {}
         except Exception as exc:
-            _api_log(site, f"refresh_token 续期异常：{exc}")
+            _api_log(site, f"refresh_token 续期异常（{base_url}）：{type(exc).__name__}: {exc}")
             return ""
         renewed = normalize_access_token(str(pair.get("access_token") or ""))
         if not renewed:
-            _api_log(site, "refresh_token 续期未成功")
+            # profile 侧已用 log 回调打过服务端判据（状态码 / reason），这里补出
+            # 站点与后续动作，让「下一步该做什么」在同一行日志里可见。
+            _api_log(
+                site,
+                f"refresh_token 续期未成功（{base_url}），将降级到账密登录 / 浏览器脚本",
+            )
             return ""
         _persist_tokens(site, renewed, str(pair.get("refresh_token") or "").strip(),
                         log=lambda m: _api_log(site, m))
@@ -218,11 +284,13 @@ def _try_api_checkin(site: SiteConfig, profile: SiteProfile) -> CheckinResult | 
                     site.name, base_url, "already_done", "今日已签到。",
                     detail={"checkin_source": "api", "api_first": True, "api_stage": "token"},
                 )
-            _api_log(site, f"token 阶段未能完成（{kind}）：{exc.message}")
+            _api_log(site, f"token 阶段未能完成（{kind}）：{_describe_failure(exc)}")
         except Exception as exc:
-            _api_log(site, f"token 阶段异常：{exc}")
+            _api_log(site, f"token 阶段异常：{type(exc).__name__}: {exc}")
     else:
-        _api_log(site, "未配置 access_token，跳过 token 阶段")
+        # 说明「为什么没有 token」：配置留空、值损坏（非 ASCII/占位）还是被清掉，
+        # 排查时结论完全不同。以前只有一句「未配置」，无法区分。
+        _api_log(site, f"跳过 token 阶段：{_describe_missing_token(site)}")
 
     # ── 第 1.5 级：token 过期但 refresh_token 可能仍有效 → 纯 HTTP 续期后重试 ──
     # 这是实测中最常见的情形（access_token 只有几小时有效期），必须在动用账密
@@ -242,9 +310,9 @@ def _try_api_checkin(site: SiteConfig, profile: SiteProfile) -> CheckinResult | 
                         site.name, base_url, "already_done", "今日已签到。",
                         detail={"checkin_source": "api", "api_first": True, "api_stage": "refresh"},
                     )
-                _api_log(site, f"refresh 阶段未能完成（{kind}）：{exc.message}")
+                _api_log(site, f"refresh 阶段未能完成（{kind}）：{_describe_failure(exc)}")
             except Exception as exc:
-                _api_log(site, f"refresh 阶段异常：{exc}")
+                _api_log(site, f"refresh 阶段异常：{type(exc).__name__}: {exc}")
 
     # ── 第 2 级：纯 HTTP 账密登录换新 token（站点未启 Turnstile 时可行）──
     login = getattr(profile, "http_password_login", None)

@@ -44,7 +44,7 @@ class SiteSpec:
     # localStorage sentinel 键名。两站同时启用时必须各自独立，否则一站登录成功会
     # 让另一站的 init script 提前停止清理 auth 键。
     login_reset_sentinel: str
-    # 截图文件名前缀（results/browser_script/<prefix>-*.png）。
+    # 截图文件名前缀（<缓存目录>/browser_script/<prefix>-*.png）。
     screenshot_prefix: str
     default_start_path: str = "/check-in"
     email_env: str = ""

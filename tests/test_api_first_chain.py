@@ -204,3 +204,63 @@ def test_turnstile_site_skips_http_login(monkeypatch) -> None:
     site = _site(script_args={"email": "a@b.c", "password": "pw"})
 
     assert browser_script._try_api_checkin(site, profile) is None
+
+
+# ── 失败日志必须带可诊断上下文（站点 / 状态码 / 服务端 reason）──────────────
+def test_describe_failure_surfaces_status_and_server_reason() -> None:
+    """排查凭据问题时，状态码和 reason 是区分「过期」与「被作废」的唯一依据。
+
+    以前只打 exc.message，401/403 与 REFRESH_TOKEN_INVALID 全看不到，
+    只能另写脚本手打接口才能区分，本测试锁住这些字段出现在日志里。
+    """
+    from providers.actions.browser_script import _describe_failure
+    from providers.base import ApiError
+
+    text = _describe_failure(
+        ApiError(
+            401,
+            {"code": 401, "message": "invalid refresh token", "reason": "REFRESH_TOKEN_INVALID"},
+            "invalid refresh token",
+        )
+    )
+    assert "HTTP 401" in text
+    assert "REFRESH_TOKEN_INVALID" in text
+
+
+def test_describe_failure_marks_transient_errors() -> None:
+    """瞬时错误要标出来：这类失败重试即可，不该让用户去换凭据。"""
+    from providers.actions.browser_script import _describe_failure
+    from providers.base import ApiError
+
+    assert "可重试" in _describe_failure(ApiError(None, None, "timeout", transient=True))
+    assert "可重试" not in _describe_failure(ApiError(403, None, "Forbidden"))
+
+
+def test_missing_token_distinguishes_empty_from_corrupt() -> None:
+    """「填了但值损坏」与「压根没填」必须能从日志区分开。
+
+    normalize_access_token 把含非 ASCII 的值静默判空（HTTP 头只能承载 latin-1），
+    最常见来源是从截断显示里复制、值中间带了 U+2026 省略号。
+    """
+    from providers.actions.browser_script import _describe_missing_token
+
+    empty = _site(access_token="")
+    assert "为空" in _describe_missing_token(empty)
+
+    corrupt = _site(access_token="eyJhbGci.eyJ1c2Vy…Q1NH0.xCpdND")
+    text = _describe_missing_token(corrupt)
+    assert "U+2026" in text or "非 ASCII" in text
+
+
+def test_refresh_failure_detail_is_exposed_by_profile() -> None:
+    """profile 侧要把服务端判据交给上层，否则 actions 层无从记录。"""
+    from providers.profiles.sub2api import _describe_api_error
+    from providers.base import ApiError
+
+    text = _describe_api_error(
+        ApiError(401, {"reason": "REFRESH_TOKEN_INVALID"}, "invalid refresh token"),
+        "https://s.invalid/api/v1/auth/refresh",
+    )
+    assert "auth/refresh" in text
+    assert "HTTP 401" in text
+    assert "REFRESH_TOKEN_INVALID" in text

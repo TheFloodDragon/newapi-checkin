@@ -3,7 +3,7 @@
 
 背景：access_token 是短期 JWT（实测 sub2api 数小时即过期），每次续期都改写
 ACCOUNTS.json 会让配置被后台任务反复重写，也让导出的 GitHub Secret 很快失效。
-因此续期结果落在独立的 results/token_cache.json，配置只保留长期凭据。
+因此续期结果落在独立的 <缓存目录>/token_cache.json，配置只保留长期凭据。
 """
 
 from __future__ import annotations

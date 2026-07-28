@@ -5,6 +5,7 @@ import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
+import accounts_store
 
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "checkin" / "100xlabs.py"
@@ -274,7 +275,7 @@ class FakeHelpers:
 
     async def screenshot(self, name: str) -> str:
         self.screenshots.append(name)
-        return f"results/{name}"
+        return f"{accounts_store.RESULTS_DIR_NAME}/{name}"
 
     @staticmethod
     def _result(
@@ -455,7 +456,7 @@ def test_missing_completion_signal_returns_error_and_screenshot() -> None:
 
     assert result["status"] == "error"
     assert "未检测到签到完成信号" in result["message"]
-    assert result["detail"]["screenshot"] == "results/100xlabs-after-click.png"
+    assert result["detail"]["screenshot"] == f"{accounts_store.RESULTS_DIR_NAME}/100xlabs-after-click.png"
     assert helpers.screenshots == ["100xlabs-after-click.png"]
     assert page.waits
 

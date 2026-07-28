@@ -91,6 +91,46 @@ def _persist_refreshed_token(
         pass
 
 
+def _brief(value: Any, limit: int = 160) -> str:
+    """把响应体压成一行短文本，供失败日志引用（不做脱敏，调用方统一走 mask_secrets）。"""
+    if value is None:
+        return "<空响应>"
+    try:
+        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    except Exception:
+        text = str(value)
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _describe_api_error(exc: ApiError, endpoint: str) -> str:
+    """把 ApiError 摊平成可诊断的一行：端点 + 状态码 + 服务端 message/reason。
+
+    以前失败只剩「refresh_token 已失效」一句结论，状态码和服务端判据（如
+    REFRESH_TOKEN_INVALID）全被吞掉，排查时只能另写脚本手打端点才看得到真实原因。
+    """
+    parts = [f"{endpoint} 请求失败"]
+    status = getattr(exc, "status", None)
+    if status:
+        parts.append(f"HTTP {status}")
+    message = str(getattr(exc, "message", "") or "").strip()
+    if message:
+        parts.append(message)
+    # 响应体在 ApiError.payload（见 providers/base.py 的 ApiError.__init__）。
+    # reason 是 sub2api 区分「凭据被服务端作废」与「请求本身有问题」的关键字段，
+    # 它只在响应体里，不在 message 中。
+    payload = getattr(exc, "payload", None)
+    if isinstance(payload, dict):
+        reason = str(payload.get("reason") or payload.get("code") or "").strip()
+        if reason and reason not in message:
+            parts.append(f"reason={reason}")
+    elif payload:
+        parts.append(_brief(payload))
+    if getattr(exc, "transient", False):
+        parts.append("（可重试的临时故障）")
+    return "；".join(parts)
+
+
 def _to_number(value: Any) -> float | int | None:
     if isinstance(value, bool) or value is None:
         return None
@@ -210,6 +250,10 @@ class Sub2ApiClient(ProfileClient):
         # 纯 HTTP 的 refresh_token 刷新（不启动浏览器）；由 profile 注入。
         self._refresh_token = str(getattr(site, "refresh_token", "") or "").strip()
         self._http_refresh_used = False
+        # 最近一次 refresh_token 续期失败的可诊断原因（端点/状态码/服务端 reason）。
+        # 供调用方打日志：失败结论本身没有诊断价值，用户需要知道是凭据被作废、
+        # 站点限流，还是网络不通。
+        self._refresh_failure = ""
 
     def _refresh_via_http(self) -> str:
         """用 refresh_token 直接调 /auth/refresh 换新 access_token（不启动浏览器）。
@@ -218,12 +262,17 @@ class Sub2ApiClient(ProfileClient):
         只要浏览器捕获登录态时存下了 refresh_token，纯 HTTP 路径就能自行续期，
         无需为「token 过期」这一常见情况拉起 Camoufox。失败返回空串。
         """
-        if not self._refresh_token or self._http_refresh_used:
+        if not self._refresh_token:
+            self._refresh_failure = "配置里没有 refresh_token"
+            return ""
+        if self._http_refresh_used:
+            self._refresh_failure = "本次运行已尝试过 refresh_token 续期，不再重试"
             return ""
         self._http_refresh_used = True
+        endpoint = self.base_url + API_PREFIX + "/auth/refresh"
         try:
             payload = http_request(
-                self.base_url + API_PREFIX + "/auth/refresh",
+                endpoint,
                 method="POST",
                 headers={**self._headers(), "Content-Type": "application/json"},
                 body=json.dumps({"refresh_token": self._refresh_token}).encode("utf-8"),
@@ -231,10 +280,15 @@ class Sub2ApiClient(ProfileClient):
                 verify_ssl=getattr(self.site, "verify_ssl", True),
                 cookie_jar=self._cookie_jar,
             )
-        except ApiError:
+        except ApiError as exc:
+            # 保留服务端给出的判据：以前这里直接 return ""，调用方只能打一句
+            # 「refresh_token 已失效」，状态码和 reason（如 REFRESH_TOKEN_INVALID）
+            # 全部丢失，排查时只能另写脚本手打这个端点才看得到真实原因。
+            self._refresh_failure = _describe_api_error(exc, endpoint)
             return ""
         data = unwrap_data(payload)
         if not isinstance(data, dict):
+            self._refresh_failure = f"{endpoint} 返回结构无法识别：{_brief(payload)}"
             return ""
         token = normalize_access_token(str(data.get("access_token") or ""))
         # 服务端可能轮换 refresh_token；记下新值供本次进程后续使用。
@@ -730,11 +784,18 @@ class Sub2ApiProfile(SiteProfile):
 
         refresh = str(getattr(site, "refresh_token", "") or "").strip()
         if not refresh:
+            _log(f"{normalize_base_url(site.base_url)} 未配置 refresh_token，跳过纯 HTTP 续期")
             return {}
         client = Sub2ApiClient(site, AuthInfo())
         token = client._refresh_via_http()
         if not token:
-            _log("refresh_token 已失效，服务端拒绝续期")
+            # 带上站点、端点、状态码与服务端 reason：只说「已失效」时用户无法区分
+            # 凭据真被作废（REFRESH_TOKEN_INVALID）、站点限流还是网络不通，
+            # 之前排查只能另写脚本手打这个端点。
+            _log(
+                f"refresh_token 续期失败（{client._refresh_failure or '原因未知'}）；"
+                f"refresh_token 长度 {len(refresh)}，如确认已被服务端作废需重新捕获登录态"
+            )
             return {}
         _log(f"refresh_token 续期成功（新 access_token {len(token)} 字符）")
         return {"access_token": token, "refresh_token": client._refresh_token or refresh}

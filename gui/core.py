@@ -762,7 +762,7 @@ class StatusStore:
     """站点状态缓存：内存字典 + 双文件（checkin_result / gui_status_cache）合并落盘。"""
 
     def __init__(self, results_dir: Path | None = None):
-        self.results_dir = results_dir or (accounts_store.SCRIPT_DIR / "results")
+        self.results_dir = results_dir or accounts_store.RESULTS_DIR
         self.entries: dict[str, dict[str, Any]] = {}
 
     @staticmethod

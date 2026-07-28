@@ -191,7 +191,7 @@ challenge 新版签到需要本机 **Node.js**（执行 WASM PoW，见 `checkin_
 ## 运行
 
 ```bash
-# 批量执行所有启用站点；每站点独立子进程，结果写入 results/checkin_result.json
+# 批量执行所有启用站点；每站点独立子进程，结果写入 .cache-checkin/checkin_result.json
 uv run python run__all_checkin.py
 uv run python run__all_checkin.py --verbose   # 额外打印每个任务的完整原始输出（已脱敏）
 
@@ -348,7 +348,7 @@ uv lock --check                     # 校验 uv.lock 与 pyproject 同步
 
 ## 安全要点
 
-- `ACCOUNTS.json` / `results/` / `.browser_profile/` / `login_grant_state.json` / `*.lock` 均已被 `.gitignore` 忽略；
+- `ACCOUNTS.json` / `.cache-checkin/` / `.browser_profile/` / `login_grant_state.json` / `*.lock` 均已被 `.gitignore` 忽略；
 - `oauth_states.*.accounts.*.state` / `browser_state` 为未加密 base64（storage_state JSON），保护依赖不入库 + GitHub Secret 加密存储；
 - 控制台、结果文件与 CI 报告统一脱敏（`mask_utils.py`）；
 - Cloudflare / 阿里云 WAF 自动绕过，失败报 `need_verification`；滑块自动拖拽，复杂验证码需人工完成后重新捕获。

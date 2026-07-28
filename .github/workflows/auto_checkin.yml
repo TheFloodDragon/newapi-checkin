@@ -28,7 +28,7 @@ jobs:
         id: results_cache
         uses: actions/cache/restore@v6
         with:
-          path: results
+          path: .cache-checkin
           key: ${{ runner.os }}-checkin-results-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             ${{ runner.os }}-checkin-results-
@@ -152,7 +152,7 @@ jobs:
         if: always()
         uses: actions/cache/save@v6
         with:
-          path: results
+          path: .cache-checkin
           key: ${{ runner.os }}-checkin-results-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: 输出报告

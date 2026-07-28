@@ -33,6 +33,12 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 SITES_CONFIG_PATH = SCRIPT_DIR / "sites.json"
 ACCOUNTS_PATH = SCRIPT_DIR / "ACCOUNTS.json"
 
+# 运行期产物目录（签到结果、GUI 状态缓存、token 缓存、脚本截图）。
+# 定义在这里而不是各模块自己拼字符串：改名时只有这一处需要动，此前同一个
+# "results" 字面量散在 6 个源文件里，漏改任何一处都会让缓存读写落到两个目录。
+RESULTS_DIR_NAME = ".cache-checkin"
+RESULTS_DIR = SCRIPT_DIR / RESULTS_DIR_NAME
+
 
 class ConfigError(Exception):
     """Raised when a config file exists but cannot be parsed as valid JSON.
@@ -567,7 +573,7 @@ def site_config_from_mapping(
     base_url = normalize_base_url(str(row.get("base_url") or row.get("url") or ""))
 
     # 运行期 token 缓存优先：签到过程中刷新出的 access_token / refresh_token 写在
-    # results/token_cache.json（不入 ACCOUNTS.json，避免后台任务反复改写用户配置、
+    # <缓存目录>/token_cache.json（不入 ACCOUNTS.json，避免后台任务反复改写用户配置、
     # 也避免导出的 GitHub Secret 里塞进很快失效的短期值）。缓存里有更新的值就用它。
     name_for_cache = str(row.get("name") or base_url)
     try:
@@ -1104,12 +1110,15 @@ def build_github_secret_payload(
         if user_id:
             out["user_id"] = user_id
 
+        # access_token 是**接口凭据**，与 auth_method 无关（和下面的 refresh_token 同理）。
+        # 以前只在 auth_method == "access_token" 时导出，于是 sub2api + browser/oauth 的
+        # 账号导出的 Secret 里没有 token：CI 第 1 级纯 API 直接被跳过（日志显示「未配置
+        # access_token」），只能靠 refresh_token 续期，续期也失败就得拉浏览器——而 CI 里
+        # Turnstile 基本过不去。签到链路永远先试纯 API，因此凭据有就导出。
         access_token = str(row.get("access_token") or row.get("authorization") or "").strip()
-        if auth_method == "access_token" and access_token:
+        if access_token:
             out["access_token"] = access_token
 
-        # refresh_token 与 auth_method 无关：sub2api 的 access_token 是短期 JWT，
-        # 只要存了 refresh_token，CI 里的纯 HTTP 路径就能自行续期而不必拉起浏览器。
         refresh_token = str(row.get("refresh_token") or "").strip()
         if refresh_token:
             out["refresh_token"] = refresh_token

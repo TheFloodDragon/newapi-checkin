@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""离屏渲染新 GUI 的开发预览：生成 results/ui-preview-{dark,light}.png。
+"""离屏渲染新 GUI 的开发预览：生成 <缓存目录>/ui-preview-{dark,light}.png。
 
-使用临时目录中的演示数据，不读写真实 ACCOUNTS.json / results 缓存。
+使用临时目录中的演示数据，不读写真实 ACCOUNTS.json / 运行期缓存。
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ import accounts_store  # noqa: E402
 
 # ── 演示数据（写入临时目录并劫持 store 路径）─────────────────────────────────
 tmp = Path(tempfile.mkdtemp(prefix="gui-demo-"))
-(tmp / "results").mkdir()
+(tmp / accounts_store.RESULTS_DIR_NAME).mkdir()
 demo = {
     "accounts": [
         {
@@ -78,7 +78,7 @@ demo = {
     "oauth_states": {"linuxdo": {"accounts": {"default": {"state": "x" * 2048, "username": "demo-user"}}}},
 }
 (tmp / "ACCOUNTS.json").write_text(json.dumps(demo, ensure_ascii=False, indent=2), encoding="utf-8")
-(tmp / "results" / "checkin_result.json").write_text(
+(tmp / accounts_store.RESULTS_DIR_NAME / "checkin_result.json").write_text(
     json.dumps(
         {
             "generated_at": "2026-07-27T08:00:00",
@@ -113,7 +113,7 @@ win.resize(1280, 840)
 win.show()
 QTest.qWait(300)
 
-out_dir = REPO / "results"
+out_dir = REPO / accounts_store.RESULTS_DIR_NAME
 out_dir.mkdir(exist_ok=True)
 
 # 冒烟断言

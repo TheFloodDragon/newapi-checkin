@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""读取 results/checkin_result.json，生成经过脱敏的 Markdown CI 报告。"""
+"""读取签到结果 JSON（accounts_store.RESULTS_DIR），生成经过脱敏的 Markdown CI 报告。"""
 
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ def build_report(payload: Any) -> str:
 
 
 def main() -> int:
-    result_path = Path("results/checkin_result.json")
+    result_path = accounts_store.RESULTS_DIR / "checkin_result.json"
     if result_path.exists():
         try:
             payload = json.loads(result_path.read_text(encoding="utf-8"))

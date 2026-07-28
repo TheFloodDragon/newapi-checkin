@@ -28,7 +28,7 @@ from typing import Any
 import accounts_store
 
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
-CACHE_PATH = SCRIPT_DIR / "results" / "token_cache.json"
+CACHE_PATH = accounts_store.RESULTS_DIR / "token_cache.json"
 
 
 def _cache_key(name: str, base_url: str) -> str:

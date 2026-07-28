@@ -1,12 +1,15 @@
 # 凭据与本地配置，严禁入库
 ACCOUNTS.json
-ACCOUNTS.json.bak
+# 通配：手工/脚本备份常带时间戳（ACCOUNTS.json.bak.20260729_001953），
+# 精确匹配 ACCOUNTS.json.bak 覆盖不到，而这类文件含全部账号的 token 与明文密码。
+ACCOUNTS.json.bak*
 ACCOUNTS.json.lock
 
 # 临时诊断脚本（会读取账号密码做登录实验，不入库）
 .tmpdiag/
 
-# 运行产物
+# 运行产物（results/ 是旧目录名，保留忽略以免历史遗留文件被误提交）
+.cache-checkin/
 results/
 login_grant_state.json
 checkin_report.md

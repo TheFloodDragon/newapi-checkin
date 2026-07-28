@@ -5,6 +5,7 @@ import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
+import accounts_store
 
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "checkin" / "jisudeng.py"
@@ -261,7 +262,7 @@ class FakeHelpers:
 
     async def screenshot(self, name: str) -> str:
         self.screenshots.append(name)
-        return f"results/{name}"
+        return f"{accounts_store.RESULTS_DIR_NAME}/{name}"
 
     @staticmethod
     def _result(

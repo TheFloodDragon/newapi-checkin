@@ -38,7 +38,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 # 统一账号配置：ACCOUNTS.json；sites.json 仅作旧配置补全来源。
 SITES_CONFIG_PATH = SCRIPT_DIR / "sites.json"
 CHECKIN_SCRIPT = SCRIPT_DIR / "checkin.py"
-RESULTS_DIR = SCRIPT_DIR / "results"
+RESULTS_DIR = accounts_store.RESULTS_DIR
 RESULT_JSON_PATH = RESULTS_DIR / "checkin_result.json"
 OLD_NEWAPI_SCRIPTS = {"elysiver_checkin.py", "chybenzun_checkin.py"}
 OK_STATUSES = {"success", "already_done"}
