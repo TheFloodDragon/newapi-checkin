@@ -78,7 +78,7 @@ class Timeouts:
     BROWSER_STARTUP_OVERHEAD: float = _env_float("BROWSER_STARTUP_OVERHEAD", 120.0)
 
     # browser_script 默认脚本超时
-    BROWSER_SCRIPT_DEFAULT: int = _env_int("BROWSER_SCRIPT_DEFAULT", 120)
+    BROWSER_SCRIPT_DEFAULT: int = _env_int("BROWSER_SCRIPT_DEFAULT", 180)
 
     # browser_script 最大脚本超时上限（防止配置错误导致任务永久挂起）
     BROWSER_SCRIPT_MAX: int = _env_int("BROWSER_SCRIPT_MAX", 3600)

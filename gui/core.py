@@ -22,11 +22,22 @@ from pathlib import Path
 from typing import Any, Callable
 
 import accounts_store
+from config import Timeouts as _Timeouts
 from mask_utils import mask_secrets
+
+_SCRIPT_TIMEOUT_DEFAULT = _Timeouts.BROWSER_SCRIPT_DEFAULT
+SCRIPT_TIMEOUT_DEFAULT = _SCRIPT_TIMEOUT_DEFAULT
+
+# 与 accounts_store.site_config_from_mapping / providers.base.SiteConfig 的默认值
+# 保持一致：GUI 用同一套默认值，空值才不会在往返中被解释成「用户改了配置」。
+_REFERER_PATH_DEFAULT = "/profile"
+_BROWSER_PROFILE_DEFAULT = ".browser_profile"
+REFERER_PATH_DEFAULT = _REFERER_PATH_DEFAULT
+BROWSER_PROFILE_DEFAULT = _BROWSER_PROFILE_DEFAULT
 
 # ── 词表（与 providers / accounts_store 对齐）─────────────────────────────────
 TYPES = ("newapi", "sub2api")
-CRED_FIELDS = ("user_id", "access_token", "cookie")
+CRED_FIELDS = ("user_id", "access_token", "refresh_token", "cookie")
 AUTH_METHODS = ("access_token", "cookie", "browser", "oauth")
 CHECKIN_ACTIONS = ("api", "visit", "relogin", "browser_script")
 API_VARIANTS = ("auto", "legacy")
@@ -175,7 +186,7 @@ class SiteRow:
     script: str = ""
     script_args: dict[str, Any] = field(default_factory=dict)
     script_args_text: str = "{}"
-    script_timeout: int = 120
+    script_timeout: int = _SCRIPT_TIMEOUT_DEFAULT
     api_variant: str = "auto"
     oauth_provider: str = "linuxdo"
     oauth_account: str = DEFAULT_OAUTH_ACCOUNT
@@ -190,6 +201,15 @@ class SiteRow:
     browser_state: str = ""
     proxy: str = ""
     verify_ssl: bool = True
+    # 以下四项 checkin.py / run__all_checkin.py 都会消费，但此前 GUI 既不展示也不
+    # 落盘：用户在 ACCOUNTS.json 手写的值，被 GUI 保存一次就静默抹掉。
+    cookie_file: str = ""
+    referer_path: str = _REFERER_PATH_DEFAULT
+    browser_profile: str = _BROWSER_PROFILE_DEFAULT
+    auto_refresh_cookie: bool = True
+    # 旧字段（providers/base.py 标注仅兼容保留，relogin 已改用 oauth_provider）。
+    # 不给输入框，但必须原样往返，否则同样会被保存流程丢掉。
+    login_selector: str = ""
 
     # -- 便捷视图 --
     @property
@@ -236,7 +256,7 @@ def row_from_store(raw: dict[str, Any]) -> SiteRow:
         script=str(raw.get("script") or ""),
         script_args=script_args,
         script_args_text=json.dumps(script_args, ensure_ascii=False, indent=2) if script_args else "{}",
-        script_timeout=accounts_store.parse_script_timeout(raw.get("script_timeout"), 120),
+        script_timeout=accounts_store.parse_script_timeout(raw.get("script_timeout")),
         api_variant=api_variant,
         oauth_provider=accounts_store.normalize_oauth_provider(raw.get("oauth_provider")) or "linuxdo",
         oauth_account=accounts_store.normalize_oauth_account(raw.get("oauth_account") or raw.get("oauth_account_id")),
@@ -250,6 +270,12 @@ def row_from_store(raw: dict[str, Any]) -> SiteRow:
         browser_state=str(raw.get("browser_state") or "") if keep_state else "",
         proxy=str(raw.get("proxy") or ""),
         verify_ssl=accounts_store.parse_enabled(raw.get("verify_ssl"), True),
+        # token_file 是 cookie_file 的旧名，accounts_store 两者都接受。
+        cookie_file=str(raw.get("cookie_file") or raw.get("token_file") or ""),
+        referer_path=str(raw.get("referer_path") or _REFERER_PATH_DEFAULT),
+        browser_profile=str(raw.get("browser_profile") or _BROWSER_PROFILE_DEFAULT),
+        auto_refresh_cookie=accounts_store.parse_enabled(raw.get("auto_refresh_cookie"), True),
+        login_selector=str(raw.get("login_selector") or ""),
     )
 
 
@@ -302,7 +328,7 @@ def task_params(row: SiteRow, oauth_states: dict[str, Any]) -> dict[str, Any]:
         "checkin_action": row.checkin_action,
         "script": row.script.strip(),
         "script_args": accounts_store.normalize_script_args(row.script_args),
-        "script_timeout": accounts_store.parse_script_timeout(row.script_timeout, 120),
+        "script_timeout": accounts_store.parse_script_timeout(row.script_timeout),
         "api_variant": row.api_variant,
         "cookie": row.cookie.strip(),
         "access_token": row.access_token.strip(),
@@ -313,10 +339,16 @@ def task_params(row: SiteRow, oauth_states: dict[str, Any]) -> dict[str, Any]:
         "oauth_fallback_provider": fallback_provider,
         "oauth_fallback_account": fallback_account,
         "browser_state": browser_state,
-        "login_selector": "",
+        "login_selector": row.login_selector.strip(),
         "proxy": row.proxy.strip(),
         "verify_ssl": bool(row.verify_ssl),
         "fallback_uid": row.user_id.strip(),
+        # 这四项 checkin.py 会消费；GUI 内单站点执行必须与批量/CI 行为一致，
+        # 否则同一份配置在两条路径下表现不同。
+        "cookie_file": row.cookie_file.strip(),
+        "referer_path": row.referer_path.strip() or _REFERER_PATH_DEFAULT,
+        "browser_profile": row.browser_profile.strip() or _BROWSER_PROFILE_DEFAULT,
+        "auto_refresh_cookie": bool(row.auto_refresh_cookie),
     }
 
 
@@ -333,14 +365,24 @@ class FormPlan:
     show_browser_ops: bool = False
     show_delete_oauth: bool = False
     creds_enabled: bool = False
+    # sub2api 的 access_token / refresh_token 是**接口凭据**，与 auth_method 无关：
+    # 即使登录方式是 browser/oauth，签到仍会先走纯 API（token → refresh_token 续期），
+    # 只有全失败才拉浏览器。因此这两个框不能跟着 creds_enabled 一起灰掉，否则用户
+    # 手工粘贴的有效 token 根本无法保存，表现为「填了仍显示没有」。
+    token_enabled: bool = False
     capture_text: str = "浏览器登录捕获"
     verify_text: str = "检测登录态"
     oauth_status: str = ""
     mode_hint: str = ""
     # sub2api 的 access_token 是短期 JWT，refresh_token 才决定能否纯 HTTP 续期
-    # （不必每次签到都拉起浏览器）。它没有输入框，用户只能靠这行文案判断状态。
+    # （不必每次签到都拉起浏览器）。除状态文案外还给出输入框：站点风控（如
+    # Turnstile）可能让浏览器捕获失败，此时手工粘贴是唯一可行的补救途径。
     show_refresh_status: bool = False
+    show_refresh_input: bool = False
     refresh_status: str = ""
+    # browser_profile 只在 browser/oauth 登录方式下被 checkin.py 使用（持久化浏览器
+    # 目录前缀）；其他方式下展示它只会让人误以为配了就会生效。
+    show_browser_profile: bool = False
 
 
 _SCRIPT_FALLBACK_HINT = (
@@ -348,6 +390,48 @@ _SCRIPT_FALLBACK_HINT = (
     "不选择 OAuth 时将直接提示签到失败。可选账号来自顶层共享 OAuth 登录态。"
 )
 _NO_SHARED_OAUTH_HINT = "暂无共享 OAuth 登录态；请切换登录方式为“OAuth 登录态（共享账号）”后捕获，或点击“刷新账号”。"
+
+
+def token_defect(value: str) -> str:
+    """检出「看起来填了、实际不可用」的 access_token；正常返回空串。
+
+    HTTP 头只能承载 latin-1，providers.base.normalize_access_token 会把含非 ASCII
+    的值静默判为空 token。最常见的来源是从站点后台的截断显示里复制，值中间带了
+    Unicode 省略号（U+2026）。不提示的话用户只会看到「未配置 access_token」，
+    完全无从判断是自己粘贴的值有问题。
+    """
+    text = (value or "").strip()
+    # 与 providers.base.normalize_access_token 保持同样的前缀剥离顺序，避免这里
+    # 判「健康」而运行时判「无 token」（或反之）。
+    if text.lower().startswith("authorization:"):
+        text = text.split(":", 1)[1].strip()
+    if text.lower().startswith("bearer "):
+        text = text[7:].strip()
+    if not text:
+        return ""
+    # 占位文本先判：模板占位符往往本身就带中文（如「<在站点后台采集的 access_token>」），
+    # 若先报「含非 ASCII」会把真正的原因盖住。
+    if text.startswith("<") and text.endswith(">"):
+        return "Token 仍是占位文本，请粘贴真实值。"
+    bad = sorted({ch for ch in text if not ch.isascii()})
+    if bad:
+        shown = " ".join(f"{ch!r}(U+{ord(ch):04X})" for ch in bad[:3])
+        return f"Token 含非 ASCII 字符 {shown}，无法用于 HTTP 请求，会被视为未配置。"
+    if text.count(".") != 2:
+        return "Token 不是 JWT 结构（应为 3 段以 . 分隔），可能复制不完整。"
+    return ""
+
+
+def _refresh_token_status(row: SiteRow) -> str:
+    """凭据卡下方的 token 健康度文案：先报硬缺陷，再报 refresh_token 有无。"""
+    defect = token_defect(row.access_token)
+    prefix = f"⚠ {defect}\n" if defect else ""
+    if row.refresh_token.strip():
+        return prefix + "已保存 refresh_token：Token 过期可纯 HTTP 自动续期，无需启动浏览器。"
+    return prefix + (
+        "未保存 refresh_token：Token 过期后需启动浏览器重新登录；"
+        "用「浏览器登录捕获」重新捕获一次即可自动存入。"
+    )
 
 
 def _fallback_status(oauth_states: dict[str, Any], provider: str, account: str) -> str:
@@ -378,16 +462,15 @@ def build_form_plan(row: SiteRow, oauth_states: dict[str, Any]) -> FormPlan:
         show_browser_ops=is_browser or needs_oauth,
         show_delete_oauth=needs_oauth,
         creds_enabled=auth in ("access_token", "cookie"),
-        # refresh_token 只对 sub2api 有意义（access_token 是短期 JWT，refresh_token
-        # 让纯 HTTP 路径能自行续期、不必每次拉起浏览器）。把它的有无显式呈现出来，
-        # 用户才能判断某站点是否已具备免浏览器续期能力。
+        # sub2api 永远可以手填接口凭据：签到链路先纯 API（token → refresh_token
+        # 续期），浏览器只是最后的兜底，所以 browser/oauth 登录方式下这两个框也必须可编辑。
+        token_enabled=row.type == "sub2api" or auth in ("access_token", "cookie"),
+        # refresh_token 决定 Token 过期时能否纯 HTTP 续期（不必每次拉起浏览器）。
         show_refresh_status=row.type == "sub2api",
-        refresh_status=(
-            "已保存 refresh_token：Token 过期可纯 HTTP 自动续期，无需启动浏览器。"
-            if row.refresh_token.strip()
-            else "未保存 refresh_token：Token 过期后需启动浏览器重新登录；"
-                 "用「浏览器登录捕获」重新捕获一次即可自动存入。"
-        ),
+        show_refresh_input=row.type == "sub2api",
+        # browser_profile 只在浏览器参与的登录方式下会被 checkin.py 使用。
+        show_browser_profile=is_browser or needs_oauth,
+        refresh_status=_refresh_token_status(row),
     )
 
     if needs_oauth:
@@ -442,7 +525,7 @@ def _snapshot_row(row: SiteRow) -> dict[str, Any]:
         "checkin_action": row.checkin_action,
         "script": row.script.strip(),
         "script_args_text": row.script_args_text,
-        "script_timeout": accounts_store.parse_script_timeout(row.script_timeout, 120),
+        "script_timeout": accounts_store.parse_script_timeout(row.script_timeout),
         "api_variant": row.api_variant if row.api_variant in API_VARIANTS else "auto",
         "oauth_provider": accounts_store.normalize_oauth_provider(row.oauth_provider) or "linuxdo",
         "oauth_account": accounts_store.normalize_oauth_account(row.oauth_account),
@@ -456,6 +539,12 @@ def _snapshot_row(row: SiteRow) -> dict[str, Any]:
         "browser_state": row.browser_state.strip() if auth == "browser" and row.checkin_action != "relogin" else "",
         "proxy": row.proxy.strip(),
         "verify_ssl": accounts_store.parse_enabled(row.verify_ssl, True),
+        # 这几项也要进快照，否则改动它们不会把配置标记为「未保存」。
+        "cookie_file": row.cookie_file.strip(),
+        "referer_path": row.referer_path.strip() or _REFERER_PATH_DEFAULT,
+        "browser_profile": row.browser_profile.strip() or _BROWSER_PROFILE_DEFAULT,
+        "auto_refresh_cookie": accounts_store.parse_enabled(row.auto_refresh_cookie, True),
+        "login_selector": row.login_selector.strip(),
     }
 
 
@@ -535,7 +624,7 @@ def persist_accounts(rows: list[SiteRow]) -> list[dict[str, Any]]:
                 parsed = accounts_store.normalize_script_args(row.script_args)
             acct["script"] = row.script.strip()
             acct["script_args"] = parsed if isinstance(parsed, dict) else {}
-            acct["script_timeout"] = accounts_store.parse_script_timeout(row.script_timeout, 120)
+            acct["script_timeout"] = accounts_store.parse_script_timeout(row.script_timeout)
         if auth == "oauth" or action == "relogin":
             acct["oauth_provider"] = accounts_store.normalize_oauth_provider(row.oauth_provider) or "linuxdo"
             acct["oauth_account"] = accounts_store.normalize_oauth_account(row.oauth_account)
@@ -552,8 +641,51 @@ def persist_accounts(rows: list[SiteRow]) -> list[dict[str, Any]]:
         state_text = row.browser_state.strip()
         if state_text and auth == "browser" and action != "relogin":
             acct["browser_state"] = state_text
+        # 以下几项 checkin.py / run__all_checkin.py 都会消费。此前 GUI 不写回，
+        # 用户在 ACCOUNTS.json 手写的值会被「保存全部」静默抹掉。只在非默认值时
+        # 落盘，避免给每个账号都塞进一堆等于默认的噪声键。
+        if row.cookie_file.strip():
+            acct["cookie_file"] = row.cookie_file.strip()
+        referer = row.referer_path.strip()
+        if referer and referer != _REFERER_PATH_DEFAULT:
+            acct["referer_path"] = referer
+        if not accounts_store.parse_enabled(row.auto_refresh_cookie, True):
+            acct["auto_refresh_cookie"] = False
+        if auth in ("browser", "oauth"):
+            profile = row.browser_profile.strip()
+            if profile and profile != _BROWSER_PROFILE_DEFAULT:
+                acct["browser_profile"] = profile
+        # login_selector 是仅兼容保留的旧字段，没有输入框，但必须原样往返。
+        if row.login_selector.strip():
+            acct["login_selector"] = row.login_selector.strip()
         accts.append(acct)
     return accts
+
+
+def reconcile_token_cache(rows: list[SiteRow]) -> int:
+    """保存配置后，清掉与用户手填凭据冲突的运行期缓存条目；返回清理条数。
+
+    读取时缓存优先（缓存里一般是刚续期出的新 token）。但用户刚手工粘贴凭据时这条
+    规则会反过来伤人：旧缓存把新填的值盖掉，表面上就是「填了有效 token 仍说没有」。
+    因此保存时做一次对账，冲突即清缓存，让手填值立刻生效。
+    """
+    cleared = 0
+    for row in rows:
+        access = row.access_token.strip()
+        refresh = row.refresh_token.strip()
+        if not access and not refresh:
+            continue
+        try:
+            from providers import token_cache
+
+            if token_cache.reconcile_with_config(
+                row.name, accounts_store.normalize_base_url(row.base_url), access, refresh
+            ):
+                cleared += 1
+        except Exception:
+            # 缓存只是加速产物：对账失败不该阻断配置保存。
+            continue
+    return cleared
 
 
 # ── 剪贴板导入 / 凭据导出 ────────────────────────────────────────────────────
@@ -640,8 +772,27 @@ class StatusStore:
 
     @staticmethod
     def task_key(row: SiteRow) -> str:
-        """任务互斥键：同 base_url 视为同一站点。"""
-        return accounts_store.normalize_base_url(row.base_url) or row.name
+        """任务互斥键：按**渠道**（base_url + 名称）唯一，不是按站点地址。
+
+        以前只用 base_url，于是同一地址下的多个账号共享一把锁：单独签到其中一个，
+        另外两个会被判「该站点已有任务运行中」而跳过，行状态也被一起点亮/清除，
+        看起来就是「三个同址渠道无法同时签到、状态被错误同步」。渠道是独立账号，
+        互斥与状态都必须按渠道区分，因此这里与 status_key 用同一套身份。
+        """
+        base = accounts_store.normalize_base_url(row.base_url)
+        name = (row.name or "").strip()
+        if base and name:
+            return f"{base}|{name}"
+        return base or name
+
+    @staticmethod
+    def site_group_key(row: SiteRow) -> str:
+        """批量执行的分组键：同 base_url 归一组，组内串行、组间并发。
+
+        与 task_key 分离：限流是**站点**维度的（同址账号并发容易被站点限流或撞上
+        同一份浏览器登录态），而互斥锁是**渠道**维度的。
+        """
+        return accounts_store.normalize_base_url(row.base_url) or (row.name or "").strip()
 
     def get(self, key: str) -> dict[str, Any] | None:
         return self.entries.get(key)

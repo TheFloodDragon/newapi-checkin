@@ -337,15 +337,16 @@ class NewApiProfile(SiteProfile):
         if not cookie:
             return None
 
-        # 刷新出的 storage_state 回写供下次复用
+        # 刷新出的 storage_state 存运行期缓存供下次复用（不写 ACCOUNTS.json：
+        # 它每次打开站点都会变，写回会让用户配置被后台任务反复改写）。
         refreshed_state = str(outcome.get("state") or "")
         if refreshed_state and refreshed_state != state_text:
             try:
-                import accounts_store
-                if accounts_store.update_account_auth_data(site.name, site.base_url, browser_state=refreshed_state):
-                    site.browser_state = refreshed_state
+                from .. import token_cache
+                token_cache.save_browser_state(site.name, site.base_url, refreshed_state)
             except Exception:
-                site.browser_state = refreshed_state
+                pass
+            site.browser_state = refreshed_state
 
         new_api_user = str(outcome.get("new_api_user") or site.user_id or "").strip()
 

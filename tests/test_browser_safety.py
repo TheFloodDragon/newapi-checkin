@@ -288,3 +288,53 @@ def test_oauth_result_without_success_toast_remains_already_done() -> None:
     result = session._oauth_checkin_result(1_000_000, 1_000_000, {"landed_back": True})
 
     assert result["status"] == "already_done"
+
+
+# ── refresh_token 快照兜底 ───────────────────────────────────────────────────
+# 背景（实测时序）：access_token 过期时 sub2api 前端收到 401 会清空 localStorage
+# 再跳登录页，而 add_init_script 每次导航又重新注入，两者约每 2 秒来回竞争。
+# 只读“活”存储会随机拿到空值，误报 refresh_token not found 并退化成开浏览器
+# 重登。解码后的登录态快照是静态的，不受该竞争影响，必须作为兜底来源。
+
+def _state_with_refresh(origin: str = "https://site.invalid", value: str = "rt_abc123") -> dict:
+    return {
+        "cookies": [],
+        "origins": [
+            {
+                "origin": origin,
+                "localStorage": [
+                    {"name": "auth_token", "value": "jwt"},
+                    {"name": "refresh_token", "value": value},
+                ],
+            }
+        ],
+    }
+
+
+def test_storage_refresh_token_reads_from_snapshot() -> None:
+    assert session.storage_refresh_token(_state_with_refresh()) == "rt_abc123"
+
+
+def test_storage_refresh_token_survives_cleared_live_storage() -> None:
+    """活存储被前端清空（origins 里没有 refresh_token）时返回空，需由调用方回落快照。"""
+    cleared = {
+        "cookies": [],
+        "origins": [
+            {
+                "origin": "https://site.invalid",
+                "localStorage": [{"name": "sub2api_site_usage_notice_v1", "value": "accepted"}],
+            }
+        ],
+    }
+    assert session.storage_refresh_token(cleared) == ""
+    # 调用方的兜底表达式：活存储为空时取快照里的值
+    snapshot = _state_with_refresh()
+    assert (session.storage_refresh_token(cleared)
+            or session.storage_refresh_token(snapshot)) == "rt_abc123"
+
+
+def test_storage_refresh_token_handles_malformed_input() -> None:
+    for bad in (None, {}, {"origins": None}, {"origins": [None]},
+                {"origins": [{"localStorage": [None]}]},
+                {"origins": [{"localStorage": [{"name": "refresh_token", "value": ""}]}]}):
+        assert session.storage_refresh_token(bad) == ""

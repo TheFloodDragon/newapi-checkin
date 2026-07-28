@@ -480,10 +480,12 @@ class App(QMainWindow):
         self.script_args_edit.setPlaceholderText('{\n  "checkin_text": "签到"\n}')
         self.script_args_wrap.layout().addWidget(self.script_args_edit)
 
-        self.script_timeout_wrap = self._field(site_layout, "脚本超时（秒）", "默认 120")
+        self.script_timeout_wrap = self._field(
+            site_layout, "脚本超时（秒）", f"默认 {core.SCRIPT_TIMEOUT_DEFAULT}"
+        )
         self.script_timeout_edit = QLineEdit()
         self.script_timeout_edit.setObjectName("input")
-        self.script_timeout_edit.setPlaceholderText("120")
+        self.script_timeout_edit.setPlaceholderText(str(core.SCRIPT_TIMEOUT_DEFAULT))
         self.script_timeout_wrap.layout().addWidget(self.script_timeout_edit)
 
         self.mode_hint = QLabel("")
@@ -496,6 +498,17 @@ class App(QMainWindow):
         cred_layout = cred_card.layout()
 
         self.token_edit = self._line(cred_layout, "Access Token", mono=True)
+        # refresh_token 需要可编辑：sub2api 的 access_token 只有几小时有效期，长期能
+        # 免浏览器续期全靠它。以前只有一行「有/无」提示，用户即便手上有有效值也无处
+        # 填写，只能靠浏览器捕获——而捕获本身可能因站点风控（如 Turnstile）失败。
+        self.refresh_wrap = self._field(
+            cred_layout, "Refresh Token", "sub2api 长期凭据，Token 过期后纯 HTTP 续期"
+        )
+        self.refresh_edit = QLineEdit()
+        self.refresh_edit.setObjectName("input")
+        self.refresh_edit.setFont(QFont(theme.MONO_FAMILY, 10))
+        self.refresh_edit.setPlaceholderText("rt_... 由浏览器捕获自动写入，也可手工粘贴")
+        self.refresh_wrap.layout().addWidget(self.refresh_edit)
         self.uid_edit = self._line(cred_layout, "用户 ID", "newapi 的 New-Api-User")
 
         cookie_wrap = self._field(cred_layout, "Cookie")
@@ -557,6 +570,40 @@ class App(QMainWindow):
         self.verify_ssl_check.setChecked(True)
         self.verify_ssl_wrap.layout().addWidget(self.verify_ssl_check)
 
+        # 以下四项 checkin.py / run__all_checkin.py 一直在消费，但此前 GUI 既不展示
+        # 也不写回：用户在 ACCOUNTS.json 手写的值会被「保存全部」静默抹掉。
+        self.referer_wrap = self._field(
+            cred_layout, "Referer 路径", f"newapi 请求头用，默认 {core.REFERER_PATH_DEFAULT}"
+        )
+        self.referer_edit = QLineEdit()
+        self.referer_edit.setObjectName("input")
+        self.referer_edit.setPlaceholderText(core.REFERER_PATH_DEFAULT)
+        self.referer_wrap.layout().addWidget(self.referer_edit)
+
+        self.cookie_file_wrap = self._field(
+            cred_layout, "凭据文件路径", "可选；三行格式（Cookie / user_id / token），留空则用上面的字段"
+        )
+        self.cookie_file_edit = QLineEdit()
+        self.cookie_file_edit.setObjectName("input")
+        self.cookie_file_edit.setPlaceholderText("如 secrets/site_token.txt")
+        self.cookie_file_wrap.layout().addWidget(self.cookie_file_edit)
+
+        self.browser_profile_wrap = self._field(
+            cred_layout, "浏览器 Profile 目录", f"browser / oauth 登录方式复用，默认 {core.BROWSER_PROFILE_DEFAULT}"
+        )
+        self.browser_profile_edit = QLineEdit()
+        self.browser_profile_edit.setObjectName("input")
+        self.browser_profile_edit.setPlaceholderText(core.BROWSER_PROFILE_DEFAULT)
+        self.browser_profile_wrap.layout().addWidget(self.browser_profile_edit)
+
+        self.auto_refresh_wrap = self._field(
+            cred_layout, "Cookie 自动刷新", "默认开启；关闭后 Cookie 失效不再尝试自动续期"
+        )
+        self.auto_refresh_check = QCheckBox("Cookie 失效时自动刷新")
+        self.auto_refresh_check.setObjectName("plainCheck")
+        self.auto_refresh_check.setChecked(True)
+        self.auto_refresh_wrap.layout().addWidget(self.auto_refresh_check)
+
         actions = QHBoxLayout()
         actions.setContentsMargins(0, 4, 0, 0)
         imp_btn = _button("从剪贴板导入", "tool")
@@ -588,11 +635,16 @@ class App(QMainWindow):
         self.script_args_edit.textChanged.connect(self._flush)
         self.script_timeout_edit.textChanged.connect(self._flush)
         self.token_edit.textChanged.connect(self._flush)
+        self.refresh_edit.textChanged.connect(self._flush)
         self.uid_edit.textChanged.connect(self._flush)
         self.cookie_edit.textChanged.connect(self._flush)
         self.state_edit.textChanged.connect(self._flush)
         self.proxy_edit.textChanged.connect(self._flush)
         self.verify_ssl_check.stateChanged.connect(self._flush)
+        self.cookie_file_edit.textChanged.connect(self._flush)
+        self.referer_edit.textChanged.connect(self._flush)
+        self.browser_profile_edit.textChanged.connect(self._flush)
+        self.auto_refresh_check.stateChanged.connect(self._flush)
 
     def _card(self, title: str, subtitle: str = "", parent_layout=None) -> QFrame:
         card = QFrame()
@@ -824,9 +876,14 @@ class App(QMainWindow):
         self.script_timeout_edit.setText(str(row.script_timeout))
         self.state_edit.setPlainText(row.browser_state)
         self.proxy_edit.setText(row.proxy)
+        self.cookie_file_edit.setText(row.cookie_file)
+        self.referer_edit.setText(row.referer_path)
+        self.browser_profile_edit.setText(row.browser_profile)
+        self.auto_refresh_check.setChecked(row.auto_refresh_cookie)
         self.verify_ssl_check.setChecked(row.verify_ssl)
         self.uid_edit.setText(row.user_id)
         self.token_edit.setText(row.access_token)
+        self.refresh_edit.setText(row.refresh_token)
         self.cookie_edit.setPlainText(row.cookie)
         self._update_summary(row)
         self._set_actions_enabled(True)
@@ -838,7 +895,8 @@ class App(QMainWindow):
         self._lock = True
         self.cur = None
         for edit in (self.name_edit, self.base_edit, self.script_edit, self.script_timeout_edit,
-                     self.state_edit, self.proxy_edit, self.uid_edit, self.token_edit):
+                     self.state_edit, self.proxy_edit, self.uid_edit, self.token_edit,
+                     self.refresh_edit):
             edit.clear()
         self._set_type_value("newapi")
         self._set_combo_value(self.auth_combo, "cookie", "cookie")
@@ -848,8 +906,14 @@ class App(QMainWindow):
         self._refresh_oauth_account_choices(core.DEFAULT_OAUTH_ACCOUNT)
         self._refresh_oauth_fallback_choices()
         self.script_args_edit.setPlainText("{}")
-        self.script_timeout_edit.setText("120")
+        self.script_timeout_edit.setText(str(core.SCRIPT_TIMEOUT_DEFAULT))
         self.cookie_edit.clear()
+        # 这几项有非空默认值，必须显式回到默认而不是 clear()，否则新站点会继承
+        # 上一个站点的值（或拿到空串而非 CLI 默认）。
+        self.cookie_file_edit.clear()
+        self.referer_edit.setText(core.REFERER_PATH_DEFAULT)
+        self.browser_profile_edit.setText(core.BROWSER_PROFILE_DEFAULT)
+        self.auto_refresh_check.setChecked(True)
         self.verify_ssl_check.setChecked(True)
         self._update_summary(None)
         self._set_actions_enabled(False)
@@ -877,7 +941,7 @@ class App(QMainWindow):
                 row.script_args = parsed
         except json.JSONDecodeError:
             pass
-        row.script_timeout = accounts_store.parse_script_timeout(self.script_timeout_edit.text().strip(), 120)
+        row.script_timeout = accounts_store.parse_script_timeout(self.script_timeout_edit.text().strip())
         row.api_variant = self._combo_value(self.variant_combo, core.API_VARIANTS, "auto")
         row.oauth_provider = self._combo_value(self.oauth_provider_combo, core.OAUTH_PROVIDERS, "linuxdo")
         row.oauth_account = self._current_oauth_account()
@@ -890,11 +954,18 @@ class App(QMainWindow):
             row.oauth_fallback_account = ""
         row.user_id = self.uid_edit.text().strip()
         row.access_token = self.token_edit.text().strip()
+        row.refresh_token = self.refresh_edit.text().strip()
         row.cookie = self.cookie_edit.toPlainText().strip()
         row.browser_state = (
             self.state_edit.toPlainText().strip() if auth == "browser" and action != "relogin" else ""
         )
         row.proxy = self.proxy_edit.text().strip()
+        row.cookie_file = self.cookie_file_edit.text().strip()
+        # 空输入回落默认值：这两项在 CLI 侧有明确默认（/profile、.browser_profile），
+        # 存空串会让 SiteConfig 拿到空值而不是默认值。
+        row.referer_path = self.referer_edit.text().strip() or core.REFERER_PATH_DEFAULT
+        row.browser_profile = self.browser_profile_edit.text().strip() or core.BROWSER_PROFILE_DEFAULT
+        row.auto_refresh_cookie = self.auto_refresh_check.isChecked()
         row.verify_ssl = self.verify_ssl_check.isChecked()
         self._update_summary(row)
         self._refresh_row(self.cur)
@@ -1067,7 +1138,12 @@ class App(QMainWindow):
         self.oauth_fallback_wrap.setVisible(plan.show_fallback)
         self.uid_edit.setEnabled(plan.creds_enabled)
         self.cookie_edit.setEnabled(plan.creds_enabled)
-        self.token_edit.setEnabled(plan.creds_enabled)
+        # token / refresh_token 走 token_enabled：它们是接口凭据，sub2api 即使用
+        # browser/oauth 登录方式也会先走纯 API，禁用会让手工粘贴的有效值无法保存。
+        self.token_edit.setEnabled(plan.token_enabled)
+        self.refresh_wrap.setVisible(plan.show_refresh_input)
+        self.refresh_edit.setEnabled(plan.token_enabled)
+        self.browser_profile_wrap.setVisible(plan.show_browser_profile)
         self.state_wrap.setVisible(plan.show_state_box)
         self.state_edit.setVisible(plan.state_editable)
         self.state_edit.setEnabled(plan.state_editable)
@@ -1311,12 +1387,16 @@ class App(QMainWindow):
 
     # ── 批量任务 ──
     def _collect_batch(self, label: str) -> list[tuple[str, list[int]]]:
-        """把启用站点按 base_url 分组，返回 [(task_key, [行号, ...]), ...]。
+        """把启用站点按 base_url 分组，返回 [(分组键, [行号, ...]), ...]。
 
         同一 base_url 下可能配了多个账号（同站多账号很常见）。旧实现对重复
         base_url 只保留第一个、其余静默丢弃，导致 GUI「全部签到」漏签，而 CLI
         的 site_locks 只是串行化、不会丢任务——同一份配置两条路径结果不同。
         这里改为分组保留：组间并发、组内串行，与 CLI 语义对齐。
+
+        分组用 site_group_key（站点维度，控制限流），跳过判定用 task_key
+        （渠道维度，与单站点操作共用同一把锁）：同址的三个渠道要能各自独立
+        运行，不能因为其中一个在跑就把其余的一起跳过。
         """
         if self.cur is not None:
             self._flush()
@@ -1325,13 +1405,13 @@ class App(QMainWindow):
         for idx, row in enumerate(self.rows):
             if not row.enabled:
                 continue
-            task_key = core.StatusStore.task_key(row)
-            if not task_key:
+            group_key = core.StatusStore.site_group_key(row)
+            if not group_key:
                 continue
-            if task_key in self._running:
+            if core.StatusStore.task_key(row) in self._running:
                 skipped_running += 1
                 continue
-            groups.setdefault(task_key, []).append(idx)
+            groups.setdefault(group_key, []).append(idx)
         if skipped_running:
             self._say(f"已跳过 {skipped_running} 个运行中的站点任务。")
         if not groups:
@@ -1349,8 +1429,11 @@ class App(QMainWindow):
             return
         self._batch_active += 1
         self._set_batch_buttons()
-        for task_key, _indices in groups:
-            self._running.add(task_key)
+        # 锁按渠道加：同址的多个渠道各自持锁，行状态才不会被一起点亮。
+        for _group_key, indices in groups:
+            for idx in indices:
+                if 0 <= idx < len(self.rows):
+                    self._running.add(core.StatusStore.task_key(self.rows[idx]))
         for _key, indices in groups:
             for idx in indices:
                 self._refresh_row(idx)
@@ -1373,30 +1456,29 @@ class App(QMainWindow):
             core.bg_log("INFO", summary)
             self._say(summary)
 
-        def run_group(task_key: str, indices: list[int], position: int = 0) -> None:
-            """同一 base_url 的账号依次执行，避免并发打同一站点被限流。"""
+        def run_group(group_key: str, indices: list[int], position: int = 0) -> None:
+            """同一 base_url 的渠道依次执行，避免并发打同一站点被限流。
+
+            锁是渠道级的，因此每个渠道跑完就立刻释放自己那把，不再等整组结束：
+            否则同址的其他渠道会在别人跑完前一直显示「运行中」。
+            """
             if position >= len(indices):
-                # 该组全部完成，才释放这个 base_url 的运行锁。
-                self._running.discard(task_key)
-                for idx in indices:
-                    if 0 <= idx < len(self.rows):
-                        self._refresh_row(idx)
-                        if idx == self.cur:
-                            self._update_summary(self.rows[idx])
                 if completed[0] >= total:
                     finish_batch()
                 return
 
             idx = indices[position]
             if idx >= len(self.rows):
-                run_group(task_key, indices, position + 1)
+                run_group(group_key, indices, position + 1)
                 return
             row = self.rows[idx]
             params = core.task_params(row, self.oauth_states)
 
             def on_done(result: dict[str, Any]) -> None:
+                # 在 try 之外取行：若放进 try 首行，该行抛异常时 finally 里的
+                # current 会 NameError，渠道锁就永久泄漏、该行一直卡在「运行中」。
+                current = self.rows[idx] if 0 <= idx < len(self.rows) else None
                 try:
-                    current = self.rows[idx] if 0 <= idx < len(self.rows) else None
                     if current is not None:
                         status_key = core.StatusStore.status_key(current)
                         if action == "query":
@@ -1417,12 +1499,19 @@ class App(QMainWindow):
                 finally:
                     completed[0] += 1
                     self._say(f"{label}进度：{completed[0]}/{total}")
-                    run_group(task_key, indices, position + 1)
+                    # 本渠道跑完就立刻释放它自己的锁：同址的其他渠道各持一把锁，
+                    # 不再被这一个拖着一起显示「运行中」。
+                    if current is not None:
+                        self._running.discard(core.StatusStore.task_key(current))
+                        self._refresh_row(idx)
+                        if idx == self.cur:
+                            self._update_summary(self.rows[idx])
+                    run_group(group_key, indices, position + 1)
 
             self.runner.submit(action, params, on_done)
 
-        for task_key, indices in groups:
-            run_group(task_key, indices)
+        for group_key, indices in groups:
+            run_group(group_key, indices)
 
     def _query_all(self) -> None:
         self._run_batch("query", "查询")
@@ -1516,6 +1605,10 @@ class App(QMainWindow):
             self._set_type_value(t)
         if data.get("access_token"):
             self.token_edit.setText(str(data["access_token"]))
+        # cred_json 会导出 refresh_token，这里必须对称地读回，否则「复制凭据 →
+        # 粘贴导入」会静默丢掉长期凭据，站点又退化成每次开浏览器。
+        if data.get("refresh_token"):
+            self.refresh_edit.setText(str(data["refresh_token"]))
         if data.get("user_id"):
             self.uid_edit.setText(str(data["user_id"]))
         if data.get("cookie"):
@@ -1573,6 +1666,10 @@ class App(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "保存失败", str(exc))
             return
+        # 读取时 token 缓存优先于 ACCOUNTS.json（缓存里通常是刚续期出的新 token）。
+        # 但用户刚手工粘贴的凭据必须赢：否则旧缓存会把新填的值盖掉，表现为「填了
+        # 有效 token 却仍提示没有」。这里清掉与新填值冲突的缓存条目。
+        core.reconcile_token_cache(self.rows)
         self._mark_saved()
         self._say(f"已保存：{len(self.rows)} 个账号配置")
 
@@ -1715,15 +1812,14 @@ class App(QMainWindow):
                         self.state_edit.setPlainText(result["state"])
                         if result.get("access_token"):
                             self.token_edit.setText(str(result["access_token"]))
-                        self._lock = False
-                        self._flush()
-                        # refresh_token 无对应输入框（长期凭据，不适合展示/手改），
-                        # _flush 也不会读它；在 _flush 之后写入行模型即可随「保存全部」落盘。
-                        # 有了它，sub2api 站点后续可纯 HTTP 续期，不必每次开浏览器。
+                        # 必须写进输入框再 _flush：refresh_token 现在有对应输入框，
+                        # _flush 会以框内容为准回写行模型。若像早先那样在 _flush 之后
+                        # 直接改 row，下一次任意字段编辑触发的 _flush 就会用空框把它冲掉。
                         refresh_token = str(result.get("refresh_token") or "").strip()
                         if refresh_token:
-                            self.rows[self.cur].refresh_token = refresh_token
-                            self._schedule_dirty()
+                            self.refresh_edit.setText(refresh_token)
+                        self._lock = False
+                        self._flush()
                     QMessageBox.information(
                         self, "捕获成功", result.get("message", "登录态已捕获并填入「站点登录状态」，记得点「保存全部」。")
                     )

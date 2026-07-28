@@ -36,6 +36,7 @@ from pathlib import Path
 
 import accounts_store
 import providers
+from config import Timeouts
 from mask_utils import sanitize_data
 from providers.base import CheckinResult, SiteConfig
 
@@ -119,7 +120,8 @@ def parse_args() -> argparse.Namespace:
     # script_args 可能含账号密码等凭据，优先从环境变量 CHECKIN_SCRIPT_ARGS 读取，
     # 避免出现在进程命令行（argv 对同机其它用户可见）。此选项仅供手工调试使用。
     parser.add_argument("--script-args", default="", help="browser_script 的脚本参数 JSON 字符串（含凭据时请改用 CHECKIN_SCRIPT_ARGS 环境变量）")
-    parser.add_argument("--script-timeout", type=int, default=120, help="browser_script 超时秒数，默认 120")
+    parser.add_argument("--script-timeout", type=int, default=Timeouts.BROWSER_SCRIPT_DEFAULT,
+                        help=f"browser_script 超时秒数，默认 {Timeouts.BROWSER_SCRIPT_DEFAULT}")
     parser.add_argument("--api-variant", default="auto", choices=["auto", "legacy"], help="newapi+api 接口变体偏好：auto=challenge 优先，legacy=旧接口优先")
     parser.add_argument("--token-file", default="", help="临时指定单站点凭证文件（newapi）：第一行 Cookie，第二行用户 ID，第三行 Access token")
     parser.add_argument("--cookie", default="", help="临时指定单站点 Cookie")

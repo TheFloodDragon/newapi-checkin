@@ -63,121 +63,33 @@ ALREADY_DONE_PATTERNS = ["already", "已签到", "今日已", "已领取"]
 UNSUPPORTED_CHECKIN_PATTERNS = ["404", "405", "not found", "no route", "route not found", "method not allowed", "不存在", "未找到"]
 
 
-def _persist_refreshed_token(site: SiteConfig, token: str, refresh_token: str = "") -> None:
-    """把 HTTP 刷新出的新 access_token（及轮换后的 refresh_token）写回 ACCOUNTS.json。
+def _persist_refreshed_token(
+    site: SiteConfig,
+    token: str,
+    refresh_token: str = "",
+    browser_state: str = "",
+) -> None:
+    """把刷新出的新凭据写入运行期缓存（token_cache.json）。
 
-    持久化失败（锁超时/文件损坏/IO 错误）不影响本次签到：内存 token 仍可用。
+    不写回 ACCOUNTS.json：那是用户维护的配置，短期 JWT 与浏览器登录态都属运行期
+    产物，混进去会让配置被后台任务反复改写、并加速导出的 GitHub Secret 过期
+    （见 providers/token_cache.py）。缓存写入失败不影响本次签到：内存值仍可用。
     """
-    if not token:
+    if not token and not refresh_token and not browser_state:
         return
-    site.access_token = token
+    if token:
+        site.access_token = token
     if refresh_token:
         site.refresh_token = refresh_token
+    if browser_state:
+        site.browser_state = browser_state
     try:
-        import accounts_store
+        from .. import token_cache
 
-        accounts_store.update_account_access_token(
-            site.name, site.base_url, token, refresh_token=refresh_token
-        )
-    except Exception:
-        # 仅内存生效；下次运行会重新走一次刷新。
-        pass
-    try:
-        import accounts_store
-
-        accounts_store.update_account_access_token(site.name, site.base_url, token)
+        token_cache.save_tokens(site.name, site.base_url, token, refresh_token, browser_state=browser_state)
     except Exception:
         pass
 
-
-
-def http_password_login(site: SiteConfig, email: str, password: str, log: Any = None) -> dict[str, str]:
-    """纯 HTTP 账密登录，换取 access_token + refresh_token（不启动浏览器）。
-
-    实测（2026-07）极速蹬等 Sub2API 站点在 /api/v1/settings/public 里可能声明
-    turnstile_enabled=false，此时 /api/v1/auth/login 接受纯 HTTP 账密登录；反之
-    声明为 true（或服务端仍校验）时会返回 400 TURNSTILE_VERIFICATION_FAILED，
-    此时必须回落浏览器由 browser.turnstile 完成真实点击。
-
-    另一个实测要点：这类站点会做「会话网络指纹」校验，登录与后续请求必须共享
-    同一 cookie 会话，否则报 Session network fingerprint changed。因此这里先访问
-    /settings/public 预热 cookie，并把整个流程放在同一个 CookieJar 上。
-
-    返回 {"access_token": ..., "refresh_token": ...}；失败返回 {}。
-    凭据只用于本次请求，不写日志、不入结果。
-    """
-    def _log(msg: str) -> None:
-        if log:
-            log(msg)
-
-    email = str(email or "").strip()
-    password = str(password or "")
-    if not email or not password:
-        return {}
-
-    base = normalize_base_url(site.base_url)
-    jar = http_cookiejar.CookieJar()
-    proxy = getattr(site, "proxy", "") or ""
-    verify_ssl = getattr(site, "verify_ssl", True)
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "zh-CN,zh;q=0.9",
-        "Origin": base,
-        "Referer": base + "/login",
-    }
-
-    # 1) 预热：建立 cookie 会话，同时读取站点是否启用 Turnstile。
-    turnstile_enabled = None
-    try:
-        settings = http_request(
-            base + API_PREFIX + "/settings/public",
-            method="GET",
-            headers=headers,
-            proxy=proxy,
-            verify_ssl=verify_ssl,
-            cookie_jar=jar,
-        )
-        data = unwrap_data(settings)
-        if isinstance(data, dict) and "turnstile_enabled" in data:
-            turnstile_enabled = bool(data.get("turnstile_enabled"))
-    except ApiError:
-        pass
-
-    if turnstile_enabled:
-        _log("站点声明启用 Turnstile，纯 HTTP 账密登录不可用，需回落浏览器")
-        return {}
-
-    # 2) 账密登录。
-    try:
-        payload = http_request(
-            base + API_PREFIX + "/auth/login",
-            method="POST",
-            headers={**headers, "Content-Type": "application/json"},
-            body=json.dumps({"email": email, "password": password}).encode("utf-8"),
-            proxy=proxy,
-            verify_ssl=verify_ssl,
-            cookie_jar=jar,
-            retry_non_idempotent=False,
-        )
-    except ApiError as exc:
-        text = f"{exc.status or 0} {exc.message}"
-        if "turnstile" in text.lower():
-            _log("账密登录被 Turnstile 拦截，需回落浏览器完成人机验证")
-        else:
-            _log(f"纯 HTTP 账密登录失败：HTTP {text}")
-        return {}
-
-    data = unwrap_data(payload)
-    if not isinstance(data, dict):
-        return {}
-    access = normalize_access_token(str(data.get("access_token") or ""))
-    refresh = str(data.get("refresh_token") or "").strip()
-    if not access:
-        _log("账密登录响应未包含 access_token")
-        return {}
-    _log(f"纯 HTTP 账密登录成功（access_token {len(access)} 字符）")
-    return {"access_token": access, "refresh_token": refresh}
 
 def _to_number(value: Any) -> float | int | None:
     if isinstance(value, bool) or value is None:
@@ -733,10 +645,99 @@ class Sub2ApiProfile(SiteProfile):
         """纯 HTTP 账密登录，换取新的 access_token / refresh_token。
 
         暴露为 profile 方法，供 actions 层在「已保存 token 与 refresh_token 都失效」
-        时作为启动浏览器之前的最后一次纯 HTTP 尝试（站点未启用 Turnstile 时可行）。
-        失败返回空 dict，由调用方降级到浏览器脚本。
+        时作为启动浏览器之前的最后一次纯 HTTP 尝试。失败返回空 dict，由调用方
+        降级到浏览器脚本。
+
+        实测要点：
+        - 站点若启用 Turnstile（/settings/public 的 turnstile_enabled），登录接口会
+          回 400 TURNSTILE_VERIFICATION_FAILED，纯 HTTP 拿不到令牌，直接放弃；
+        - 必须先访问一次站点并复用同一个 CookieJar，否则会被判
+          「Session network fingerprint changed」。
         """
-        return http_password_login(site, email, password, log=log)
+        def _log(message: str) -> None:
+            if log:
+                log(message)
+
+        base = normalize_base_url(site.base_url)
+        jar = http_cookiejar.CookieJar()
+        common = {
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Origin": base,
+            "Referer": base + "/",
+        }
+
+        # 1) 读公开设置：启用 Turnstile 时纯 HTTP 登录必然被拒，不必白跑一次。
+        try:
+            settings = http_request(
+                base + API_PREFIX + "/settings/public",
+                method="GET",
+                headers=common,
+                proxy=site.proxy,
+                verify_ssl=getattr(site, "verify_ssl", True),
+                cookie_jar=jar,
+            )
+        except ApiError as exc:
+            _log(f"读取站点公开设置失败：{exc.message}")
+            settings = None
+        data = unwrap_data(settings)
+        if isinstance(data, dict) and bool(data.get("turnstile_enabled")):
+            _log("站点声明启用 Turnstile，纯 HTTP 账密登录不可用，需回落浏览器")
+            return {}
+
+        # 2) 登录（沿用同一 CookieJar，满足会话指纹校验）。
+        try:
+            payload = http_request(
+                base + API_PREFIX + "/auth/login",
+                method="POST",
+                headers={**common, "Content-Type": "application/json"},
+                body=json.dumps({"email": email, "password": password}).encode("utf-8"),
+                proxy=site.proxy,
+                verify_ssl=getattr(site, "verify_ssl", True),
+                cookie_jar=jar,
+            )
+        except ApiError as exc:
+            _log(f"纯 HTTP 账密登录失败：{exc.message}")
+            return {}
+
+        body = unwrap_data(payload)
+        if not isinstance(body, dict):
+            _log("登录响应结构无法识别")
+            return {}
+        if body.get("temp_token") or body.get("two_factor_required"):
+            _log("账号启用了两步验证，纯 HTTP 登录不可用")
+            return {}
+        token = normalize_access_token(str(body.get("access_token") or ""))
+        if not token:
+            _log("登录响应未包含 access_token")
+            return {}
+        refresh = str(body.get("refresh_token") or "").strip()
+        _log(f"纯 HTTP 账密登录成功（access_token {len(token)} 字符）")
+        return {"access_token": token, "refresh_token": refresh}
+
+    def refresh_token_via_http(self, site: SiteConfig, log: Any = None) -> dict[str, str]:
+        """仅用 refresh_token 做纯 HTTP 续期，不启动浏览器。
+
+        用于 access_token 缺失/损坏（例如配置里是占位文本）但 refresh_token 仍
+        有效的情况：此时没有可用 token 去触发客户端内部的惰性刷新，需要一个不
+        依赖 access_token 的入口。返回 {"access_token": ..., "refresh_token": ...}，
+        失败返回 {}。
+        """
+        def _log(message: str) -> None:
+            if log:
+                log(message)
+
+        refresh = str(getattr(site, "refresh_token", "") or "").strip()
+        if not refresh:
+            return {}
+        client = Sub2ApiClient(site, AuthInfo())
+        token = client._refresh_via_http()
+        if not token:
+            _log("refresh_token 已失效，服务端拒绝续期")
+            return {}
+        _log(f"refresh_token 续期成功（新 access_token {len(token)} 字符）")
+        return {"access_token": token, "refresh_token": client._refresh_token or refresh}
 
     def build_lazy_refresh_client(self, site: SiteConfig) -> ProfileClient | None:
         """oauth/browser 场景下的缓存优先客户端：先用已缓存 access_token 调接口，
@@ -826,24 +827,10 @@ class Sub2ApiProfile(SiteProfile):
                 elif isinstance(refreshed, str):
                     token = refreshed
                 if token:
-                    if refreshed_state or refresh_token:
-                        try:
-                            import accounts_store
-                            if accounts_store.update_account_auth_data(
-                                site.name,
-                                site.base_url,
-                                access_token=token,
-                                browser_state=refreshed_state,
-                                refresh_token=refresh_token,
-                            ):
-                                if refreshed_state:
-                                    site.browser_state = refreshed_state
-                                if refresh_token:
-                                    # 存下 refresh_token 后，下次「token 过期」可纯 HTTP 续期，
-                                    # 不必再为这一常见情况启动 Camoufox。
-                                    site.refresh_token = refresh_token
-                        except Exception:
-                            pass
+                    # token 与 browser_state 都是运行期产物，一并写独立缓存。
+                    # browser_state 每次打开站点都会变（cookie/localStorage 刷新），
+                    # 写回 ACCOUNTS.json 会让用户配置被后台任务反复改写。
+                    _persist_refreshed_token(site, token, refresh_token, refreshed_state)
                     _log(f"已通过{label}刷新 auth_token")
                     return token
             except Exception as exc:

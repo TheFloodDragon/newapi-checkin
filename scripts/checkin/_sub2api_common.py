@@ -395,8 +395,8 @@ async def persist_state(context: Any, site: Any) -> None:
     if not site_name and not site_base:
         return
     try:
-        import accounts_store
         from browser import state as browser_state
+        from providers import token_cache
     except Exception:
         return
     try:
@@ -410,7 +410,10 @@ async def persist_state(context: Any, site: Any) -> None:
     if not encoded:
         return
     try:
-        accounts_store.update_account_auth_data(site_name, site_base, browser_state=encoded)
+        # 写运行期缓存而非 ACCOUNTS.json：浏览器每次打开站点都会刷新 cookie /
+        # localStorage，写回配置会让用户文件被后台任务反复改写（也会和 GUI 里的
+        # 手工编辑抢锁）。登录态属运行期产物，缓存已 gitignore。
+        token_cache.save_browser_state(site_name, site_base, encoded)
     except Exception:
         return
 
@@ -698,9 +701,17 @@ def _api_checkin_js(checkin_path: str) -> str:
         const businessOk = !raw || typeof raw !== 'object'
             ? response.ok
             : raw.success !== false && !(/^[1-9]\\d*$/.test(code));
+        // 站点签到响应通常带 reward_amount / balance（实测极速蹬回
+        // {"reward_amount":0.5,"balance_added":0.5,"streak_count":2}）。
+        // 回传它们，让脚本结果能直接携带额度，无需再多打一次查询接口。
+        const pickNum = (v) => (typeof v === 'number' && isFinite(v)) ? v : null;
+        const reward = pickNum(payload && (payload.reward_amount ?? payload.balance_added ?? payload.today_reward));
+        const balance = pickNum(payload && (payload.balance ?? payload.remaining ?? payload.current_balance));
         return {
             ok: Boolean(response.ok && businessOk && !already),
             status: response.status,
+            reward,
+            balance,
             already,
             code: code.slice(0, 80),
             message: message.replace(/[\\r\\n]/g, ' ').slice(0, 160),
@@ -922,10 +933,14 @@ async def api_fallback(
         "completion_signal": "api_fallback",
         "response_status": status,
     }
+    # 签到接口通常回传 balance / reward_amount，透出去让 GUI 与汇总直接显示额度，
+    # 免得「签到成功」却看不到到账多少（此前这些数字被丢弃）。
+    quota = (result or {}).get("balance")
+    awarded = (result or {}).get("reward")
     if bool((result or {}).get("already")):
-        return helpers.already_done("今日已签到", detail)
+        return helpers.already_done("今日已签到", detail, quota=quota)
     if bool((result or {}).get("ok")):
-        return helpers.success(spec.success_message, detail)
+        return helpers.success(spec.success_message, detail, quota=quota, awarded=awarded)
 
     if (status in {401, 403} or status == 0) and not login_attempted:
         login_result = await do_login()
@@ -938,10 +953,12 @@ async def api_fallback(
             "completion_signal": "api_fallback_after_login",
             "response_status": status,
         }
+        retry_quota = (retry or {}).get("balance")
+        retry_awarded = (retry or {}).get("reward")
         if bool((retry or {}).get("already")):
-            return helpers.already_done("今日已签到", detail)
+            return helpers.already_done("今日已签到", detail, quota=retry_quota)
         if bool((retry or {}).get("ok")):
-            return helpers.success(spec.success_message, detail)
+            return helpers.success(spec.success_message, detail, quota=retry_quota, awarded=retry_awarded)
 
     if status in {401, 403}:
         return helpers.need_login(f"{spec.site_label}签到登录态已失效，请重新捕获 browser_state", detail)

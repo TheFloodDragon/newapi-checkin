@@ -133,7 +133,7 @@ def build_site_tasks() -> list[CheckinTask]:
             script = str(site.get("script") or "").strip()
             if script:
                 command.extend(["--script", script])
-            command.extend(["--script-timeout", str(accounts_store.parse_script_timeout(site.get("script_timeout"), 120))])
+            command.extend(["--script-timeout", str(accounts_store.parse_script_timeout(site.get("script_timeout")))])
         cookie_file = str(site.get("cookie_file") or site.get("token_file") or "").strip()
         cookie = str(site.get("cookie") or "").strip()
         access_token = str(site.get("access_token") or site.get("authorization") or "").strip()

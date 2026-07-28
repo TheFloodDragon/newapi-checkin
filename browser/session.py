@@ -1752,9 +1752,16 @@ async def capture_sub2api_token(
             storage_state = await _safe_storage_state(context, log)
             # 一并交出 refresh_token：它有效期远长于 access_token，存进配置后
             # 纯 HTTP 路径即可自行续期，无需为「JWT 过期」拉起浏览器。
+            #
+            # 不能只看导出的活 storage_state：access_token 过期时前端会在收到 401 后
+            # 清空 localStorage 跳登录页（实测每 2 秒左右清一次，与 add_init_script
+            # 的重注入来回竞争）。恰好在清空后导出就会丢掉一个仍然有效的
+            # refresh_token。传入的登录态是解码后的静态快照，不受该竞争影响，
+            # 因此活存储读不到时回落到它。
+            refresh = storage_refresh_token(storage_state) or storage_refresh_token(storage_state_dict)
             return {
                 "access_token": token_value,
-                "refresh_token": storage_refresh_token(storage_state),
+                "refresh_token": refresh,
                 "state": state.encode_state(storage_state),
             }
 
@@ -1814,10 +1821,16 @@ async def capture_sub2api_token(
                 return {"ok": False, "status": 0, "path": "", "body": str(exc)}
 
         async def _refresh_via_refresh_token() -> str:
+            # 从登录态快照兜底：token 过期时前端会清空 localStorage 再跳登录页，
+            # 只读活存储会随机拿到空值并误报「refresh_token not found」。
+            fallback_refresh = storage_refresh_token(storage_state_dict)
             try:
                 result = await page.evaluate(
-                    """async ([baseUrl, timeoutMs]) => {
-                        const refreshToken = localStorage.getItem('refresh_token') || sessionStorage.getItem('refresh_token') || '';
+                    """async ([baseUrl, timeoutMs, fallbackRefresh]) => {
+                        const refreshToken = localStorage.getItem('refresh_token')
+                            || sessionStorage.getItem('refresh_token')
+                            || fallbackRefresh
+                            || '';
                         if (!refreshToken || refreshToken.length <= 20) return { ok: false, status: 0, message: 'refresh_token not found' };
                         const controller = new AbortController();
                         const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -1847,7 +1860,7 @@ async def capture_sub2api_token(
                             clearTimeout(timer);
                         }
                     }""",
-                    [base_url.rstrip("/"), 15000],
+                    [base_url.rstrip("/"), 15000, fallback_refresh],
                 )
                 if isinstance(result, dict) and result.get("ok") and result.get("access_token"):
                     token_value = str(result.get("access_token") or "")

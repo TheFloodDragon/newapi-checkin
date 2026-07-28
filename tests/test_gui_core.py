@@ -294,3 +294,144 @@ def test_log_sink_receives_lines() -> None:
     finally:
         core.remove_log_sink(lines.append)
     assert lines and "hello" in lines[0] and "site=x" in lines[0]
+
+
+# ── 接口凭据可编辑性 / token 健康度 ──────────────────────────────────────────
+def test_sub2api_token_inputs_editable_under_browser_auth() -> None:
+    """sub2api 即使用 browser 登录态，签到仍先走纯 API，故 token 框必须可编辑。
+
+    回归：此前 token 框跟随 creds_enabled（只在 access_token/cookie 时启用），
+    导致 auth_method=browser 的 sub2api 站点无法手填 token，表现为「填了仍显示没有」。
+    """
+    row = core.SiteRow(
+        name="s", base_url="https://s.invalid", type="sub2api",
+        auth_method="browser", checkin_action="browser_script", script="x.js",
+    )
+    plan = core.build_form_plan(row, {})
+    assert plan.creds_enabled is False          # cookie/uid 仍按登录方式灰掉
+    assert plan.token_enabled is True           # 但接口凭据必须可填
+    assert plan.show_refresh_input is True
+
+
+def test_newapi_cookie_auth_keeps_token_enabled() -> None:
+    row = core.SiteRow(name="n", base_url="https://n.invalid", type="newapi", auth_method="cookie")
+    plan = core.build_form_plan(row, {})
+    assert plan.token_enabled is True
+    assert plan.show_refresh_input is False     # refresh_token 只对 sub2api 有意义
+
+
+def test_newapi_browser_auth_disables_token() -> None:
+    row = core.SiteRow(name="n", base_url="https://n.invalid", type="newapi", auth_method="browser")
+    plan = core.build_form_plan(row, {})
+    assert plan.token_enabled is False
+
+
+def test_token_defect_flags_non_ascii_ellipsis() -> None:
+    """从截断显示里复制的 token 带 U+2026，运行时被静默判为空，必须提示。"""
+    msg = core.token_defect("eyJhbGciOi\u2026Q1NH0.xCpdND.sig")
+    assert "U+2026" in msg
+
+
+def test_token_defect_flags_placeholder_and_shape() -> None:
+    assert "占位" in core.token_defect("<在站点后台采集的 access_token>")
+    assert "JWT" in core.token_defect("abcdef")
+
+
+def test_token_defect_accepts_valid_jwt_with_prefix() -> None:
+    assert core.token_defect("Bearer aaa.bbb.ccc") == ""
+    assert core.token_defect("aaa.bbb.ccc") == ""
+    assert core.token_defect("") == ""
+    assert core.token_defect("   ") == ""
+
+
+def test_refresh_status_surfaces_defect_before_refresh_hint() -> None:
+    row = core.SiteRow(
+        name="s", base_url="https://s.invalid", type="sub2api",
+        access_token="aa\u2026bb.cc.dd", refresh_token="rt_x",
+    )
+    plan = core.build_form_plan(row, {})
+    assert plan.refresh_status.startswith("\u26a0")
+    assert "已保存 refresh_token" in plan.refresh_status
+
+
+def test_cred_json_roundtrip_includes_refresh_token() -> None:
+    """复制凭据 → 剪贴板导入必须往返一致，漏掉 refresh_token 会丢长期凭据。"""
+    row = core.SiteRow(
+        name="s", base_url="https://s.invalid", type="sub2api",
+        access_token="aa.bb.cc", refresh_token="rt_keep",
+    )
+    data, err = core.parse_clipboard_site(core.cred_json(row))
+    assert err == ""
+    assert data["access_token"] == "aa.bb.cc"
+    assert data["refresh_token"] == "rt_keep"
+
+
+# ── 配置字段往返（GUI 保存不得丢字段）────────────────────────────────────────
+def test_cli_consumed_fields_survive_roundtrip() -> None:
+    """checkin.py / run__all_checkin.py 会消费的字段必须能从 GUI 往返落盘。
+
+    这些字段此前只存在于 ACCOUNTS.json 与 CLI，GUI 既不展示也不写回，用户手写的
+    值被「保存全部」静默抹掉（实测 5 个字段全部丢失）。
+    """
+    raw = {
+        "name": "s",
+        "base_url": "https://s.invalid",
+        "site_profile": "sub2api",
+        "auth_method": "browser",
+        "checkin_action": "browser_script",
+        "script": "scripts/checkin/x.py",
+        "cookie_file": "secrets/t.txt",
+        "referer_path": "/console",
+        "auto_refresh_cookie": False,
+        "browser_profile": ".p_t",
+        "login_selector": "a.login",
+    }
+    row = core.row_from_store(raw)
+    assert row.cookie_file == "secrets/t.txt"
+    assert row.referer_path == "/console"
+    assert row.auto_refresh_cookie is False
+    assert row.browser_profile == ".p_t"
+    assert row.login_selector == "a.login"
+
+    saved = core.persist_accounts([row])[0]
+    assert saved["cookie_file"] == "secrets/t.txt"
+    assert saved["referer_path"] == "/console"
+    assert saved["auto_refresh_cookie"] is False
+    assert saved["browser_profile"] == ".p_t"
+    assert saved["login_selector"] == "a.login"
+
+
+def test_default_values_do_not_add_noise_keys() -> None:
+    """等于默认值时不落盘，避免给每个账号塞进一堆冗余键。"""
+    row = core.row_from_store({
+        "name": "s",
+        "base_url": "https://s.invalid",
+        "site_profile": "newapi",
+        "auth_method": "cookie",
+    })
+    saved = core.persist_accounts([row])[0]
+    for key in ("cookie_file", "referer_path", "auto_refresh_cookie",
+                "browser_profile", "login_selector"):
+        assert key not in saved, f"默认值不应写入 {key}"
+
+
+def test_task_params_passes_cli_fields() -> None:
+    """GUI 内单站点执行必须与批量/CI 传同样的参数。"""
+    row = core.row_from_store({
+        "name": "s",
+        "base_url": "https://s.invalid",
+        "site_profile": "newapi",
+        "auth_method": "cookie",
+        "referer_path": "/console",
+        "cookie_file": "secrets/t.txt",
+        "auto_refresh_cookie": False,
+    })
+    params = core.task_params(row, {})
+    assert params["referer_path"] == "/console"
+    assert params["cookie_file"] == "secrets/t.txt"
+    assert params["auto_refresh_cookie"] is False
+    # 未配置时给出与 SiteConfig 一致的默认值，而不是空串
+    plain = core.task_params(core.row_from_store(
+        {"name": "p", "base_url": "https://p.invalid"}), {})
+    assert plain["referer_path"] == core.REFERER_PATH_DEFAULT
+    assert plain["browser_profile"] == core.BROWSER_PROFILE_DEFAULT

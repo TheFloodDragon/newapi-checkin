@@ -103,6 +103,7 @@ _LOCK_STATE = _LockState()
 # 锁参数集中在 config.FileLockConfig（支持 CHECKIN_LOCK_TIMEOUT 覆盖）；
 # 这里只做引用，避免「改了 config 却不生效」的硬编码绕过。
 from config import FileLockConfig as _FileLockConfig  # noqa: E402
+from config import Timeouts  # noqa: E402
 
 # Windows msvcrt.locking 需要指定锁定字节数；我们只用文件存在性做互斥，锁 1 字节即可。
 _MSVCRT_LOCK_BYTES = _FileLockConfig.LOCK_SIZE
@@ -439,9 +440,14 @@ def normalize_script_args(value: Any) -> dict[str, Any]:
     return {}
 
 
-def parse_script_timeout(value: Any, default: int = 120) -> int:
-    """解析 browser_script 超时秒数，限制在 [1, BROWSER_SCRIPT_MAX] 区间内。"""
-    from config import Timeouts
+def parse_script_timeout(value: Any, default: int | None = None) -> int:
+    """解析 browser_script 超时秒数，限制在 [1, BROWSER_SCRIPT_MAX] 区间内。
+
+    default=None 时取 config.Timeouts.BROWSER_SCRIPT_DEFAULT，避免默认值散落成
+    十几处硬编码字面量（改一处就得全仓库跟着改）。
+    """
+    if default is None:
+        default = Timeouts.BROWSER_SCRIPT_DEFAULT
     try:
         timeout = int(value)
     except (TypeError, ValueError):
@@ -559,6 +565,26 @@ def site_config_from_mapping(
         raw.update(overrides)
     row = _normalize_account_entry(raw)
     base_url = normalize_base_url(str(row.get("base_url") or row.get("url") or ""))
+
+    # 运行期 token 缓存优先：签到过程中刷新出的 access_token / refresh_token 写在
+    # results/token_cache.json（不入 ACCOUNTS.json，避免后台任务反复改写用户配置、
+    # 也避免导出的 GitHub Secret 里塞进很快失效的短期值）。缓存里有更新的值就用它。
+    name_for_cache = str(row.get("name") or base_url)
+    try:
+        from providers import token_cache as _token_cache
+
+        cached = _token_cache.load_tokens(name_for_cache, base_url)
+    except Exception:
+        cached = {}
+    if cached.get("access_token"):
+        row["access_token"] = cached["access_token"]
+    if cached.get("refresh_token"):
+        row["refresh_token"] = cached["refresh_token"]
+    # browser_state 同理：签到过程中浏览器会刷新 cookie/localStorage，新登录态存进
+    # 缓存而不是 ACCOUNTS.json。缓存里有就用它，否则回落到配置里用户捕获的初始值。
+    if cached.get("browser_state"):
+        row["browser_state"] = cached["browser_state"]
+
     return SiteConfig(
         name=str(row.get("name") or base_url),
         base_url=base_url,
@@ -567,7 +593,7 @@ def site_config_from_mapping(
         checkin_action=str(row.get("checkin_action") or "api"),
         script=str(row.get("script") or ""),
         script_args=normalize_script_args(row.get("script_args")),
-        script_timeout=parse_script_timeout(row.get("script_timeout"), 120),
+        script_timeout=parse_script_timeout(row.get("script_timeout")),
         api_variant=str(row.get("api_variant") or "auto"),
         cookie=str(row.get("cookie") or ""),
         user_id=str(row.get("user_id") or row.get("new_api_user") or ""),
@@ -882,8 +908,8 @@ def _account_to_persist(row: dict[str, Any]) -> dict[str, Any]:
             continue
         if field == "script_timeout":
             if row.get("checkin_action") == "browser_script":
-                timeout = parse_script_timeout(row.get("script_timeout"), 120)
-                if timeout != 120:
+                timeout = parse_script_timeout(row.get("script_timeout"))
+                if timeout != Timeouts.BROWSER_SCRIPT_DEFAULT:
                     out["script_timeout"] = timeout
             continue
         if field == "oauth_provider":
@@ -1072,7 +1098,7 @@ def build_github_secret_payload(
             script_args = normalize_script_args(row.get("script_args"))
             if script_args:
                 out["script_args"] = script_args
-            out["script_timeout"] = parse_script_timeout(row.get("script_timeout"), 120)
+            out["script_timeout"] = parse_script_timeout(row.get("script_timeout"))
 
         user_id = str(row.get("user_id") or row.get("new_api_user") or "").strip()
         if user_id:

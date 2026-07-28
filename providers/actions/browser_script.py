@@ -68,6 +68,37 @@ def _api_log(site: SiteConfig, message: str) -> None:
     print(f"[api_first:{site.name}] {mask_secrets(str(message))}", file=sys.stderr, flush=True)
 
 
+def _persist_tokens(
+    site: SiteConfig,
+    access_token: str,
+    refresh_token: str = "",
+    log: Any = None,
+) -> bool:
+    """把新拿到的 token 写入运行期缓存，并同步到内存 site。
+
+    刻意不写 ACCOUNTS.json：token 是短期运行产物（access_token 数小时即过期），
+    混进配置会让用户的配置文件被后台任务反复改写，也会让导出的 GitHub Secret
+    里带上很快失效的值。缓存文件见 providers/token_cache.py（已 gitignore）。
+    """
+    from .. import token_cache
+
+    token = normalize_access_token(access_token or "")
+    rotated = str(refresh_token or "").strip()
+    if not token and not rotated:
+        return False
+    saved = token_cache.save_tokens(site.name, site.base_url, token, rotated)
+    if token:
+        site.access_token = token
+    if rotated:
+        site.refresh_token = rotated
+    if log is not None and saved:
+        try:
+            log("新 token 已写入运行期缓存（未改动 ACCOUNTS.json）")
+        except Exception:
+            pass
+    return saved
+
+
 def _try_api_checkin(site: SiteConfig, profile: SiteProfile) -> CheckinResult | None:
     """浏览器脚本之前的首选方案：纯 HTTP 调站点签到接口（不启动浏览器）。
 
@@ -135,6 +166,37 @@ def _try_api_checkin(site: SiteConfig, profile: SiteProfile) -> CheckinResult | 
         _api_log(site, f"[{stage}] 签到成功")
         return CheckinResult(site.name, base_url, "success", "签到成功。", detail=detail)
 
+    def _renew_via_refresh(reason: str) -> str:
+        """用 refresh_token 做纯 HTTP 续期，返回新 access_token（失败返回空串）。
+
+        两处都要用：token 完全缺失时（占位/被清空），以及 token 已过期时。
+        之前只在「完全缺失」时调用，导致「token 过期但 refresh_token 有效」这一
+        最常见情形被跳过——第 1 级用的是裸 token 客户端（无 refresher），过期即
+        失败，明明有效的 refresh_token 从未被使用，直接退化成开浏览器。
+        """
+        refresh_http = getattr(profile, "refresh_token_via_http", None)
+        if not callable(refresh_http):
+            return ""
+        if not str(getattr(site, "refresh_token", "") or "").strip():
+            return ""
+        _api_log(site, f"{reason}，尝试用 refresh_token 纯 HTTP 续期")
+        try:
+            pair = refresh_http(site, log=lambda m: _api_log(site, m)) or {}
+        except Exception as exc:
+            _api_log(site, f"refresh_token 续期异常：{exc}")
+            return ""
+        renewed = normalize_access_token(str(pair.get("access_token") or ""))
+        if not renewed:
+            _api_log(site, "refresh_token 续期未成功")
+            return ""
+        _persist_tokens(site, renewed, str(pair.get("refresh_token") or "").strip(),
+                        log=lambda m: _api_log(site, m))
+        return renewed
+
+    # ── 第 0 级：完全没有可用 access_token 时，先用 refresh_token 换一个 ──
+    if not token:
+        token = _renew_via_refresh("无可用 access_token")
+
     # ── 第 1 级：已配置的 access_token（含 refresh_token 纯 HTTP 续期）──
     if token:
         _api_log(site, "尝试纯 API 签到（使用已保存的 access_token）")
@@ -162,6 +224,28 @@ def _try_api_checkin(site: SiteConfig, profile: SiteProfile) -> CheckinResult | 
     else:
         _api_log(site, "未配置 access_token，跳过 token 阶段")
 
+    # ── 第 1.5 级：token 过期但 refresh_token 可能仍有效 → 纯 HTTP 续期后重试 ──
+    # 这是实测中最常见的情形（access_token 只有几小时有效期），必须在动用账密
+    # 之前先试，否则等于浪费一个长期有效的凭据。
+    if token:
+        renewed = _renew_via_refresh("token 已失效")
+        if renewed and renewed != token:
+            token = renewed
+            try:
+                result = _attempt(build_client(site, AuthInfo(access_token=token)), "refresh")
+                if result is not None:
+                    return result
+            except ApiError as exc:
+                kind = profile.classify(exc) if hasattr(profile, "classify") else "error"
+                if kind == "already_done":
+                    return CheckinResult(
+                        site.name, base_url, "already_done", "今日已签到。",
+                        detail={"checkin_source": "api", "api_first": True, "api_stage": "refresh"},
+                    )
+                _api_log(site, f"refresh 阶段未能完成（{kind}）：{exc.message}")
+            except Exception as exc:
+                _api_log(site, f"refresh 阶段异常：{exc}")
+
     # ── 第 2 级：纯 HTTP 账密登录换新 token（站点未启 Turnstile 时可行）──
     login = getattr(profile, "http_password_login", None)
     email, password = _script_credentials(site)
@@ -175,20 +259,8 @@ def _try_api_checkin(site: SiteConfig, profile: SiteProfile) -> CheckinResult | 
         new_token = normalize_access_token(str((fresh or {}).get("access_token") or ""))
         if new_token:
             new_refresh = str((fresh or {}).get("refresh_token") or "").strip()
-            # 立即写回，让下次运行可直接用新 token / refresh_token。
-            try:
-                if accounts_store.update_account_access_token(
-                    site.name, site.base_url, new_token, refresh_token=new_refresh
-                ):
-                    _api_log(site, "新 token 已写回 ACCOUNTS.json")
-                site.access_token = new_token
-                if new_refresh:
-                    site.refresh_token = new_refresh
-            except Exception as exc:
-                _api_log(site, f"写回新 token 失败（不影响本次）：{exc}")
-                site.access_token = new_token
-                if new_refresh:
-                    site.refresh_token = new_refresh
+            # 写入运行期缓存（不动 ACCOUNTS.json），让下次运行可直接复用。
+            _persist_tokens(site, new_token, new_refresh, log=lambda m: _api_log(site, m))
             try:
                 result = _attempt(build_client(site, AuthInfo(access_token=new_token)), "password")
                 if result is not None:

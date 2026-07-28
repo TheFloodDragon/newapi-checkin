@@ -15,12 +15,16 @@ def _row(name: str, base_url: str, **kwargs) -> core.SiteRow:
 
 
 def _group(rows: list[core.SiteRow]) -> list[tuple[str, list[int]]]:
-    """复刻 App._collect_batch 的分组语义（同 base_url 归一组、保留全部账号）。"""
+    """复刻 App._collect_batch 的分组语义。
+
+    分组用 site_group_key（同 base_url 归一组，组内串行以避免站点限流），
+    互斥锁用 task_key（渠道级）。两者刻意分离，见 StatusStore 的注释。
+    """
     groups: dict[str, list[int]] = {}
     for idx, row in enumerate(rows):
         if not row.enabled:
             continue
-        key = core.StatusStore.task_key(row)
+        key = core.StatusStore.site_group_key(row)
         if not key:
             continue
         groups.setdefault(key, []).append(idx)
@@ -64,13 +68,31 @@ def test_rows_without_base_url_are_skipped() -> None:
     assert len(groups) == 2
 
 
-def test_task_key_groups_by_base_url_not_name() -> None:
-    """同站不同账号名必须落到同一互斥键，否则会并发打同一站点。"""
+def test_task_key_is_per_channel_not_per_site() -> None:
+    """互斥锁必须按渠道区分：同址多账号要能各自独立签到。
+
+    旧实现 task_key 只用 base_url，同址三个渠道共享一把锁：单独签到其中一个，
+    另外两个被判「该站点已有任务运行中」而跳过，行状态也被一起点亮/清除。
+    """
     a = _row("账号A", "https://same.invalid")
     b = _row("账号B", "https://same.invalid")
-    assert core.StatusStore.task_key(a) == core.StatusStore.task_key(b)
-    # 而状态键必须区分账号，否则两个账号的结果会互相覆盖
+    assert core.StatusStore.task_key(a) != core.StatusStore.task_key(b)
+    # 状态键同样按渠道区分，否则两个账号的结果会互相覆盖
     assert core.StatusStore.status_key(a) != core.StatusStore.status_key(b)
+    # 但批量分组仍按站点归一组，保住「组内串行、不并发打同一站点」的限流语义
+    assert core.StatusStore.site_group_key(a) == core.StatusStore.site_group_key(b)
+
+
+def test_locking_one_channel_leaves_siblings_runnable() -> None:
+    """锁住一个渠道后，同址的其他渠道仍必须可执行（回归本次修复的核心症状）。"""
+    rows = [
+        _row("渠道1", "https://multi.invalid"),
+        _row("渠道2", "https://multi.invalid"),
+        _row("渠道3", "https://multi.invalid"),
+    ]
+    running = {core.StatusStore.task_key(rows[0])}
+    runnable = [r.name for r in rows if core.StatusStore.task_key(r) not in running]
+    assert runnable == ["渠道2", "渠道3"]
 
 
 # ── refresh_token 状态提示 ───────────────────────────────────────────────────

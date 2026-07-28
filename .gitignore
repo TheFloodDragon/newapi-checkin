@@ -3,6 +3,9 @@ ACCOUNTS.json
 ACCOUNTS.json.bak
 ACCOUNTS.json.lock
 
+# 临时诊断脚本（会读取账号密码做登录实验，不入库）
+.tmpdiag/
+
 # 运行产物
 results/
 login_grant_state.json

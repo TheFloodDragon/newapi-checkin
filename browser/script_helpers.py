@@ -138,26 +138,124 @@ class ScriptHelpers:
             return ""
         return str(path)
 
-    def success(self, message: str, detail: dict[str, Any] | None = None) -> dict[str, Any]:
-        return self._result("success", message, detail)
+    def success(
+        self,
+        message: str,
+        detail: dict[str, Any] | None = None,
+        *,
+        quota: Any = None,
+        awarded: Any = None,
+        quota_is_usd: bool = True,
+    ) -> dict[str, Any]:
+        return self._result("success", message, detail, quota=quota, awarded=awarded, quota_is_usd=quota_is_usd)
 
-    def already_done(self, message: str, detail: dict[str, Any] | None = None) -> dict[str, Any]:
-        return self._result("already_done", message, detail)
+    def already_done(
+        self,
+        message: str,
+        detail: dict[str, Any] | None = None,
+        *,
+        quota: Any = None,
+        awarded: Any = None,
+        quota_is_usd: bool = True,
+    ) -> dict[str, Any]:
+        return self._result("already_done", message, detail, quota=quota, awarded=awarded, quota_is_usd=quota_is_usd)
 
-    def need_login(self, message: str, detail: dict[str, Any] | None = None) -> dict[str, Any]:
-        return self._result("need_login", message, detail)
+    def need_login(
+        self,
+        message: str,
+        detail: dict[str, Any] | None = None,
+        *,
+        quota: Any = None,
+        quota_is_usd: bool = True,
+    ) -> dict[str, Any]:
+        return self._result("need_login", message, detail, quota=quota, quota_is_usd=quota_is_usd)
 
-    def need_verification(self, message: str, detail: dict[str, Any] | None = None) -> dict[str, Any]:
-        return self._result("need_verification", message, detail)
+    def need_verification(
+        self,
+        message: str,
+        detail: dict[str, Any] | None = None,
+        *,
+        quota: Any = None,
+        quota_is_usd: bool = True,
+    ) -> dict[str, Any]:
+        return self._result("need_verification", message, detail, quota=quota, quota_is_usd=quota_is_usd)
 
-    def need_config(self, message: str, detail: dict[str, Any] | None = None) -> dict[str, Any]:
-        return self._result("need_config", message, detail)
+    def need_config(
+        self,
+        message: str,
+        detail: dict[str, Any] | None = None,
+        *,
+        quota: Any = None,
+        quota_is_usd: bool = True,
+    ) -> dict[str, Any]:
+        return self._result("need_config", message, detail, quota=quota, quota_is_usd=quota_is_usd)
 
-    def error(self, message: str, detail: dict[str, Any] | None = None) -> dict[str, Any]:
-        return self._result("error", message, detail)
+    def error(
+        self,
+        message: str,
+        detail: dict[str, Any] | None = None,
+        *,
+        quota: Any = None,
+        quota_is_usd: bool = True,
+    ) -> dict[str, Any]:
+        return self._result("error", message, detail, quota=quota, quota_is_usd=quota_is_usd)
 
-    def _result(self, status: str, message: str, detail: dict[str, Any] | None = None) -> dict[str, Any]:
+    @staticmethod
+    def parse_quota(text: Any) -> float | None:
+        """从页面文本里抽取金额，例如 "余额 $26.55" / "￥12,3.40" → 26.55 / 123.4。
+
+        脚本常见做法是读一段带货币符号和千分位的文案，手写正则容易出错，
+        这里统一处理：取第一个数字（允许千分位逗号与小数点），无法识别返回 None。
+        """
+        if isinstance(text, bool):
+            return None
+        if isinstance(text, (int, float)):
+            return float(text)
+        raw = str(text or "")
+        match = re.search(r"-?\d[\d,]*(?:\.\d+)?", raw)
+        if not match:
+            return None
+        try:
+            return float(match.group(0).replace(",", ""))
+        except ValueError:
+            return None
+
+    def _result(
+        self,
+        status: str,
+        message: str,
+        detail: dict[str, Any] | None = None,
+        *,
+        quota: Any = None,
+        awarded: Any = None,
+        quota_is_usd: bool = True,
+    ) -> dict[str, Any]:
+        """组装脚本结果；quota/awarded 会写成聚合层认识的标准键。
+
+        额度提取的唯一实现在 providers.base（detail_current_quota /
+        detail_quota_awarded），它按固定键名递归查找。脚本此前只能自己往 detail
+        里塞字典、键名写错就静默丢额度，所以这里提供显式参数并负责映射：
+        - quota   → detail["current_quota"]
+        - awarded → detail["quota_awarded"]
+        - quota_is_usd → detail["quota_is_usd"]，避免美元值被再除 500000。
+        """
         out: dict[str, Any] = {"status": status, "message": message}
-        if detail is not None:
+        merged: dict[str, Any] = dict(detail) if isinstance(detail, dict) else {}
+
+        current = self.parse_quota(quota) if quota is not None else None
+        gained = self.parse_quota(awarded) if awarded is not None else None
+        if current is not None:
+            merged["current_quota"] = current
+        if gained is not None:
+            merged["quota_awarded"] = gained
+        if current is not None or gained is not None:
+            # 脚本读到的通常已是站点展示的美元金额，标记后聚合层不会二次换算。
+            merged["quota_is_usd"] = bool(quota_is_usd)
+
+        if detail is not None and not isinstance(detail, dict):
+            merged["script_detail"] = detail
+        if merged:
+            out["detail"] = merged
+        elif detail is not None:
             out["detail"] = detail
         return out

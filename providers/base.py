@@ -174,7 +174,7 @@ class SiteConfig:
     # ── 自定义浏览器脚本 ──
     script: str = ""
     script_args: dict[str, Any] = field(default_factory=dict)
-    script_timeout: int = 120
+    script_timeout: int = _Timeouts.BROWSER_SCRIPT_DEFAULT
     # ── 凭据 ──
     cookie: str = ""
     user_id: str = ""
@@ -420,11 +420,25 @@ def normalize_cookie(value: str) -> str:
 
 
 def normalize_access_token(value: str) -> str:
-    value = value.strip()
+    """规范化 access_token；非 ASCII 内容视为无效并返回空串。
+
+    HTTP 头只能承载 latin-1 字符。配置里若残留占位文本（如「<在站点后台采集的
+    access_token>」或带省略号的截断值），直接塞进 Authorization 头会在请求发出
+    *之前* 抛 UnicodeEncodeError；该异常不是 ApiError，会绕过 need_login 判定，
+    导致「明明有可用的 refresh_token 却从不续期」。这里提前判为无 token，让调用
+    方走 refresh_token / 账密登录等正常降级路径。
+    """
+    value = (value or "").strip()
     if value.lower().startswith("authorization:"):
         value = value.split(":", 1)[1].strip()
     if value.lower().startswith("bearer "):
         value = value[7:].strip()
+    if not value:
+        return ""
+    try:
+        value.encode("ascii")
+    except UnicodeEncodeError:
+        return ""
     return value
 
 

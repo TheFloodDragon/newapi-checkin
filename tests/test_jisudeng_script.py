@@ -264,26 +264,41 @@ class FakeHelpers:
         return f"results/{name}"
 
     @staticmethod
-    def _result(status: str, message: str, detail: dict[str, Any]) -> dict[str, Any]:
-        return {"status": status, "message": message, "detail": detail}
+    def _result(
+        status: str,
+        message: str,
+        detail: dict[str, Any] | None = None,
+        quota: Any = None,
+        awarded: Any = None,
+    ) -> dict[str, Any]:
+        # 与真实 ScriptHelpers._result 保持同样的额度注入语义：只在传了额度时
+        # 才写标准键，并标记 quota_is_usd 避免聚合层二次换算。
+        out_detail = dict(detail) if detail else {}
+        if quota is not None:
+            out_detail["current_quota"] = quota
+        if awarded is not None:
+            out_detail["quota_awarded"] = awarded
+        if quota is not None or awarded is not None:
+            out_detail["quota_is_usd"] = True
+        return {"status": status, "message": message, "detail": out_detail or detail}
 
-    def success(self, message: str, detail: dict[str, Any]) -> dict[str, Any]:
-        return self._result("success", message, detail)
+    def success(self, message, detail=None, quota=None, awarded=None):
+        return self._result("success", message, detail, quota, awarded)
 
-    def already_done(self, message: str, detail: dict[str, Any]) -> dict[str, Any]:
-        return self._result("already_done", message, detail)
+    def already_done(self, message, detail=None, quota=None, awarded=None):
+        return self._result("already_done", message, detail, quota, awarded)
 
-    def need_login(self, message: str, detail: dict[str, Any]) -> dict[str, Any]:
-        return self._result("need_login", message, detail)
+    def need_login(self, message, detail=None, quota=None, awarded=None):
+        return self._result("need_login", message, detail, quota, awarded)
 
-    def need_verification(self, message: str, detail: dict[str, Any]) -> dict[str, Any]:
-        return self._result("need_verification", message, detail)
+    def need_verification(self, message, detail=None, quota=None, awarded=None):
+        return self._result("need_verification", message, detail, quota, awarded)
 
-    def need_config(self, message: str, detail: dict[str, Any]) -> dict[str, Any]:
-        return self._result("need_config", message, detail)
+    def need_config(self, message, detail=None, quota=None, awarded=None):
+        return self._result("need_config", message, detail, quota, awarded)
 
-    def error(self, message: str, detail: dict[str, Any]) -> dict[str, Any]:
-        return self._result("error", message, detail)
+    def error(self, message, detail=None, quota=None, awarded=None):
+        return self._result("error", message, detail, quota, awarded)
 
 
 def _run(page: FakePage, script_args: dict[str, Any] | None = None) -> tuple[dict[str, Any], FakeHelpers]:
