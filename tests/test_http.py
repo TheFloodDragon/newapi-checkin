@@ -10,7 +10,7 @@ from providers import base
 def test_http_retry_only_for_idempotent_methods(monkeypatch) -> None:
     calls: list[str] = []
 
-    def fake_once(url, *, method, headers, body, timeout, proxy, verify_ssl=True):
+    def fake_once(url, *, method, headers, body, timeout, proxy, verify_ssl=True, **_kwargs):
         calls.append(method)
         if len(calls) == 1:
             raise base.ApiError(503, None, "temporary", transient=True)

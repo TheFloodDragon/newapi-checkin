@@ -515,6 +515,13 @@ class App(QMainWindow):
         self.oauth_state_status.setWordWrap(True)
         self.state_wrap.layout().addWidget(self.oauth_state_status)
 
+        # refresh_token 状态（仅 sub2api）：它决定 Token 过期时能否纯 HTTP 续期，
+        # 不展示的话用户无从判断某站点是否还需要每次开浏览器。只显示有无，不显示值。
+        self.refresh_token_hint = QLabel("")
+        self.refresh_token_hint.setObjectName("hintText")
+        self.refresh_token_hint.setWordWrap(True)
+        cred_layout.addWidget(self.refresh_token_hint)
+
         self.oauth_fallback_wrap = self._field(cred_layout, "可选 OAuth")
         fallback_row = QHBoxLayout()
         fallback_row.setContentsMargins(0, 0, 0, 0)
@@ -1065,6 +1072,8 @@ class App(QMainWindow):
         self.state_edit.setVisible(plan.state_editable)
         self.state_edit.setEnabled(plan.state_editable)
         self.oauth_state_status.setVisible(plan.show_oauth_status)
+        self.refresh_token_hint.setVisible(plan.show_refresh_status)
+        self.refresh_token_hint.setText(plan.refresh_status)
         self.browser_ops.setVisible(plan.show_browser_ops)
         self.btn_oauth_delete.setVisible(plan.show_delete_oauth)
         self.btn_capture.setText(plan.capture_text)
@@ -1301,13 +1310,18 @@ class App(QMainWindow):
         self.runner.submit("checkin", params, on_done)
 
     # ── 批量任务 ──
-    def _collect_batch(self, label: str) -> list[tuple[int, str]]:
-        """挑选可执行的启用站点：跳过运行中的、同 base_url 只保留第一个。"""
+    def _collect_batch(self, label: str) -> list[tuple[str, list[int]]]:
+        """把启用站点按 base_url 分组，返回 [(task_key, [行号, ...]), ...]。
+
+        同一 base_url 下可能配了多个账号（同站多账号很常见）。旧实现对重复
+        base_url 只保留第一个、其余静默丢弃，导致 GUI「全部签到」漏签，而 CLI
+        的 site_locks 只是串行化、不会丢任务——同一份配置两条路径结果不同。
+        这里改为分组保留：组间并发、组内串行，与 CLI 语义对齐。
+        """
         if self.cur is not None:
             self._flush()
-        picked: list[tuple[int, str]] = []
-        seen: set[str] = set()
-        skipped_running = skipped_dup = 0
+        groups: dict[str, list[int]] = {}
+        skipped_running = 0
         for idx, row in enumerate(self.rows):
             if not row.enabled:
                 continue
@@ -1317,16 +1331,12 @@ class App(QMainWindow):
             if task_key in self._running:
                 skipped_running += 1
                 continue
-            if task_key in seen:
-                skipped_dup += 1
-                continue
-            seen.add(task_key)
-            picked.append((idx, task_key))
-        if skipped_running or skipped_dup:
-            self._say(f"已跳过 {skipped_running} 个运行中的站点任务、{skipped_dup} 个同站点重复任务。")
-        if not picked:
+            groups.setdefault(task_key, []).append(idx)
+        if skipped_running:
+            self._say(f"已跳过 {skipped_running} 个运行中的站点任务。")
+        if not groups:
             QMessageBox.information(self, "提示", f"没有可{label}的启用站点（可能都在运行中）。")
-        return picked
+        return list(groups.items())
 
     def _set_batch_buttons(self) -> None:
         idle = self._batch_active == 0
@@ -1334,63 +1344,85 @@ class App(QMainWindow):
         self.btn_checkin_all.setEnabled(idle)
 
     def _run_batch(self, action: str, label: str) -> None:
-        picked = self._collect_batch(label)
-        if not picked:
+        groups = self._collect_batch(label)
+        if not groups:
             return
         self._batch_active += 1
         self._set_batch_buttons()
-        for _idx, task_key in picked:
+        for task_key, _indices in groups:
             self._running.add(task_key)
-        for idx, _key in picked:
-            self._refresh_row(idx)
+        for _key, indices in groups:
+            for idx in indices:
+                self._refresh_row(idx)
         self._update_summary()
-        core.bg_log("INFO", f"批量{label}开始", count=len(picked))
-        self._say(f"批量{label}：共 {len(picked)} 个站点…")
 
-        total = len(picked)
+        total = sum(len(indices) for _key, indices in groups)
+        core.bg_log("INFO", f"批量{label}开始", sites=total, groups=len(groups))
+        self._say(f"批量{label}：共 {total} 个站点…")
+
         completed = [0]
         failures = [0]
 
-        def make_callback(done_idx: int, done_key: str):
+        def finish_batch() -> None:
+            self._batch_active = max(0, self._batch_active - 1)
+            self._set_batch_buttons()
+            self._update_overview()
+            summary = f"批量{label}完成：{total - failures[0]}/{total} 成功"
+            if failures[0]:
+                summary += f"，{failures[0]} 个失败或需处理（详见日志）"
+            core.bg_log("INFO", summary)
+            self._say(summary)
+
+        def run_group(task_key: str, indices: list[int], position: int = 0) -> None:
+            """同一 base_url 的账号依次执行，避免并发打同一站点被限流。"""
+            if position >= len(indices):
+                # 该组全部完成，才释放这个 base_url 的运行锁。
+                self._running.discard(task_key)
+                for idx in indices:
+                    if 0 <= idx < len(self.rows):
+                        self._refresh_row(idx)
+                        if idx == self.cur:
+                            self._update_summary(self.rows[idx])
+                if completed[0] >= total:
+                    finish_batch()
+                return
+
+            idx = indices[position]
+            if idx >= len(self.rows):
+                run_group(task_key, indices, position + 1)
+                return
+            row = self.rows[idx]
+            params = core.task_params(row, self.oauth_states)
+
             def on_done(result: dict[str, Any]) -> None:
                 try:
-                    row = self.rows[done_idx] if 0 <= done_idx < len(self.rows) else None
-                    if row is not None:
-                        status_key = core.StatusStore.status_key(row)
+                    current = self.rows[idx] if 0 <= idx < len(self.rows) else None
+                    if current is not None:
+                        status_key = core.StatusStore.status_key(current)
                         if action == "query":
                             self.store.apply_query(status_key, result)
                         else:
                             self.store.apply_checkin(status_key, result)
+                        self._refresh_row(idx)
                     ok = bool(result.get("ok"))
                     if not ok:
                         failures[0] += 1
-                    name = (row.name if row else "") or "未命名站点"
                     core.bg_log(
                         "INFO" if ok else "WARN",
                         f"批量{label}结果",
-                        site=name,
+                        site=(current.name if current else "") or "未命名站点",
                         status=result.get("status"),
                         result_message=result.get("message"),
                     )
                 finally:
                     completed[0] += 1
-                    self._unlock(done_key, done_idx)
                     self._say(f"{label}进度：{completed[0]}/{total}")
-                    if completed[0] >= total:
-                        self._batch_active = max(0, self._batch_active - 1)
-                        self._set_batch_buttons()
-                        self._update_overview()
-                        summary = f"批量{label}完成：{total - failures[0]}/{total} 成功"
-                        if failures[0]:
-                            summary += f"，{failures[0]} 个失败或需处理（详见日志）"
-                        core.bg_log("INFO", summary)
-                        self._say(summary)
+                    run_group(task_key, indices, position + 1)
 
-            return on_done
+            self.runner.submit(action, params, on_done)
 
-        for idx, task_key in picked:
-            params = core.task_params(self.rows[idx], self.oauth_states)
-            self.runner.submit(action, params, make_callback(idx, task_key))
+        for task_key, indices in groups:
+            run_group(task_key, indices)
 
     def _query_all(self) -> None:
         self._run_batch("query", "查询")
@@ -1685,6 +1717,13 @@ class App(QMainWindow):
                             self.token_edit.setText(str(result["access_token"]))
                         self._lock = False
                         self._flush()
+                        # refresh_token 无对应输入框（长期凭据，不适合展示/手改），
+                        # _flush 也不会读它；在 _flush 之后写入行模型即可随「保存全部」落盘。
+                        # 有了它，sub2api 站点后续可纯 HTTP 续期，不必每次开浏览器。
+                        refresh_token = str(result.get("refresh_token") or "").strip()
+                        if refresh_token:
+                            self.rows[self.cur].refresh_token = refresh_token
+                            self._schedule_dirty()
                     QMessageBox.information(
                         self, "捕获成功", result.get("message", "登录态已捕获并填入「站点登录状态」，记得点「保存全部」。")
                     )

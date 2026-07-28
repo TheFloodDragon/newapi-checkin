@@ -66,6 +66,49 @@ def _build_detail(client: ProfileClient, reward: CheckinReward) -> dict[str, Any
     return detail
 
 
+def _read_quota(client: ProfileClient) -> float | None:
+    """读取当前余额（美元）；失败返回 None。用于签到前后的交叉验证。"""
+    try:
+        user = client.fetch_user()
+    except Exception:
+        return None
+    return client.quota_to_usd(user.quota_raw)
+
+
+def _quota_increased(
+    client: ProfileClient,
+    quota_before: float | None,
+    detail: dict[str, Any],
+) -> float | None:
+    """签到后余额是否真的增长；返回增量（美元），无法确认返回 None。
+
+    签到接口没给奖励字段时，余额增长是「确实发放了」的最可靠证据。
+    """
+    if quota_before is None:
+        return None
+    current = detail.get("current_quota")
+    quota_after = (
+        client.quota_to_usd(current)
+        if current is not None and not detail.get("quota_is_usd")
+        else current
+    )
+    if not isinstance(quota_after, (int, float)) or isinstance(quota_after, bool):
+        quota_after = _read_quota(client)
+    if not isinstance(quota_after, (int, float)) or isinstance(quota_after, bool):
+        return None
+    delta = float(quota_after) - float(quota_before)
+    # 浮点余额比较留一点容差，避免把计费抖动当成签到到账。
+    return delta if delta > 1e-9 else None
+
+
+def _checked_in_after(client: ProfileClient) -> bool:
+    """重新读状态接口，确认站点是否已把今日标记为已签到。"""
+    try:
+        return bool(client.fetch_status().checked_in_today)
+    except Exception:
+        return False
+
+
 def _inject_current_quota(client: ProfileClient, detail: dict[str, Any]) -> None:
     """补全 current_quota（签到返回里没有时，读 user/self）。"""
     if detail.get("current_quota") is not None:
@@ -122,6 +165,10 @@ def _checkin_once(site: SiteConfig, client: ProfileClient, turnstile: str) -> Ch
         )
 
     # 4) 执行签到
+    # 先记下签到前余额：部分 fork 的签到接口不返回奖励字段，只能靠前后余额差
+    # 判断是否真的到账（避免把「HTTP 200 但未发放」误报成成功）。状态接口已给出
+    # 余额时直接复用，省一次请求。
+    quota_before = status.quota_usd if status.quota_usd is not None else _read_quota(client)
     try:
         reward = client.do_checkin(turnstile)
     except ApiError as exc:
@@ -153,6 +200,28 @@ def _checkin_once(site: SiteConfig, client: ProfileClient, turnstile: str) -> Ch
     if reward.quota_awarded is not None:
         awarded = format_usd(reward.quota_awarded, is_usd=client.quota_is_usd)
         return CheckinResult(site.name, base_url, "success", f"签到成功，获得额度：{awarded}", detail=detail)
+
+    # 响应里没有任何签到成立的正面证据（无奖励额度、无连续天数、无已签标记）。
+    # 这类响应过去被无条件报成「签到成功」，但实测存在 HTTP 200 却未真正发放的情况
+    # （站点静默拒绝/端点非签到接口），导致「显示成功但额度没到账」。
+    # 此时用签到前后的余额差与状态接口做交叉验证，拿不到证据就不谎报成功。
+    if reward.checkin_unconfirmed:
+        confirmed_quota = _quota_increased(client, quota_before, detail)
+        if confirmed_quota is not None:
+            awarded = format_usd(confirmed_quota, is_usd=client.quota_is_usd)
+            detail["quota_awarded"] = confirmed_quota
+            return CheckinResult(site.name, base_url, "success", f"签到成功，获得额度：{awarded}", detail=detail)
+        if _checked_in_after(client):
+            return CheckinResult(site.name, base_url, "success", "签到成功（站点已标记今日已签到）。", detail=detail)
+        detail["checkin_unconfirmed"] = True
+        return CheckinResult(
+            site.name,
+            base_url,
+            "error",
+            "签到接口返回成功但未发放额度，站点也未标记今日已签到；"
+            "该站点可能需要在网页手动签到，或签到接口已变更。",
+            detail=detail,
+        )
     return CheckinResult(site.name, base_url, "success", "签到成功。", detail=detail)
 
 

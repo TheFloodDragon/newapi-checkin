@@ -25,13 +25,13 @@ import accounts_store
 
 from ..auth import has_http_credentials, load_auth
 from ..base import (
-    QUOTA_UNIT,
     ApiError,
     CheckinResult,
     QueryStatus,
     SiteConfig,
     SiteProfile,
     normalize_base_url,
+    quota_usd_value,
 )
 
 
@@ -192,6 +192,8 @@ def query_action(site: SiteConfig, profile: SiteProfile) -> QueryStatus:
             status = "need_login"
         return QueryStatus(ok=False, message=msg, status=status)
 
-    quota = outcome.get("quota")
-    quota_usd = float(quota) / QUOTA_UNIT if isinstance(quota, (int, float)) else None
+    # 额度换算走 providers.base 的唯一实现（quota_usd_value），不要在这里手写
+    # /QUOTA_UNIT：手写版本对 bool 与 sub2api（额度本身已是美元）都会算错，
+    # 也正是 docs/OPTIMIZATION.md P0-3 收敛掉的漂移模式。
+    quota_usd = quota_usd_value(outcome.get("quota"), is_usd=profile.quota_is_usd)
     return QueryStatus(ok=True, quota_usd=quota_usd, checked_in=None, message="查询成功", status="success")

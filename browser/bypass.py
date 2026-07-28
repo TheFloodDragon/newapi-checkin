@@ -186,19 +186,85 @@ async def launch_camoufox(
 
 
 # ──────────────────────── Cloudflare 挑战求解 ───────────────────────────
-async def solve_cloudflare(page, log=None, wait_seconds: int = 10) -> bool:
-    """在当前页面用 playwright-captcha 的 ClickSolver 自动破解 Cloudflare Interstitial。
 
-    检测页面是否为 CF 挑战页（"Just a moment" / "Checking your browser"），
-    是则调用 ClickSolver 自动点击验证。用参考项目验证过的正确调用方式。
+# CF 挑战页特征。旧实现只认 "Just a moment" / "Checking your browser" 两条，
+# 漏判新版 managed challenge（"Verifying you are human"）、JS/cookie 提示页、
+# 以及内嵌 challenge-platform / cf-chl widget 的页面。漏判的后果比求解失败更糟：
+# solve_cloudflare 会直接 return True，调用方误以为已通过，实际仍停在挑战页。
+CF_TITLE_PATTERNS = (
+    "just a moment",
+    "attention required",
+    "access denied",
+    "please wait",
+)
+CF_CONTENT_PATTERNS = (
+    "checking your browser",
+    "verifying you are human",
+    "verify you are human",
+    "needs to review the security of your connection",
+    "enable javascript and cookies to continue",
+    "challenges.cloudflare.com",
+    "challenge-platform",
+    "cf-challenge",
+    "cf-chl",
+    "cf_chl_opt",
+    "_cf_chl",
+)
+
+# 交互式 Turnstile widget 特征：这类挑战不会自动签发令牌，必须用真实鼠标点击
+# 复选框（Cloudflare 校验事件的 isTrusted），ClickSolver 的 interstitial 策略无效。
+CF_INTERACTIVE_PATTERNS = (
+    "cf-turnstile-response",
+    "challenges.cloudflare.com/turnstile",
+    "turnstile-container",
+    "turnstile-wrapper",
+)
+
+
+async def _page_signals(page) -> tuple[str, str]:
+    """取当前页面的 title 与 HTML（失败返回空串）。"""
+    try:
+        title = (await page.title()) or ""
+    except Exception:
+        title = ""
+    try:
+        content = (await page.content()) or ""
+    except Exception:
+        content = ""
+    return title.lower(), content.lower()
+
+
+def _is_cf_challenge(title_low: str, content_low: str) -> bool:
+    """页面是否为 Cloudflare 挑战/拦截页。"""
+    if any(pattern in title_low for pattern in CF_TITLE_PATTERNS):
+        return True
+    return any(pattern in content_low for pattern in CF_CONTENT_PATTERNS)
+
+
+def _has_interactive_widget(content_low: str) -> bool:
+    """页面是否内嵌需要人工点击的 Turnstile widget。"""
+    return any(pattern in content_low for pattern in CF_INTERACTIVE_PATTERNS)
+
+
+async def solve_cloudflare(page, log=None, wait_seconds: int = 10) -> bool:
+    """破解当前页面的 Cloudflare 挑战（interstitial + 交互式 Turnstile）。
+
+    两级策略：
+    1. ClickSolver（playwright-captcha）处理经典 interstitial "Just a moment" 页；
+    2. 若页面内嵌交互式 Turnstile widget，或 ClickSolver 之后挑战仍未消失，
+       改用 browser.turnstile 的真实鼠标点击（Cloudflare 校验 isTrusted，
+       JS click 与被动等待都拿不到令牌）。
+
+    最后回读页面确认挑战确实消失才返回 True——ClickSolver 不抛异常并不等于
+    挑战已通过，旧实现据此报成功，导致调用方在仍被拦截的页面上继续操作。
 
     Args:
         page: Camoufox/Playwright Page 对象。
         log: 可选日志回调。
-        wait_seconds: 验证通过后的额外等待（秒）。
+        wait_seconds: 求解后的额外等待（秒）。
 
     Returns:
-        True 表示无 CF 挑战或已破解，False 表示破解失败。
+        True 表示无 CF 挑战或已确认通过，False 表示仍被拦截。
     """
     _check_camoufox()
 
@@ -206,30 +272,63 @@ async def solve_cloudflare(page, log=None, wait_seconds: int = 10) -> bool:
         if log:
             log(msg)
 
-    try:
-        title = (await page.title()) or ""
-        content = (await page.content()) or ""
-    except Exception:
-        title, content = "", ""
+    title_low, content_low = await _page_signals(page)
+    interactive = _has_interactive_widget(content_low)
 
-    if "Just a moment" not in title and "Checking your browser" not in content:
+    if not _is_cf_challenge(title_low, content_low) and not interactive:
         return True  # 无 CF 挑战
 
-    _log("检测到 Cloudflare 挑战，ClickSolver 自动破解中...")
-    try:
-        async with ClickSolver(
-            framework=FrameworkType.CAMOUFOX, page=page, max_attempts=5, attempt_delay=3
-        ) as solver:
-            await solver.solve_captcha(
-                captcha_container=page,
-                captcha_type=CaptchaType.CLOUDFLARE_INTERSTITIAL,
-            )
-        await page.wait_for_timeout(wait_seconds * 1000)
-        _log("Cloudflare 挑战已破解")
+    from . import turnstile as _turnstile
+
+    # 交互式 widget：直接走真实鼠标点击，不浪费时间在 interstitial 策略上。
+    if interactive:
+        _log("检测到交互式 Cloudflare Turnstile，真实鼠标点击复选框...")
+        token = await _turnstile.solve(page, timeout_ms=max(wait_seconds, 30) * 1000)
+        if token:
+            _log("Turnstile 令牌已签发")
+            # 令牌签发 ≠ 页面已放行：登录页的 widget 只是把令牌填进表单，仍需站点
+            # 提交后才通行；而 interstitial 页拿到令牌后会自行跳转。因此必须回读页面，
+            # 只有确认不再是挑战页才算通过，否则继续走下面的 interstitial 兜底。
+            title_low, content_low = await _page_signals(page)
+            if not _is_cf_challenge(title_low, content_low):
+                return True
+            _log("令牌已签发但页面仍为挑战页，继续尝试 interstitial 策略")
+        else:
+            _log("Turnstile 未在等待时间内签发令牌")
+        # 未通行也继续往下：部分页面同时挂着 interstitial，仍可能被 ClickSolver 解开。
+
+    if _is_cf_challenge(title_low, content_low):
+        _log("检测到 Cloudflare 挑战，ClickSolver 自动破解中...")
+        try:
+            async with ClickSolver(
+                framework=FrameworkType.CAMOUFOX, page=page, max_attempts=5, attempt_delay=3
+            ) as solver:
+                await solver.solve_captcha(
+                    captcha_container=page,
+                    captcha_type=CaptchaType.CLOUDFLARE_INTERSTITIAL,
+                )
+            await page.wait_for_timeout(wait_seconds * 1000)
+        except Exception as exc:
+            _log(f"ClickSolver 破解失败：{exc}")
+
+    # 回读确认：ClickSolver 不报错 ≠ 挑战已通过。
+    title_low, content_low = await _page_signals(page)
+    if not _is_cf_challenge(title_low, content_low):
+        _log("Cloudflare 挑战已通过")
         return True
-    except Exception as exc:
-        _log(f"Cloudflare 自动破解失败：{exc}")
-        return False
+
+    # interstitial 仍在：最后再尝试一次真实点击（部分 managed challenge 会在
+    # interstitial 内嵌复选框，等待期结束后才渲染出来）。
+    if _has_interactive_widget(content_low):
+        _log("挑战仍在，尝试真实鼠标点击 Turnstile 复选框...")
+        if await _turnstile.solve(page, timeout_ms=max(wait_seconds, 20) * 1000):
+            title_low, content_low = await _page_signals(page)
+            if not _is_cf_challenge(title_low, content_low):
+                _log("Cloudflare 挑战已通过（真实点击）")
+                return True
+
+    _log("Cloudflare 挑战未能通过（页面仍为挑战页）")
+    return False
 
 
 async def get_cf_clearance(

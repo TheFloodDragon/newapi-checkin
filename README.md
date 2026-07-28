@@ -287,7 +287,15 @@ uv run python manage_accounts.py
 
 ## 浏览器一键采集凭据（collector.js）
 
-在已登录的站点页面打开 F12 → Console，粘贴 `collector.js` 内容回车。脚本自动识别站点类型（newapi / sub2api），输出可粘贴到 `ACCOUNTS.json` 的账号配置块。Sub2API 会从 localStorage 读取 `auth_token` 并探测 `/v1/usage`；返回 `INVALID_API_KEY` 属正常（表示需要专用 API Key，而非前端 token）。
+在已登录的站点页面打开 F12 → Console，粘贴 `collector.js` 内容回车。脚本自动识别站点类型，直接输出**新三维字段**（`site_profile` / `auth_method` / `checkin_action`）的账号配置块，可原样粘进 `ACCOUNTS.json` 的 `accounts` 数组，无需再经旧字段迁移。
+
+采集内容与推断规则：
+
+- **Sub2API**：从 localStorage 读 `auth_token` 作为 `access_token`，并一并采集 **`refresh_token`**（长效凭证，让纯 HTTP 路径能自行续期，避免每次 JWT 过期都拉起浏览器）；余额优先探测 `/api/v1/user/profile` → `/api/v1/auth/me` → `/api/v1/usage`。顺带探测签到端点（`/api/v1/check-in`、`/api/v1/play/checkin`），命中哪个就在输出里注明。
+- **New API**：读 `/api/user/self` 取 `user_id` 与 `access_token`；若检测到该账号**无本地密码且仅第三方 OAuth 登录**（`linux_do_id` / `github_id` 等），会自动推断为 `auth_method=oauth` + `checkin_action=relogin` 并补上 `oauth_provider`，同时提示这类站点「登录即发额度」。
+- `/v1/usage` 返回 `INVALID_API_KEY` 属正常现象：它要求专用 `sk-*` API Key，而非前端登录态 token。
+
+> 采集结果含明文凭据，只粘贴到本地 `ACCOUNTS.json`（已被 `.gitignore`），不要提交或转发。
 
 ## CLI：捕获与测试浏览器登录态
 
@@ -306,7 +314,7 @@ uv run python browser/poc_oauth.py run --base-url https://agentrouter.org --oaut
 
 `.github/workflows/auto_checkin.yml` 每日定时运行：
 
-1. 用 `astral-sh/setup-uv` 固定 uv 版本 + `actions/setup-python` **Python 3.12**；
+1. 用 `astral-sh/setup-uv` 固定 uv 版本 + `actions/setup-python` **Python 3.14**；
 2. `uv sync --locked --extra dev` 按 `uv.lock` 严格安装；
 3. **质量门**：`ruff check .` + `pytest` + `compileall`，任一失败即让 job 失败；
 4. 把 Secret `ACCOUNTS` **原子写入** `ACCOUNTS.json` 并设 `0600` 权限；

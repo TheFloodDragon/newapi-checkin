@@ -85,6 +85,7 @@ def test_site_task_keeps_secrets_out_of_argv(monkeypatch) -> None:
                 "auth_method": "access_token",
                 "checkin_action": "api",
                 "access_token": "top-secret-token",
+                "refresh_token": "top-secret-refresh",
                 "cookie": "session=top-secret-cookie",
                 "user_id": "42",
                 "proxy": "http://user:password@proxy.invalid:8080",
@@ -96,12 +97,105 @@ def test_site_task_keeps_secrets_out_of_argv(monkeypatch) -> None:
     task = tasks[0]
     argv = " ".join(task.command)
     assert "top-secret-token" not in argv
+    assert "top-secret-refresh" not in argv
     assert "top-secret-cookie" not in argv
     assert "password@proxy" not in argv
     assert task.env == {
         "CHECKIN_COOKIE": "session=top-secret-cookie",
         "CHECKIN_ACCESS_TOKEN": "top-secret-token",
+        "CHECKIN_REFRESH_TOKEN": "top-secret-refresh",
         "CHECKIN_USER_ID": "42",
         "CHECKIN_PROXY": "http://user:password@proxy.invalid:8080",
     }
     assert task.worker_protocol
+
+
+def test_script_args_credentials_never_reach_argv(monkeypatch) -> None:
+    """browser_script 的 script_args 可能含站点账号密码，必须走环境变量。
+
+    argv 对同机其它用户可见（ps / 任务管理器），把密码放进 --script-args 会泄露。
+    """
+    monkeypatch.setattr(
+        runner.accounts_store,
+        "load_unified_accounts",
+        lambda **_kwargs: [
+            {
+                "name": "script-site",
+                "base_url": "https://script.invalid",
+                "site_profile": "sub2api",
+                "auth_method": "browser",
+                "checkin_action": "browser_script",
+                "script": "scripts/checkin/jisudeng.py",
+                "script_args": {
+                    "email": "user@example.test",
+                    "password": "top-secret-password",
+                    "start_url": "/check-in",
+                },
+            }
+        ],
+    )
+    tasks = runner.build_site_tasks()
+    assert len(tasks) == 1
+    task = tasks[0]
+    argv = " ".join(task.command)
+    assert "top-secret-password" not in argv
+    assert "user@example.test" not in argv
+    assert "--script-args" not in argv
+    # 脚本路径本身不是凭据，仍可留在 argv 便于诊断。
+    assert "scripts/checkin/jisudeng.py" in argv
+
+    payload = json.loads((task.env or {})["CHECKIN_SCRIPT_ARGS"])
+    assert payload["password"] == "top-secret-password"
+    assert payload["email"] == "user@example.test"
+    assert payload["start_url"] == "/check-in"
+
+
+def test_site_task_forwards_transport_settings(monkeypatch) -> None:
+    """verify_ssl / referer_path / auto_refresh_cookie 必须透传给 worker。
+
+    这三项此前只在直接读配置文件的路径生效，worker 模式会静默回落默认值，
+    导致同一份 ACCOUNTS.json 在 GUI 与 CI 下行为不一致。
+    """
+    monkeypatch.setattr(
+        runner.accounts_store,
+        "load_unified_accounts",
+        lambda **_kwargs: [
+            {
+                "name": "tls-site",
+                "base_url": "https://expired-cert.invalid",
+                "site_profile": "newapi",
+                "auth_method": "access_token",
+                "checkin_action": "api",
+                "access_token": "tok",
+                "verify_ssl": False,
+                "referer_path": "/console/token",
+                "auto_refresh_cookie": False,
+            }
+        ],
+    )
+    argv = " ".join(runner.build_site_tasks()[0].command)
+    assert "--no-verify-ssl" in argv
+    assert "--referer-path /console/token" in argv
+    assert "--no-auto-refresh-cookie" in argv
+
+
+def test_site_task_omits_transport_flags_at_defaults(monkeypatch) -> None:
+    """默认值不应产生冗余参数（保持 argv 简洁、便于诊断）。"""
+    monkeypatch.setattr(
+        runner.accounts_store,
+        "load_unified_accounts",
+        lambda **_kwargs: [
+            {
+                "name": "plain-site",
+                "base_url": "https://plain.invalid",
+                "site_profile": "newapi",
+                "auth_method": "access_token",
+                "checkin_action": "api",
+                "access_token": "tok",
+            }
+        ],
+    )
+    argv = " ".join(runner.build_site_tasks()[0].command)
+    assert "--no-verify-ssl" not in argv
+    assert "--no-auto-refresh-cookie" not in argv
+    assert "--referer-path" not in argv

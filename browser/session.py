@@ -91,30 +91,6 @@ def _browser_mode_label(headless: bool) -> str:
     return f"{'headless' if headless else 'headful'} / {'CI' if ci else 'local'}"
 
 
-def _site_cookie_string(cookies: list[dict[str, Any]], base_url: str) -> str:
-    """从 Playwright cookies 里提取站点域的 cookie，拼成 "k=v; k2=v2"。
-
-    只保留与站点 host 同域（含父域）的 cookie，过滤掉 linux.do/github 等第三方域，
-    避免把无关的第三方登录态 cookie 发给站点接口。重复键保留最后一个。
-    """
-    host = urlparse(_origin_from_url(base_url)).netloc.lower()
-    if not host:
-        return ""
-    pairs: dict[str, str] = {}
-    for cookie in cookies or []:
-        name = str(cookie.get("name") or "")
-        value = cookie.get("value")
-        if not name or value is None:
-            continue
-        domain = str(cookie.get("domain") or "").lstrip(".").lower()
-        if not domain:
-            continue
-        # 站点 host 等于 cookie 域，或是其子域（cookie 域为站点父域）
-        if host == domain or host.endswith("." + domain) or domain.endswith("." + host):
-            pairs[name] = str(value)
-    return "; ".join(f"{k}={v}" for k, v in pairs.items())
-
-
 # 驱动/浏览器已关闭的错误特征（模块级常量，避免每次调用重建元组）
 _DRIVER_CLOSED_MARKERS = (
     "connection closed",
@@ -1692,6 +1668,9 @@ async def capture_sub2api_login(
             "state": encoded_state,
             "username": username,
             "access_token": token,
+            # refresh_token 存进配置后，纯 HTTP 路径可自行续期短期 JWT，
+            # 无需为「access_token 过期」这一常见情况再启动浏览器。
+            "refresh_token": storage_refresh_token(storage_state_dict),
             "auth_verified": ok,
         }
     except Exception as exc:
@@ -1771,7 +1750,13 @@ async def capture_sub2api_token(
             if not return_state:
                 return token_value
             storage_state = await _safe_storage_state(context, log)
-            return {"access_token": token_value, "state": state.encode_state(storage_state)}
+            # 一并交出 refresh_token：它有效期远长于 access_token，存进配置后
+            # 纯 HTTP 路径即可自行续期，无需为「JWT 过期」拉起浏览器。
+            return {
+                "access_token": token_value,
+                "refresh_token": storage_refresh_token(storage_state),
+                "state": state.encode_state(storage_state),
+            }
 
         async def _clear_cached_token() -> None:
             try:
@@ -2081,26 +2066,51 @@ async def verify_state(
         await _safe_close_browser(browser)
 
 
+def storage_refresh_token(storage_state: dict[str, Any] | None) -> str:
+    """从 storage_state 的 localStorage 里取出 refresh_token。
+
+    Sub2API 系站点把 access_token（短期 JWT）与 refresh_token（长期）都放在
+    localStorage。把 refresh_token 提出来存进 ACCOUNTS.json，纯 HTTP 路径就能
+    自行调 /api/v1/auth/refresh 续期，不必为「JWT 过期」这种常见情况开浏览器。
+    找不到返回空串。
+    """
+    if not isinstance(storage_state, dict):
+        return ""
+    for origin_entry in storage_state.get("origins") or []:
+        if not isinstance(origin_entry, dict):
+            continue
+        for item in origin_entry.get("localStorage") or []:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("name") or "").strip() == "refresh_token":
+                value = str(item.get("value") or "").strip()
+                if value:
+                    return value
+    return ""
+
+
 def _site_cookie_string(cookies: list[dict[str, Any]], base_url: str) -> str:
     """从 context.cookies() 里挑出属于站点域的 cookie，拼成 "k=v; k2=v2"。
 
     仿 millylee：把浏览器过 WAF 后拿到的 acw_tc 等 WAF cookie 与站点 session
-    cookie 一起导出，交给 HTTP 层复用。只保留站点域（含父域）cookie，避免把
-    第三方 OAuth（linux.do/github）cookie 混入站点请求。
+    cookie 一起导出，交给 HTTP 层复用。只保留 cookie 作用域真正覆盖站点 host 的
+    条目（cookie 域等于 host 或为其父域），避免把第三方 OAuth（linux.do/github）
+    或兄弟子域的 cookie 混入站点请求。域边界判定复用 oauth_providers 的唯一实现。
     """
-    host = urlparse(base_url if base_url.startswith(("http://", "https://")) else "https://" + base_url).hostname or ""
-    host = host.lower()
+    host = urlparse(_origin_from_url(base_url)).hostname or ""
+    if not host:
+        return ""
     pairs: dict[str, str] = {}
-    for c in cookies or []:
-        name = str(c.get("name") or "")
+    for cookie in cookies or []:
+        name = str(cookie.get("name") or "")
         if not name:
             continue
-        dom = str(c.get("domain") or "").lstrip(".").lower()
-        if not dom:
+        domain = str(cookie.get("domain") or "")
+        if not domain:
             continue
-        # 站点域或其父域下的 cookie 才带上（host == dom 或 host 是 dom 的子域）
-        if host == dom or host.endswith("." + dom):
-            pairs[name] = str(c.get("value") or "")
+        # host 位于 cookie 域边界内即代表该 cookie 会被发送给站点。
+        if oauth_providers.hostname_matches_domain(host, domain):
+            pairs[name] = str(cookie.get("value") or "")
     return "; ".join(f"{k}={v}" for k, v in pairs.items())
 
 

@@ -62,6 +62,28 @@ def _env_headless() -> bool:
     return bool(os.getenv("GITHUB_ACTIONS") or os.getenv("CI"))
 
 
+def _make_log(site_name: str):
+    """构造 browser_script 的进度日志回调。
+
+    其它浏览器路径（relogin / newapi / sub2api）都会往 stderr 打进度，唯独
+    browser_script 此前完全静默：脚本可能跑几十秒（等 SPA 渲染、过 Turnstile、
+    账密登录），用户与 CI 日志里看不到任何过程，失败时只有一行最终结论，无从
+    定位卡在哪一步。这里统一加上带站点名的前缀，并经 mask_secrets 脱敏。
+    """
+    label = str(site_name or "browser_script").strip() or "browser_script"
+
+    def _log(message: str) -> None:
+        try:
+            from mask_utils import mask_secrets
+
+            text = mask_secrets(str(message))
+        except Exception:
+            text = str(message)
+        print(f"[browser_script:{label}] {text}", file=sys.stderr, flush=True)
+
+    return _log
+
+
 def _origin_from_url(url: str) -> str:
     parsed = urlparse(str(url or ""))
     if not parsed.scheme or not parsed.netloc:
@@ -138,7 +160,7 @@ def _site_view(site: Any, script_path: str, script_args: dict[str, Any] | None, 
         proxy=str(getattr(site, "proxy", "") or ""),
         script=script_path,
         script_args=dict(script_args or {}),
-        script_timeout=int(timeout or 120),
+        script_timeout=int(timeout or 240),
     )
 
 
@@ -174,7 +196,7 @@ async def run_browser_script(
     browser_state_text: str,
     script_path: str,
     script_args: dict[str, Any] | None = None,
-    timeout: int = 120,
+    timeout: int = 240,
     oauth_provider: str = "",
 ) -> BrowserScriptResult:
     """启动 Camoufox、恢复登录态、按需完成 OAuth，然后执行用户脚本。"""
@@ -182,12 +204,18 @@ async def run_browser_script(
         script_file = resolve_script_path(script_path)
     except BrowserScriptError as exc:
         return BrowserScriptResult("need_config", str(exc), {"checkin_source": "browser_script"})
-    timeout = max(1, int(timeout or 120))
+    timeout = max(1, int(timeout or 240))
 
-    try:
-        storage_state = state.decode_state(browser_state_text)
-    except state.BrowserStateError as exc:
-        return BrowserScriptResult("need_login", f"登录态解码失败：{exc}", {"checkin_source": "browser_script"})
+    # 空登录态是合法输入：站点没有 browser_state、但脚本自带账密登录兜底时，
+    # action 层会显式传空串，让脚本在干净浏览器里自行登录（见 providers/actions/
+    # browser_script.py 的 _script_can_self_login）。此时跳过解码，不能报 need_login。
+    if str(browser_state_text or "").strip():
+        try:
+            storage_state = state.decode_state(browser_state_text)
+        except state.BrowserStateError as exc:
+            return BrowserScriptResult("need_login", f"登录态解码失败：{exc}", {"checkin_source": "browser_script"})
+    else:
+        storage_state = {"cookies": [], "origins": []}
 
     try:
         module = _load_module(script_file)
@@ -198,9 +226,12 @@ async def run_browser_script(
     run_func = getattr(module, "run")
     site_view = _site_view(site, str(script_file.relative_to(REPO_ROOT)).replace("\\", "/"), script_args, timeout)
 
+    log = _make_log(site_view.name)
+
     browser = None
     page = None
     try:
+        log(f"启动浏览器执行脚本 {site_view.script}（超时 {timeout}s）")
         browser, context = await bypass.launch_camoufox(
             headless=_env_headless(),
             humanize=True,
@@ -209,10 +240,12 @@ async def run_browser_script(
         )
         await state.restore_storage_state(context, storage_state)
         page = await context.new_page()
+        log("浏览器已就绪，已恢复登录态" if storage_state.get("cookies") else "浏览器已就绪（无登录态，脚本需自行登录）")
         allowed_origin = _origin_from_url(site_view.base_url)
         await popups.setup_popup_guard(page, allowed_origin=allowed_origin)
 
         if oauth_provider:
+            log(f"先完成 {oauth_provider} OAuth 登录回跳...")
             # 共享 OAuth state 只包含第三方 provider 登录态；先完成站点 OAuth 回跳，
             # 再把已认证的站点页面交给自定义脚本。
             await page.goto(site_view.base_url, wait_until="domcontentloaded", timeout=60000)
@@ -227,28 +260,34 @@ async def run_browser_script(
                     "oauth_cloudflare": bool(oauth_link.get("cloudflare")),
                 }
                 detail.update({key: value for key, value in oauth_link.items() if key not in detail})
+                log("OAuth 自动登录未完成")
                 return BrowserScriptResult("need_login", "OAuth 自动登录未完成，请检查共享登录态或站点 OAuth 配置。", detail)
+            log("OAuth 登录已回跳站点")
             await popups.dismiss_popups(page)
 
-        helpers = ScriptHelpers(page, context, site_view, SCREENSHOT_DIR)
+        helpers = ScriptHelpers(page, context, site_view, SCREENSHOT_DIR, log=log)
 
+        log("开始执行脚本 run()")
         maybe_result = run_func(page, context, site_view, helpers)
         if inspect.isawaitable(maybe_result):
             raw_result = await asyncio.wait_for(maybe_result, timeout=timeout)
         else:
             raw_result = maybe_result
-        return _normalize_result(raw_result, script_file=script_file)
+        outcome = _normalize_result(raw_result, script_file=script_file)
+        log(f"脚本结束：{outcome.status} - {outcome.message}")
+        return outcome
     except asyncio.TimeoutError:
         screenshot = ""
         if page is not None:
             try:
-                helpers = ScriptHelpers(page, getattr(page, "context", None), site_view, SCREENSHOT_DIR)
+                helpers = ScriptHelpers(page, getattr(page, "context", None), site_view, SCREENSHOT_DIR, log=log)
                 screenshot = await helpers.screenshot("browser_script-timeout.png")
             except Exception:
                 screenshot = ""
         detail = {"checkin_source": "browser_script", "script": str(script_file.relative_to(REPO_ROOT)).replace("\\", "/"), "timeout": timeout}
         if screenshot:
             detail["screenshot"] = screenshot
+        log(f"脚本执行超时（{timeout}s）")
         return BrowserScriptResult("error", f"浏览器脚本执行超时（{timeout}s）", detail)
     except BrowserScriptError as exc:
         return BrowserScriptResult("need_config", str(exc), {"checkin_source": "browser_script"})
@@ -267,7 +306,7 @@ async def run_browser_script(
         screenshot = ""
         if page is not None:
             try:
-                helpers = ScriptHelpers(page, getattr(page, "context", None), site_view, SCREENSHOT_DIR)
+                helpers = ScriptHelpers(page, getattr(page, "context", None), site_view, SCREENSHOT_DIR, log=log)
                 screenshot = await helpers.screenshot("browser_script-error.png")
             except Exception:
                 screenshot = ""

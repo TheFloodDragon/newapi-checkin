@@ -179,6 +179,9 @@ class SiteConfig:
     cookie: str = ""
     user_id: str = ""
     access_token: str = ""
+    # Sub2API 系的长效刷新令牌。access_token 是短期 JWT，过期后纯 HTTP 路径可用它
+    # 直接调 /api/v1/auth/refresh 续期，无需为常见的「token 过期」拉起浏览器。
+    refresh_token: str = ""
     cookie_file: str = ""
     browser_state: str = ""
     # ── 浏览器 / 网络 ──
@@ -272,6 +275,11 @@ class CheckinReward:
     current_quota: Any = None  # 当前余额（原始值）
     raw: Any = None
     extra: dict[str, Any] = field(default_factory=dict)  # consecutive_days / total_* 等附加字段
+    # 接口返回 2xx，但响应体里没有任何「签到确实成立」的正面证据（无奖励额度、
+    # 无连续天数、无已签标记）。实测存在站点静默拒绝或端点并非签到接口的情况，
+    # 此时若直接报成功就会出现「显示签到成功但额度未到账」。置 True 时由 action
+    # 层用签到前后余额差 / 状态接口做交叉验证，验证不到证据则不谎报成功。
+    checkin_unconfirmed: bool = False
 
 
 class ApiError(Exception):
@@ -482,12 +490,20 @@ def unwrap_data(payload: Any) -> Any:
     return payload
 
 
-def _build_url_opener(proxy: str = "", verify_ssl: bool = True) -> urllib.request.OpenerDirector:
+def _build_url_opener(proxy: str = "", verify_ssl: bool = True, cookie_jar: Any = None) -> urllib.request.OpenerDirector:
     """构造不依赖进程隐式代理环境的 opener。
 
     verify_ssl=False 时禁用 TLS 证书与主机名校验（用于证书过期/自签名的应急兜底）。
+
+    cookie_jar 非空时挂上 HTTPCookieProcessor，让同一会话的多次请求复用 Set-Cookie。
+    部分 Sub2API 站点（实测极速蹬）会把会话绑定到网络/客户端指纹，登录时下发的
+    cookie 若不带回，后续请求即被拒：
+        {"code":401,"message":"Session network fingerprint changed, please login again"}
+    默认仍不带 cookie jar，保持其它 profile 的无状态请求语义不变。
     """
     handlers: list[urllib.request.BaseHandler] = []
+    if cookie_jar is not None:
+        handlers.append(urllib.request.HTTPCookieProcessor(cookie_jar))
     if not verify_ssl:
         import ssl
         ctx = ssl.create_default_context()
@@ -517,10 +533,11 @@ def _http_request_once(
     timeout: int,
     proxy: str,
     verify_ssl: bool = True,
+    cookie_jar: Any = None,
 ) -> Any:
     """单次 HTTP 请求并解析 JSON；HTTP 错误也尽量解析 body，统一抛 ApiError。"""
     req = urllib.request.Request(url, data=body, headers=headers, method=method.upper())
-    opener = _build_url_opener(proxy, verify_ssl=verify_ssl)
+    opener = _build_url_opener(proxy, verify_ssl=verify_ssl, cookie_jar=cookie_jar)
     try:
         with opener.open(req, timeout=timeout) as response:
             text = decode_response_body(response.read(), response.headers.get("content-encoding", ""))
@@ -559,6 +576,7 @@ def http_request(
     proxy: str = "",
     retry_non_idempotent: bool = False,
     verify_ssl: bool = True,
+    cookie_jar: Any = None,
 ) -> Any:
     """发送 HTTP 请求并解析 JSON，对可安全重放的瞬时性错误做退避重试。
 
@@ -581,6 +599,7 @@ def http_request(
                 timeout=timeout,
                 proxy=proxy,
                 verify_ssl=verify_ssl,
+                cookie_jar=cookie_jar,
             )
         except ApiError as exc:
             last_error = exc

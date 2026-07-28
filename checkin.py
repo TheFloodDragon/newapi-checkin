@@ -116,7 +116,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--auth-method", default="", help="登录方式：access_token / cookie / browser / oauth（留空自动推断）")
     parser.add_argument("--checkin-action", default="api", choices=["api", "relogin", "visit", "browser_script"], help="签到方式：api=调接口，relogin=浏览器重登，visit=访问保活，browser_script=自定义浏览器脚本")
     parser.add_argument("--script", default="", help="browser_script 的仓库内相对 Python 脚本路径")
-    parser.add_argument("--script-args", default="{}", help="browser_script 的脚本参数 JSON 字符串")
+    # script_args 可能含账号密码等凭据，优先从环境变量 CHECKIN_SCRIPT_ARGS 读取，
+    # 避免出现在进程命令行（argv 对同机其它用户可见）。此选项仅供手工调试使用。
+    parser.add_argument("--script-args", default="", help="browser_script 的脚本参数 JSON 字符串（含凭据时请改用 CHECKIN_SCRIPT_ARGS 环境变量）")
     parser.add_argument("--script-timeout", type=int, default=120, help="browser_script 超时秒数，默认 120")
     parser.add_argument("--api-variant", default="auto", choices=["auto", "legacy"], help="newapi+api 接口变体偏好：auto=challenge 优先，legacy=旧接口优先")
     parser.add_argument("--token-file", default="", help="临时指定单站点凭证文件（newapi）：第一行 Cookie，第二行用户 ID，第三行 Access token")
@@ -131,6 +133,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--oauth-fallback-provider", default="", choices=("", *accounts_store.KNOWN_OAUTH_PROVIDERS), help=argparse.SUPPRESS)
     parser.add_argument("--oauth-fallback-account", default=accounts_store.DEFAULT_OAUTH_ACCOUNT, help=argparse.SUPPRESS)
     parser.add_argument("--proxy", default="", help="代理 URL（HTTP API 支持 http/https；浏览器流程可使用 socks5）")
+    parser.add_argument("--referer-path", default="/profile", help="newapi 请求头 Referer 的路径部分，默认 /profile")
+    parser.add_argument(
+        "--no-verify-ssl",
+        dest="verify_ssl",
+        action="store_false",
+        default=True,
+        help="跳过 TLS 证书与主机名校验（仅用于证书过期/自签名站点的应急兜底，有中间人风险）",
+    )
+    parser.add_argument(
+        "--no-auto-refresh-cookie",
+        dest="auto_refresh_cookie",
+        action="store_false",
+        default=True,
+        help="禁止自动回写清理后的 Cookie 文件",
+    )
     parser.add_argument("--turnstile", default="", help="如站点要求 Turnstile，可临时传入验证值")
     parser.add_argument("--workers", type=int, default=0, help="同时执行的最大任务数，默认最多 8 个")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
@@ -152,13 +169,25 @@ def _result_payload(result: CheckinResult) -> dict[str, object]:
     return sanitize_data(result.__dict__)
 
 
+def _load_script_args(args: argparse.Namespace) -> dict[str, object]:
+    """解析 browser_script 参数；优先环境变量，避免凭据出现在命令行。
+
+    script_args 可能含站点账号密码（见 scripts/checkin/*.py 的登录兜底），
+    放进 argv 会泄露到同机进程列表，因此批量调度改用 CHECKIN_SCRIPT_ARGS 传递。
+    --script-args 仅作为人工调试的兼容入口。
+    """
+    raw = os.environ.get("CHECKIN_SCRIPT_ARGS", "").strip() or (args.script_args or "{}")
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise ValueError("script_args 必须是 JSON 对象")
+    return parsed
+
+
 def _execute(args: argparse.Namespace) -> tuple[dict[str, object] | list[dict[str, object]], int]:
     try:
-        script_args = json.loads(args.script_args or "{}")
-        if not isinstance(script_args, dict):
-            raise ValueError("--script-args 必须是 JSON 对象")
+        script_args = _load_script_args(args)
     except Exception as exc:
-        result = CheckinResult("checkin", "", "need_config", f"解析 --script-args 失败：{exc}")
+        result = CheckinResult("checkin", "", "need_config", f"解析 script_args 失败：{exc}")
         return _result_payload(result), 2
 
     if args.base_url:
@@ -175,6 +204,9 @@ def _execute(args: argparse.Namespace) -> tuple[dict[str, object] | list[dict[st
             "cookie": args.cookie or os.environ.get("CHECKIN_COOKIE", ""),
             "user_id": args.user_id or os.environ.get("CHECKIN_USER_ID", ""),
             "access_token": args.access_token or os.environ.get("CHECKIN_ACCESS_TOKEN", ""),
+            # refresh_token 只从环境变量读（属凭据，不设命令行选项）：sub2api 用它
+            # 在 access_token 过期时纯 HTTP 续期，避免为此拉起浏览器。
+            "refresh_token": os.environ.get("CHECKIN_REFRESH_TOKEN", ""),
             "cookie_file": args.token_file,
             "browser_profile": args.browser_profile,
             "login_selector": args.login_selector,
@@ -184,6 +216,11 @@ def _execute(args: argparse.Namespace) -> tuple[dict[str, object] | list[dict[st
             "oauth_fallback_account": args.oauth_fallback_account,
             "browser_state": os.environ.get("CHECKIN_BROWSER_STATE", ""),
             "proxy": args.proxy or os.environ.get("CHECKIN_PROXY", ""),
+            # 以下三项此前只在读配置文件的路径生效；worker 模式（--base-url）缺失会
+            # 静默回落默认值，导致同一份 ACCOUNTS.json 在 GUI 与 CI 表现不一致。
+            "verify_ssl": args.verify_ssl,
+            "referer_path": args.referer_path,
+            "auto_refresh_cookie": args.auto_refresh_cookie,
         }
         sites = [accounts_store.site_config_from_mapping(raw_site)]
     else:

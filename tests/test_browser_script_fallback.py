@@ -109,3 +109,89 @@ def test_browser_script_without_oauth_reports_failed_checkin_on_expired_state(mo
     assert len(runner.calls) == 1
     assert runner.calls[0]["browser_state_text"] == "site-state"
     assert runner.calls[0]["oauth_provider"] == ""
+
+
+def test_api_first_uses_plain_http_client_not_browser_refresher(monkeypatch) -> None:
+    """有 access_token 的站点必须先走纯 API，且不得触发会启动浏览器的刷新器。
+
+    用户要求的顺序是「先 API（纯 HTTP）→ 再登录态 → 再账密」。
+    build_lazy_refresh_client 注入的 token_refresher 会拉起 Camoufox，
+    放在第 1 级会让「纯 API」名不副实（实测日志里出现过 Camoufox 启动），
+    因此第 1 级只能用 build_client 的纯 HTTP 客户端。
+    """
+    runner = FakeRunner([])
+    _install(monkeypatch, runner)
+
+    class FakeClient:
+        base_url = "https://script.invalid"
+        quota_is_usd = True
+
+        def fetch_status(self):
+            return SimpleNamespace(checked_in_today=False, quota_usd=3.0)
+
+        def do_checkin(self, _turnstile=""):
+            return SimpleNamespace(
+                already_done=False,
+                checkin_unconfirmed=False,
+                quota_awarded=1,
+                raw={"reward_amount": 1},
+            )
+
+    build_calls: list[object] = []
+
+    class FakeProfile:
+        def build_lazy_refresh_client(self, site):  # pragma: no cover - 不应被调用
+            raise AssertionError("第 1 级不得使用会启动浏览器的 lazy 刷新客户端")
+
+        def build_client(self, site, auth):
+            build_calls.append(auth)
+            return FakeClient()
+
+        def classify(self, error):
+            return "error"
+
+    site = _site()
+    site.access_token = "cached-jwt"
+
+    result = browser_script.run_action(site, FakeProfile())
+
+    assert result.status == "success"
+    assert result.detail["api_first"] is True
+    assert result.detail["api_stage"] == "token"
+    assert len(build_calls) == 1
+    # 纯 API 已拿到结论，绝不应启动浏览器脚本。
+    assert runner.calls == []
+
+def test_missing_state_with_script_credentials_still_runs_script(monkeypatch) -> None:
+    """无 browser_state 但 script_args 有账密时，应让脚本自行登录而非直接失败。"""
+    runner = FakeRunner(["success"])
+    _install(monkeypatch, runner, oauth_state="")
+    site = _site()
+    site.browser_state = ""
+    site.oauth_fallback_provider = ""
+    site.oauth_fallback_account = ""
+    site.script_args = {"email": "user@example.test", "password": "pw"}
+
+    result = browser_script.run_action(site, SimpleNamespace())
+
+    assert result.status == "success"
+    assert len(runner.calls) == 1
+    assert runner.calls[0]["browser_state_text"] == ""
+    assert result.detail["self_login"] is True
+
+
+def test_missing_state_without_any_credentials_reports_clear_error(monkeypatch) -> None:
+    """既无登录态、又无 OAuth 兜底、也无脚本凭据时，错误信息需覆盖三种缺失。"""
+    runner = FakeRunner([])
+    _install(monkeypatch, runner, oauth_state="")
+    site = _site()
+    site.browser_state = ""
+    site.oauth_fallback_provider = ""
+    site.oauth_fallback_account = ""
+    site.script_args = {}
+
+    result = browser_script.run_action(site, SimpleNamespace())
+
+    assert result.status == "error"
+    assert "脚本账密凭据" in result.message
+    assert runner.calls == []

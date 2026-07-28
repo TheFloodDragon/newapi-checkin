@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -17,11 +18,42 @@ class ScriptHelpers:
     page/context 完成更复杂的交互。
     """
 
-    def __init__(self, page: Any, context: Any, site: Any, screenshot_dir: Path) -> None:
+    def __init__(
+        self,
+        page: Any,
+        context: Any,
+        site: Any,
+        screenshot_dir: Path,
+        log: Any = None,
+    ) -> None:
         self.page = page
         self.context = context
         self.site = site
         self.screenshot_dir = screenshot_dir
+        self._log = log
+
+    def log(self, message: str) -> None:
+        """输出一行脚本进度日志（stderr，已脱敏）。
+
+        browser_script 流程动辄跑几十秒（启浏览器、过 WAF、登录、轮询按钮），
+        此前脚本没有任何输出能力，失败时只能看到最终状态、无法判断卡在哪一步；
+        而 relogin / newapi / sub2api 等路径早就有 _log。这里补齐能力，让站点
+        脚本与其它 provider 的可观测性一致。
+
+        worker 模式下 stdout 是机器协议通道，所以日志一律走 stderr。
+        """
+        text = str(message or "").strip()
+        if not text:
+            return
+        if self._log is not None:
+            try:
+                self._log(text)
+                return
+            except Exception:
+                pass
+        from mask_utils import mask_secrets
+
+        print(mask_secrets(text), file=sys.stderr, flush=True)
 
     def resolve_url(self, url: str | None = None) -> str:
         """把绝对 URL 或站点相对路径解析为可导航 URL。"""

@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import os
+import sys
 from typing import Any
 
 import accounts_store
@@ -24,63 +26,188 @@ def _load_runner():
     return script_runner
 
 
-def _try_api_checkin(site: SiteConfig, profile: SiteProfile) -> CheckinResult | None:
-    """浏览器脚本之前的首选方案：用配置的 access_token 直接调 HTTP 签到接口。
+def _script_can_self_login(site: SiteConfig) -> bool:
+    """脚本是否具备自行登录的凭据（无需现成 browser_state）。
 
-    仅在拿到明确结论（签到成功 / 今日已签到）时返回 CheckinResult；登录态失效
-    （need_login / 401）或接口不可用一律返回 None，交由下方浏览器脚本降级处理
-    （browser_state → 账密登录）。任何异常都吞掉返回 None，绝不影响后续降级。
-
-    只对具备 HTTP 签到能力的 profile（如 sub2api）生效，且必须配置了 access_token。
+    scripts/checkin/*.py 的账密兜底优先读 script_args 的 email/password，
+    未填时回退到环境变量（键名可由 email_env/password_env 覆盖）。只要任一来源
+    可用，就该让脚本启动并自行登录，而不是在这里判「登录态缺失」失败。
     """
-    token = normalize_access_token(getattr(site, "access_token", "") or "")
-    if not token:
-        return None
+    args = site.script_args if isinstance(site.script_args, dict) else {}
+    if str(args.get("email") or "").strip() and str(args.get("password") or "").strip():
+        return True
+    email_env = str(args.get("email_env") or "").strip()
+    password_env = str(args.get("password_env") or "").strip()
+    if email_env and password_env:
+        return bool(os.environ.get(email_env, "").strip() and os.environ.get(password_env, "").strip())
+    # 未显式指定环境变量名时无法可靠猜出脚本的默认键名，交由脚本自行判断。
+    return False
+
+
+def _script_credentials(site: SiteConfig) -> tuple[str, str]:
+    """取脚本可用的账密（script_args 优先，回退环境变量）。"""
+    args = site.script_args if isinstance(site.script_args, dict) else {}
+    email = str(args.get("email") or "").strip()
+    password = str(args.get("password") or "")
+    if email and password:
+        return email, password
+    email_env = str(args.get("email_env") or "").strip()
+    password_env = str(args.get("password_env") or "").strip()
+    if email_env and password_env:
+        return (
+            os.environ.get(email_env, "").strip(),
+            os.environ.get(password_env, ""),
+        )
+    return "", ""
+
+
+def _api_log(site: SiteConfig, message: str) -> None:
+    """browser_script 的 API 优先阶段日志（stderr，worker 的 stdout 是协议通道）。"""
+    from mask_utils import mask_secrets
+
+    print(f"[api_first:{site.name}] {mask_secrets(str(message))}", file=sys.stderr, flush=True)
+
+
+def _try_api_checkin(site: SiteConfig, profile: SiteProfile) -> CheckinResult | None:
+    """浏览器脚本之前的首选方案：纯 HTTP 调站点签到接口（不启动浏览器）。
+
+    三级凭据来源，逐级降级（对应用户要求的「先 API、再登录态、再账密」）：
+    1. 配置的 access_token（过期时 profile 会用 refresh_token 纯 HTTP 续期）；
+    2. 上述都不可用时，用 script_args/环境变量里的账密做纯 HTTP 登录换新 token
+       （站点未启用 Turnstile 时可行，实测极速蹬可走通）；
+    3. 仍拿不到明确结论则返回 None，交由浏览器脚本处理（browser_state → 账密 →
+       Turnstile 真实点击）。
+
+    只在拿到明确结论（成功 / 今日已签到）时返回结果；其余一律返回 None 以便降级。
+    每个阶段都打日志：此前这里完全静默，失败时无法判断卡在哪一级。
+    """
     build_client = getattr(profile, "build_client", None)
     if not callable(build_client):
         return None
     base_url = normalize_base_url(site.base_url)
-    try:
-        from ..base import AuthInfo
+    token = normalize_access_token(getattr(site, "access_token", "") or "")
 
-        client = build_client(site, AuthInfo(access_token=token))
-        # 先读状态：今日已签到直接返回，避免重复 POST。
+    from ..base import AuthInfo
+
+    def _attempt(client: Any, stage: str) -> CheckinResult | None:
+        """用给定客户端跑一次「读状态 → 签到」；无明确结论返回 None。"""
         try:
             status = client.fetch_status()
-        except ApiError:
+        except ApiError as exc:
+            kind = profile.classify(exc) if hasattr(profile, "classify") else "error"
+            _api_log(site, f"[{stage}] 读取签到状态失败：{exc.message}（判定 {kind}）")
+            if kind == "need_login":
+                raise
             status = None
-        if status is not None and getattr(status, "checked_in_today", None):
-            return CheckinResult(
-                site.name, base_url, "already_done", "今日已签到。",
-                detail={"checkin_source": "api", "api_first": True},
+        else:
+            checked = getattr(status, "checked_in_today", None)
+            quota = getattr(status, "quota_usd", None)
+            _api_log(
+                site,
+                f"[{stage}] 状态读取成功：今日已签={checked} 余额="
+                + (f"${quota:.2f}" if isinstance(quota, (int, float)) else "未知"),
             )
+            if checked:
+                return CheckinResult(
+                    site.name, base_url, "already_done", "今日已签到。",
+                    detail={"checkin_source": "api", "api_first": True, "api_stage": stage},
+                )
+
+        _api_log(site, f"[{stage}] 调用签到接口...")
         reward = client.do_checkin("")
-        detail = {"checkin_source": "api", "api_first": True}
+        detail = {"checkin_source": "api", "api_first": True, "api_stage": stage}
         if getattr(reward, "already_done", False):
+            _api_log(site, f"[{stage}] 接口返回今日已签到")
             return CheckinResult(site.name, base_url, "already_done", "今日已签到。", detail=detail)
-        # 标准 sub2api 无签到接口时 do_checkin 会返回 unsupported 标记——不算签到成功，
-        # 交给浏览器脚本处理，避免把「只查了余额」误报成签到成功。
         raw = getattr(reward, "raw", None)
         if isinstance(raw, dict) and raw.get("unsupported_checkin"):
+            _api_log(site, f"[{stage}] 站点无可用签到端点，交给浏览器脚本")
             return None
+        # 无签到成立证据时不谎报成功，交给浏览器脚本二次确认。
+        if getattr(reward, "checkin_unconfirmed", False):
+            _api_log(site, f"[{stage}] 接口回 200 但无签到证据，交给浏览器脚本确认")
+            return None
+        awarded = getattr(reward, "quota_awarded", None)
+        if awarded is not None:
+            detail["quota_awarded"] = awarded
+            _api_log(site, f"[{stage}] 签到成功，获得 {awarded}")
+            return CheckinResult(site.name, base_url, "success", f"签到成功，获得额度：{awarded}", detail=detail)
+        _api_log(site, f"[{stage}] 签到成功")
         return CheckinResult(site.name, base_url, "success", "签到成功。", detail=detail)
-    except ApiError as exc:
-        # 登录态失效（need_login）或需人机验证等：降级到浏览器脚本。
-        kind = None
-        classify = getattr(profile, "classify", None)
-        if callable(classify):
+
+    # ── 第 1 级：已配置的 access_token（含 refresh_token 纯 HTTP 续期）──
+    if token:
+        _api_log(site, "尝试纯 API 签到（使用已保存的 access_token）")
+        try:
+            # 必须用纯 HTTP 客户端：build_lazy_refresh_client 注入的 refresher 会
+            # 拉起 Camoufox（实测日志里出现过 "Camoufox 运行模式"），那就违背了
+            # 「第一级先纯 API」的前提，也让本该几秒完成的探测变成几十秒。
+            # refresh_token 的纯 HTTP 续期由 Sub2ApiClient 内部的 _refresh_via_http
+            # 完成，无需浏览器。
+            client = build_client(site, AuthInfo(access_token=token))
+            result = _attempt(client, "token")
+            if result is not None:
+                return result
+        except ApiError as exc:
+            kind = profile.classify(exc) if hasattr(profile, "classify") else "error"
+            if kind == "already_done":
+                _api_log(site, "接口返回今日已签到")
+                return CheckinResult(
+                    site.name, base_url, "already_done", "今日已签到。",
+                    detail={"checkin_source": "api", "api_first": True, "api_stage": "token"},
+                )
+            _api_log(site, f"token 阶段未能完成（{kind}）：{exc.message}")
+        except Exception as exc:
+            _api_log(site, f"token 阶段异常：{exc}")
+    else:
+        _api_log(site, "未配置 access_token，跳过 token 阶段")
+
+    # ── 第 2 级：纯 HTTP 账密登录换新 token（站点未启 Turnstile 时可行）──
+    login = getattr(profile, "http_password_login", None)
+    email, password = _script_credentials(site)
+    if callable(login) and email and password:
+        _api_log(site, "token 不可用，尝试纯 HTTP 账密登录换取新 token")
+        try:
+            fresh = login(site, email, password, log=lambda m: _api_log(site, m))
+        except Exception as exc:
+            _api_log(site, f"账密登录异常：{exc}")
+            fresh = {}
+        new_token = normalize_access_token(str((fresh or {}).get("access_token") or ""))
+        if new_token:
+            new_refresh = str((fresh or {}).get("refresh_token") or "").strip()
+            # 立即写回，让下次运行可直接用新 token / refresh_token。
             try:
-                kind = classify(exc)
-            except Exception:
-                kind = None
-        if kind == "already_done":
-            return CheckinResult(
-                site.name, base_url, "already_done", "今日已签到。",
-                detail={"checkin_source": "api", "api_first": True},
-            )
-        return None
-    except Exception:
-        return None
+                if accounts_store.update_account_access_token(
+                    site.name, site.base_url, new_token, refresh_token=new_refresh
+                ):
+                    _api_log(site, "新 token 已写回 ACCOUNTS.json")
+                site.access_token = new_token
+                if new_refresh:
+                    site.refresh_token = new_refresh
+            except Exception as exc:
+                _api_log(site, f"写回新 token 失败（不影响本次）：{exc}")
+                site.access_token = new_token
+                if new_refresh:
+                    site.refresh_token = new_refresh
+            try:
+                result = _attempt(build_client(site, AuthInfo(access_token=new_token)), "password")
+                if result is not None:
+                    return result
+            except ApiError as exc:
+                kind = profile.classify(exc) if hasattr(profile, "classify") else "error"
+                if kind == "already_done":
+                    return CheckinResult(
+                        site.name, base_url, "already_done", "今日已签到。",
+                        detail={"checkin_source": "api", "api_first": True, "api_stage": "password"},
+                    )
+                _api_log(site, f"账密阶段未能完成（{kind}）：{exc.message}")
+            except Exception as exc:
+                _api_log(site, f"账密阶段异常：{exc}")
+    elif not (email and password):
+        _api_log(site, "未配置脚本账密，跳过纯 HTTP 登录阶段")
+
+    _api_log(site, "纯 API 路径未能完成签到，降级到浏览器脚本")
+    return None
 
 
 def run_action(site: SiteConfig, profile: SiteProfile, turnstile: str = "") -> CheckinResult:
@@ -141,12 +268,23 @@ def run_action(site: SiteConfig, profile: SiteProfile, turnstile: str = "") -> C
             "oauth_account": fallback_account,
         })
 
+    # 没有任何登录态时，不能直接判失败：脚本可能自带账密登录兜底
+    # （见 scripts/checkin/*.py 的 _login_with_password，凭据来自 script_args
+    # 或环境变量）。此时用空登录态启动浏览器，让脚本自己走登录流程；
+    # 只有脚本也没有可用凭据时，才由脚本返回 need_login。
     if not str(state_text or "").strip():
-        if fallback_provider:
-            message = f"缺少可选 OAuth {fallback_provider}:{fallback_account} 登录态，签到失败"
+        if _script_can_self_login(site):
+            state_text = ""
+            initial_oauth_provider = ""
+            detail["self_login"] = True
         else:
-            message = "站点登录态缓存不存在，且未配置 OAuth 兜底，签到失败"
-        return CheckinResult(site.name, base_url, "error", message, detail=detail)
+            if fallback_provider:
+                message = f"缺少可选 OAuth {fallback_provider}:{fallback_account} 登录态，签到失败"
+            else:
+                message = (
+                    "站点登录态缓存不存在，且未配置 OAuth 兜底或脚本账密凭据，签到失败"
+                )
+            return CheckinResult(site.name, base_url, "error", message, detail=detail)
 
     try:
         runner = _load_runner()

@@ -184,6 +184,8 @@ class SiteRow:
     enabled: bool = True
     user_id: str = ""
     access_token: str = ""
+    # sub2api 的长期凭据：access_token 过期后可纯 HTTP 续期，无需启动浏览器。
+    refresh_token: str = ""
     cookie: str = ""
     browser_state: str = ""
     proxy: str = ""
@@ -243,6 +245,7 @@ def row_from_store(raw: dict[str, Any]) -> SiteRow:
         enabled=accounts_store.parse_enabled(raw.get("enabled"), True),
         user_id=str(raw.get("user_id") or ""),
         access_token=str(raw.get("access_token") or ""),
+        refresh_token=str(raw.get("refresh_token") or ""),
         cookie=str(raw.get("cookie") or ""),
         browser_state=str(raw.get("browser_state") or "") if keep_state else "",
         proxy=str(raw.get("proxy") or ""),
@@ -303,6 +306,7 @@ def task_params(row: SiteRow, oauth_states: dict[str, Any]) -> dict[str, Any]:
         "api_variant": row.api_variant,
         "cookie": row.cookie.strip(),
         "access_token": row.access_token.strip(),
+        "refresh_token": row.refresh_token.strip(),
         "user_id": row.user_id.strip(),
         "oauth_provider": oauth_provider,
         "oauth_account": oauth_account,
@@ -333,6 +337,10 @@ class FormPlan:
     verify_text: str = "检测登录态"
     oauth_status: str = ""
     mode_hint: str = ""
+    # sub2api 的 access_token 是短期 JWT，refresh_token 才决定能否纯 HTTP 续期
+    # （不必每次签到都拉起浏览器）。它没有输入框，用户只能靠这行文案判断状态。
+    show_refresh_status: bool = False
+    refresh_status: str = ""
 
 
 _SCRIPT_FALLBACK_HINT = (
@@ -370,6 +378,16 @@ def build_form_plan(row: SiteRow, oauth_states: dict[str, Any]) -> FormPlan:
         show_browser_ops=is_browser or needs_oauth,
         show_delete_oauth=needs_oauth,
         creds_enabled=auth in ("access_token", "cookie"),
+        # refresh_token 只对 sub2api 有意义（access_token 是短期 JWT，refresh_token
+        # 让纯 HTTP 路径能自行续期、不必每次拉起浏览器）。把它的有无显式呈现出来，
+        # 用户才能判断某站点是否已具备免浏览器续期能力。
+        show_refresh_status=row.type == "sub2api",
+        refresh_status=(
+            "已保存 refresh_token：Token 过期可纯 HTTP 自动续期，无需启动浏览器。"
+            if row.refresh_token.strip()
+            else "未保存 refresh_token：Token 过期后需启动浏览器重新登录；"
+                 "用「浏览器登录捕获」重新捕获一次即可自动存入。"
+        ),
     )
 
     if needs_oauth:
@@ -433,6 +451,7 @@ def _snapshot_row(row: SiteRow) -> dict[str, Any]:
         "enabled": bool(row.enabled),
         "user_id": row.user_id.strip(),
         "access_token": row.access_token.strip(),
+        "refresh_token": row.refresh_token.strip(),
         "cookie": row.cookie.strip(),
         "browser_state": row.browser_state.strip() if auth == "browser" and row.checkin_action != "relogin" else "",
         "proxy": row.proxy.strip(),
@@ -505,6 +524,7 @@ def persist_accounts(rows: list[SiteRow]) -> list[dict[str, Any]]:
             "enabled": bool(row.enabled),
             "user_id": row.user_id,
             "access_token": row.access_token,
+            "refresh_token": row.refresh_token,
             "cookie": row.cookie,
         }
         if action == "browser_script":

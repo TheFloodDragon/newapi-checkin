@@ -133,9 +133,6 @@ def build_site_tasks() -> list[CheckinTask]:
             script = str(site.get("script") or "").strip()
             if script:
                 command.extend(["--script", script])
-            script_args = accounts_store.normalize_script_args(site.get("script_args"))
-            if script_args:
-                command.extend(["--script-args", json.dumps(script_args, ensure_ascii=False, separators=(",", ":"))])
             command.extend(["--script-timeout", str(accounts_store.parse_script_timeout(site.get("script_timeout"), 120))])
         cookie_file = str(site.get("cookie_file") or site.get("token_file") or "").strip()
         cookie = str(site.get("cookie") or "").strip()
@@ -145,10 +142,23 @@ def build_site_tasks() -> list[CheckinTask]:
         if cookie_file:
             command.extend(["--token-file", cookie_file])
         env_values: dict[str, str] = {}
+        # script_args 可能含站点账号密码（scripts/checkin/*.py 的登录兜底会读 email/password），
+        # 必须走环境变量：命令行参数会出现在同机可见的进程列表里。
+        if checkin_action == "browser_script":
+            script_args = accounts_store.normalize_script_args(site.get("script_args"))
+            if script_args:
+                env_values["CHECKIN_SCRIPT_ARGS"] = json.dumps(
+                    script_args, ensure_ascii=False, separators=(",", ":")
+                )
         if cookie:
             env_values["CHECKIN_COOKIE"] = cookie
         if access_token:
             env_values["CHECKIN_ACCESS_TOKEN"] = access_token
+        # refresh_token 让 sub2api 站点在 access_token 过期时纯 HTTP 续期，
+        # 不必为此启动浏览器；与 token 同级敏感，同样只走环境变量。
+        refresh_token = str(site.get("refresh_token") or "").strip()
+        if refresh_token:
+            env_values["CHECKIN_REFRESH_TOKEN"] = refresh_token
         if user_id:
             env_values["CHECKIN_USER_ID"] = user_id
         if auth_method == "oauth" or checkin_action == "relogin":
@@ -163,6 +173,16 @@ def build_site_tasks() -> list[CheckinTask]:
         proxy = str(site.get("proxy") or "").strip() or os.environ.get("CHECKIN_PROXY", "").strip()
         if proxy:
             env_values["CHECKIN_PROXY"] = proxy
+
+        # 这三项以前只在 checkin.py 读配置文件时生效；worker 模式（--base-url）不透传会
+        # 静默回落默认值，导致同一份 ACCOUNTS.json 在 GUI 能用、批量/CI 却失败。
+        if not site_config.verify_ssl:
+            command.append("--no-verify-ssl")
+        referer_path = str(site.get("referer_path") or "").strip()
+        if referer_path and referer_path != "/profile":
+            command.extend(["--referer-path", referer_path])
+        if not site_config.auto_refresh_cookie:
+            command.append("--no-auto-refresh-cookie")
 
         if auth_method in {"browser", "oauth"}:
             browser_profile = str(site.get("browser_profile") or "").strip()

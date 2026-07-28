@@ -100,12 +100,16 @@ class _LockState:
 
 _LOCK_STATE = _LockState()
 
+# 锁参数集中在 config.FileLockConfig（支持 CHECKIN_LOCK_TIMEOUT 覆盖）；
+# 这里只做引用，避免「改了 config 却不生效」的硬编码绕过。
+from config import FileLockConfig as _FileLockConfig  # noqa: E402
+
 # Windows msvcrt.locking 需要指定锁定字节数；我们只用文件存在性做互斥，锁 1 字节即可。
-_MSVCRT_LOCK_BYTES = 1
+_MSVCRT_LOCK_BYTES = _FileLockConfig.LOCK_SIZE
 
 
 @contextlib.contextmanager
-def _file_lock(path: Path, *, timeout: float = 30.0):
+def _file_lock(path: Path, *, timeout: float | None = None):
     """Cross-platform advisory lock serializing read-modify-write on `path`.
 
     Concurrent check-in tasks each do "read whole file -> change one entry ->
@@ -120,6 +124,8 @@ def _file_lock(path: Path, *, timeout: float = 30.0):
     # A plain OS file lock would self-deadlock on Windows (msvcrt), so we serialize
     # within the process using a reentrant lock and only touch the OS-level lock at
     # the outermost scope, tracked by a per-thread depth counter.
+    if timeout is None:
+        timeout = _FileLockConfig.DEFAULT_TIMEOUT
     _LOCK_STATE.rlock.acquire()
     try:
         depth = getattr(_LOCK_STATE.local, "depth", 0)
@@ -209,8 +215,12 @@ def atomic_write_text(path: Path, text: str) -> None:
 
 
 @contextlib.contextmanager
-def file_lock(path: Path, *, timeout: float = 30.0):
-    """公开的共享文件锁入口，供额度状态和结果文件复用。"""
+def file_lock(path: Path, *, timeout: float | None = None):
+    """公开的共享文件锁入口，供额度状态和结果文件复用。
+
+    timeout 为 None 时用 config.FileLockConfig.DEFAULT_TIMEOUT（可经
+    CHECKIN_LOCK_TIMEOUT 环境变量覆盖）。
+    """
     with _file_lock(path, timeout=timeout):
         yield
 
@@ -280,7 +290,10 @@ def normalize_oauth_account(value: Any) -> str:
     return text or DEFAULT_OAUTH_ACCOUNT
 
 
-CRED_FIELDS = ("user_id", "access_token", "cookie")
+# 凭据字段唯一来源：读取索引、归一化、持久化都从这里派生。
+# refresh_token 供 sub2api 纯 HTTP 续期使用（access_token 是短期 JWT，
+# refresh_token 有效期长得多，存下它就能免去为「token 过期」拉起浏览器）。
+CRED_FIELDS = ("user_id", "access_token", "refresh_token", "cookie")
 CONFIG_FIELDS = (
     "name",
     "base_url",
@@ -510,7 +523,27 @@ def _normalize_account_entry(entry: dict[str, Any]) -> dict[str, Any]:
         out["script_args"] = normalize_script_args(out.get("script_args"))
     if "script_timeout" in out:
         out["script_timeout"] = parse_script_timeout(out.get("script_timeout"))
+    # 存量登录态回填：refresh_token 字段是后加的，早先捕获的 browser_state 里
+    # 其实已经存了 localStorage 的 refresh_token，只是没提取到独立字段。不回填
+    # 会导致「明明有长期凭据，却因 access_token 过期而每次都要启动浏览器」。
+    if not str(out.get("refresh_token") or "").strip():
+        recovered = _refresh_token_from_state(str(out.get("browser_state") or ""))
+        if recovered:
+            out["refresh_token"] = recovered
     return out
+
+
+def _refresh_token_from_state(state_text: str) -> str:
+    """从 browser_state 的 localStorage 提取 refresh_token；失败返回空串。"""
+    if not state_text.strip():
+        return ""
+    try:
+        from browser.session import storage_refresh_token
+        from browser.state import decode_state
+
+        return storage_refresh_token(decode_state(state_text))
+    except Exception:
+        return ""
 
 
 def site_config_from_mapping(
@@ -539,6 +572,7 @@ def site_config_from_mapping(
         cookie=str(row.get("cookie") or ""),
         user_id=str(row.get("user_id") or row.get("new_api_user") or ""),
         access_token=str(row.get("access_token") or row.get("authorization") or ""),
+        refresh_token=str(row.get("refresh_token") or ""),
         cookie_file=str(row.get("cookie_file") or row.get("token_file") or ""),
         browser_state=str(row.get("browser_state") or ""),
         browser_profile=str(row.get("browser_profile") or ".browser_profile"),
@@ -735,64 +769,6 @@ def delete_oauth_state(provider: str, account: str = DEFAULT_OAUTH_ACCOUNT, path
     return True
 
 
-def load_accounts(path: Path | None = None) -> dict[str, dict[str, Any]]:
-    """读取 ACCOUNTS.json，返回 {匹配键 -> 凭据/状态}；同时建立 name 与 base_url 两套索引。
-    
-    注意：此函数返回索引格式，用于向后兼容。新代码应使用 load_unified_accounts()。
-    """
-    path = path or ACCOUNTS_PATH
-    if not path.exists():
-        return {}
-    raw = _read_json_file(path, what="accounts")
-
-    if isinstance(raw, dict) and "accounts" in raw:
-        raw = raw["accounts"]
-
-    entries: list[dict[str, Any]] = []
-    if isinstance(raw, dict):
-        for key, value in raw.items():
-            if key.startswith("_") or key == "oauth_states" or not isinstance(value, dict):
-                continue  # 跳过 _说明 / 顶层 oauth_states 之类的非账号键
-            entry = {"name": value.get("name") or key}
-            entry.update(value)
-            entries.append(entry)
-    elif isinstance(raw, list):
-        if any(not isinstance(item, dict) for item in raw):
-            raise ConfigError("accounts 数组中的每一项都必须是对象")
-        entries = list(raw)
-    else:
-        raise ConfigError("accounts 顶层必须是数组、对象映射或包含 accounts 的对象")
-
-    index: dict[str, dict[str, Any]] = {}
-    for entry in entries:
-        # 保留所有字段（含凭据 + 新正交三维站点配置字段）
-        cred: dict[str, Any] = {field: str(entry.get(field) or "") for field in CRED_FIELDS}
-        if "enabled" in entry:
-            cred["enabled"] = parse_enabled(entry.get("enabled"), True)
-        # 保留站点配置字段（新三维 + 旧字段兼容）
-        for field in CONFIG_FIELDS:
-            if field in entry:
-                cred[field] = entry[field]
-        name = _norm_key(str(entry.get("name") or ""))
-        base = _norm_key(normalize_base_url(str(entry.get("base_url") or "")))
-        if name:
-            index[f"name:{name}"] = cred
-        if base:
-            index[f"url:{base}"] = cred
-    return index
-
-
-def credentials_for(name: str, base_url: str, accounts: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    """按 name 优先、base_url 兜底，查出某站点的凭据/状态；查不到返回空凭据。"""
-    by_name = accounts.get(f"name:{_norm_key(name)}")
-    if by_name:
-        return by_name
-    by_url = accounts.get(f"url:{_norm_key(normalize_base_url(base_url))}")
-    if by_url:
-        return by_url
-    return {field: "" for field in CRED_FIELDS}
-
-
 def load_unified_accounts(path: Path | None = None, sites_path: Path | None = None) -> list[dict[str, Any]]:
     """读取统一账号配置；旧格式会从 sites.json 补全站点字段。
 
@@ -850,6 +826,7 @@ _PERSIST_ORDER = (
     "enabled",
     "user_id",
     "access_token",
+    "refresh_token",
     "cookie",
 )
 _PERSIST_OPTIONAL = (
@@ -1105,6 +1082,12 @@ def build_github_secret_payload(
         if auth_method == "access_token" and access_token:
             out["access_token"] = access_token
 
+        # refresh_token 与 auth_method 无关：sub2api 的 access_token 是短期 JWT，
+        # 只要存了 refresh_token，CI 里的纯 HTTP 路径就能自行续期而不必拉起浏览器。
+        refresh_token = str(row.get("refresh_token") or "").strip()
+        if refresh_token:
+            out["refresh_token"] = refresh_token
+
         cookie = str(row.get("cookie") or "").strip()
         if auth_method == "cookie" and cookie:
             out["cookie"] = cookie
@@ -1216,12 +1199,18 @@ def update_account_auth_data(
     base_url: str,
     access_token: str = "",
     browser_state: str = "",
+    refresh_token: str = "",
     path: Path | None = None,
 ) -> bool:
-    """按 name/base_url 更新 ACCOUNTS.json 中某站点的 token/state。"""
+    """按 name/base_url 更新 ACCOUNTS.json 中某站点的 token/state。
+
+    refresh_token 由浏览器捕获链路从 storage_state 提取后写入，供 sub2api
+    纯 HTTP 续期使用（避免每次 access_token 过期都拉起浏览器）。
+    """
     token = str(access_token or "").strip()
     state_text = str(browser_state or "").strip()
-    if not token and not state_text:
+    refresh = str(refresh_token or "").strip()
+    if not token and not state_text and not refresh:
         return False
     path = path or ACCOUNTS_PATH
     with _file_lock(path):
@@ -1239,6 +1228,9 @@ def update_account_auth_data(
         if state_text and str(entry.get("browser_state") or "").strip() != state_text:
             entry["browser_state"] = state_text
             changed = True
+        if refresh and str(entry.get("refresh_token") or "").strip() != refresh:
+            entry["refresh_token"] = refresh
+            changed = True
         if not changed:
             return False
         save_accounts(entries, path=path, oauth_states=load_oauth_states(path))
@@ -1250,14 +1242,19 @@ def update_account_access_token(
     base_url: str,
     access_token: str,
     path: Path | None = None,
+    refresh_token: str = "",
 ) -> bool:
     """按 name/base_url 更新 ACCOUNTS.json 中某站点的 access_token。
 
     用于 Sub2API 这类短期 JWT：浏览器刷新出新 token 后立即写回，
     避免下次自动签到继续使用过期 access_token。保留顶层 oauth_states。
+
+    refresh_token 非空时一并写回：服务端在 /auth/refresh 可能轮换 refresh_token，
+    旧值随即失效；不写回会导致下次纯 HTTP 续期失败并退化为启动浏览器。
     """
     token = str(access_token or "").strip()
-    if not token:
+    rotated = str(refresh_token or "").strip()
+    if not token and not rotated:
         return False
     path = path or ACCOUNTS_PATH
     with _file_lock(path):
@@ -1268,9 +1265,15 @@ def update_account_access_token(
         if index is None:
             return False
         entry = entries[index]
-        if str(entry.get("access_token") or "").strip() == token:
+        changed = False
+        if token and str(entry.get("access_token") or "").strip() != token:
+            entry["access_token"] = token
+            changed = True
+        if rotated and str(entry.get("refresh_token") or "").strip() != rotated:
+            entry["refresh_token"] = rotated
+            changed = True
+        if not changed:
             return False
-        entry["access_token"] = token
         save_accounts(entries, path=path, oauth_states=load_oauth_states(path))
     return True
 
