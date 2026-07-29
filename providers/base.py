@@ -174,6 +174,25 @@ def detail_quota_usd(detail: Any) -> float | None:
 
 
 @dataclass
+class RuntimeCredentialContext:
+    """运行期凭据解析上下文，不属于用户配置，也不得持久化或输出。
+
+    token_basis/state_basis 是 ACCOUNTS/Secret 中凭据种子的不可逆摘要。运行期刷新
+    产生的 token/browser_state 只有在 basis 与当前配置一致时才允许覆盖；用户更新
+    Secret 后摘要变化，旧 Actions cache 会被自动忽略。
+
+    explicit_fields 区分「未提供」和「显式清空」：GUI/CLI 明确传入的字段始终优先
+    于缓存，即使值是空字符串。cache_policy=ignore 用于父进程已解析凭据后的 worker，
+    防止子进程再次应用缓存。
+    """
+
+    token_basis: str = ""
+    state_basis: str = ""
+    explicit_fields: frozenset[str] = field(default_factory=frozenset)
+    cache_policy: str = "compatible"
+
+
+@dataclass
 class SiteConfig:
     """站点配置（正交三维 + 凭据 + 浏览器/网络参数）。"""
 
@@ -214,6 +233,12 @@ class SiteConfig:
     # TLS 证书校验开关。默认开启；仅当站点证书过期/自签名导致 CERTIFICATE_VERIFY_FAILED
     # 时，才在配置里显式设为 false 作为应急兜底（跳过校验有中间人风险，谨慎使用）。
     verify_ssl: bool = True
+    # 仅供运行期缓存解析/写回使用；不属于 ACCOUNTS/Secret 配置语义。
+    runtime_credentials: RuntimeCredentialContext = field(
+        default_factory=RuntimeCredentialContext,
+        repr=False,
+        compare=False,
+    )
 
 
 @dataclass

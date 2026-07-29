@@ -38,18 +38,19 @@ def has_refresh_state(site: SiteConfig) -> bool:
 
 
 def persist_access_token(site: SiteConfig, token: str) -> None:
-    """刷新出新 access_token 后尽力写回 ACCOUNTS.json。"""
+    """刷新出的短期 access_token 只写运行缓存，不改用户维护的 ACCOUNTS.json。"""
+    site.access_token = token
     try:
-        if accounts_store.update_account_access_token(site.name, site.base_url, token):
-            site.access_token = token
-    except (OSError, accounts_store.ConfigError):
-        # 持久化失败（文件锁超时/损坏/IO 错误）不应影响本次签到；
-        # 本次内存 token 仍可继续使用。
-        site.access_token = token
+        from .. import token_cache
+
+        token_cache.save_site_tokens(site, token)
+    except Exception:
+        # 缓存写失败不影响本次签到；内存 token 已更新，可继续完成当前请求。
+        pass
 
 
 def persist_refreshed_auth(site: SiteConfig, auth: AuthInfo) -> None:
-    """把浏览器刷新出的认证（access_token 或 cookie）尽力写回 ACCOUNTS.json。"""
+    """把浏览器刷新出的认证同步到内存/运行缓存。"""
     if auth.access_token:
         persist_access_token(site, auth.access_token)
 

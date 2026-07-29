@@ -189,3 +189,42 @@ def test_export_skips_disabled_accounts() -> None:
         [_sub2api_browser_account(access_token="at", enabled=False)]
     )
     assert payload["accounts"] == []
+
+
+def test_export_keeps_non_default_runtime_options() -> None:
+    payload = accounts_store.build_github_secret_payload(
+        [
+            _sub2api_browser_account(
+                access_token="at",
+                verify_ssl=False,
+                referer_path="/console",
+                auto_refresh_cookie=False,
+            )
+        ]
+    )
+    exported = payload["accounts"][0]
+    assert exported["verify_ssl"] is False
+    assert exported["referer_path"] == "/console"
+    assert exported["auto_refresh_cookie"] is False
+
+    restored = accounts_store.configured_site_from_mapping(exported)
+    assert restored.verify_ssl is False
+    assert restored.referer_path == "/console"
+    assert restored.auto_refresh_cookie is False
+
+
+def test_export_omits_default_runtime_options() -> None:
+    payload = accounts_store.build_github_secret_payload(
+        [
+            _sub2api_browser_account(
+                access_token="at",
+                verify_ssl=True,
+                referer_path="/profile",
+                auto_refresh_cookie=True,
+            )
+        ]
+    )
+    exported = payload["accounts"][0]
+    assert "verify_ssl" not in exported
+    assert "referer_path" not in exported
+    assert "auto_refresh_cookie" not in exported

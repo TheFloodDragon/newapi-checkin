@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 import accounts_store
+import time_utils
 from config import Timeouts, OutputConfig
 from mask_utils import mask_secrets, sanitize_data
 from providers import base as providers_base
@@ -101,7 +102,9 @@ def build_site_tasks() -> list[CheckinTask]:
 
     tasks: list[CheckinTask] = []
     for site in sites:
-        site_config = accounts_store.site_config_from_mapping(site)
+        # 父进程统一解析配置 + 兼容缓存；子 worker 收到的是最终运行凭据，
+        # 并通过 CHECKIN_CACHE_POLICY=ignore 禁止再次叠加缓存。
+        site_config = accounts_store.runtime_site_from_mapping(site)
         base_url = site_config.base_url
         if not base_url:
             continue
@@ -134,10 +137,10 @@ def build_site_tasks() -> list[CheckinTask]:
             if script:
                 command.extend(["--script", script])
             command.extend(["--script-timeout", str(accounts_store.parse_script_timeout(site.get("script_timeout")))])
-        cookie_file = str(site.get("cookie_file") or site.get("token_file") or "").strip()
-        cookie = str(site.get("cookie") or "").strip()
-        access_token = str(site.get("access_token") or site.get("authorization") or "").strip()
-        user_id = str(site.get("user_id") or site.get("new_api_user") or "").strip()
+        cookie_file = site_config.cookie_file.strip()
+        cookie = site_config.cookie.strip()
+        access_token = site_config.access_token.strip()
+        user_id = site_config.user_id.strip()
 
         if cookie_file:
             command.extend(["--token-file", cookie_file])
@@ -156,7 +159,7 @@ def build_site_tasks() -> list[CheckinTask]:
             env_values["CHECKIN_ACCESS_TOKEN"] = access_token
         # refresh_token 让 sub2api 站点在 access_token 过期时纯 HTTP 续期，
         # 不必为此启动浏览器；与 token 同级敏感，同样只走环境变量。
-        refresh_token = str(site.get("refresh_token") or "").strip()
+        refresh_token = site_config.refresh_token.strip()
         if refresh_token:
             env_values["CHECKIN_REFRESH_TOKEN"] = refresh_token
         if user_id:
@@ -195,10 +198,13 @@ def build_site_tasks() -> list[CheckinTask]:
             if auth_method == "oauth":
                 browser_state = accounts_store.oauth_state_text(oauth_provider, oauth_account).strip()
             else:
-                browser_state = str(site.get("browser_state") or "").strip()
+                browser_state = site_config.browser_state.strip()
             if browser_state:
                 env_values["CHECKIN_BROWSER_STATE"] = browser_state
 
+        # 凭据已在父进程按配置 basis 解析完，子 worker 必须禁止再次读 token_cache，
+        # 否则同一任务会经过两套优先级判断，显式空值也可能被旧缓存回填。
+        env_values["CHECKIN_CACHE_POLICY"] = "ignore"
         env = env_values or None
         # Browser-driven flows (browser/oauth login, relogin,
         # custom browser scripts) can spend minutes on WAF solving + navigation,
@@ -665,7 +671,8 @@ def write_result_file(summaries: list[dict[str, Any]]) -> None:
     success_count = sum(1 for item in summaries if item["status"] == "success")
     already_done_count = sum(1 for item in summaries if item["status"] == "already_done")
     payload = sanitize_data({
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "generated_at": time_utils.utc_iso(),
+        "business_date": time_utils.business_date(),
         "total": len(summaries),
         "success_count": success_count,
         "already_done_count": already_done_count,

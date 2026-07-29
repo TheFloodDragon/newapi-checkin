@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from providers.actions import api
+from providers import token_cache
+from providers.actions import _common, api
 from providers.base import (
     ApiError,
     AuthInfo,
@@ -198,3 +199,21 @@ def test_browser_auth_error_status_and_detail_are_preserved(query: bool) -> None
     assert result.detail is detail
     assert profile.refresh_calls == 1
     assert profile.build_calls == 0
+
+
+def test_refreshed_access_token_only_writes_runtime_cache(monkeypatch) -> None:
+    site = _site("browser")
+
+    def should_not_write_accounts(*_args, **_kwargs):
+        raise AssertionError("运行期 token 不得写回 ACCOUNTS.json")
+
+    monkeypatch.setattr(
+        _common.accounts_store,
+        "update_account_access_token",
+        should_not_write_accounts,
+    )
+
+    _common.persist_access_token(site, "fresh-token")
+
+    assert site.access_token == "fresh-token"
+    assert token_cache.load_tokens(site.name, site.base_url)["access_token"] == "fresh-token"

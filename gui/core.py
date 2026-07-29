@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import sys
 import traceback
+import uuid
 from copy import deepcopy
 from dataclasses import dataclass, field, fields, replace
 from datetime import datetime
@@ -22,6 +23,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import accounts_store
+import time_utils
 from config import Timeouts as _Timeouts
 from mask_utils import mask_secrets
 
@@ -178,6 +180,8 @@ def can_optional_oauth(site_type: str, checkin_action: str, auth_method: str) ->
 # ── 行模型 ────────────────────────────────────────────────────────────────────
 @dataclass
 class SiteRow:
+    # 仅当前 GUI 进程使用的稳定身份；不写入 ACCOUNTS/Secret/状态快照。
+    runtime_id: str = field(default_factory=lambda: uuid.uuid4().hex, repr=False, compare=False)
     name: str = ""
     base_url: str = ""
     type: str = "newapi"
@@ -218,11 +222,19 @@ class SiteRow:
         return effective_auth(self.checkin_action, self.auth_method)
 
     def copy(self) -> "SiteRow":
-        return replace(self, script_args=dict(self.script_args))
+        return replace(
+            self,
+            runtime_id=uuid.uuid4().hex,
+            script_args=dict(self.script_args),
+        )
 
     def to_legacy(self) -> dict[str, Any]:
         """旧版 GUI 行字典形态（accounts_store.build_github_secret_payload 消费）。"""
-        out = {f.name: getattr(self, f.name) for f in fields(self)}
+        out = {
+            f.name: getattr(self, f.name)
+            for f in fields(self)
+            if f.name != "runtime_id"
+        }
         out["script_args"] = dict(self.script_args)
         out["site_profile"] = self.type
         return out
@@ -312,7 +324,12 @@ def normalized_fallback(row: SiteRow) -> tuple[str, str]:
 
 
 # ── 任务参数装配（唯一实现；旧版三处手写 dict）───────────────────────────────
-def task_params(row: SiteRow, oauth_states: dict[str, Any]) -> dict[str, Any]:
+def task_params(
+    row: SiteRow,
+    oauth_states: dict[str, Any],
+    *,
+    explicit_credential_fields: set[str] | frozenset[str] = frozenset(),
+) -> dict[str, Any]:
     auth = row.auth
     oauth_provider = accounts_store.normalize_oauth_provider(row.oauth_provider) or "linuxdo"
     oauth_account = accounts_store.normalize_oauth_account(row.oauth_account)
@@ -349,6 +366,13 @@ def task_params(row: SiteRow, oauth_states: dict[str, Any]) -> dict[str, Any]:
         "referer_path": row.referer_path.strip() or _REFERER_PATH_DEFAULT,
         "browser_profile": row.browser_profile.strip() or _BROWSER_PROFILE_DEFAULT,
         "auto_refresh_cookie": bool(row.auto_refresh_cookie),
+        # GUI 未保存的显式输入（含显式清空）必须赢过运行缓存；worker 构造
+        # SiteConfig 前会消费并移除这个内部字段，不进入配置/日志/结果。
+        "_explicit_credential_fields": sorted(
+            field
+            for field in explicit_credential_fields
+            if field in {"access_token", "refresh_token", "browser_state"}
+        ),
     }
 
 
@@ -557,6 +581,33 @@ def config_snapshot(rows: list[SiteRow], oauth_states: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
+def credential_snapshot(row: SiteRow) -> dict[str, str]:
+    """GUI 成功保存时的凭据基线；用对象 id 关联，仅在当前进程内存在。"""
+    return {
+        "name": row.name.strip(),
+        "base_url": accounts_store.normalize_base_url(row.base_url),
+        "access_token": row.access_token.strip(),
+        "refresh_token": row.refresh_token.strip(),
+        "browser_state": row.browser_state.strip(),
+    }
+
+
+def credential_snapshots(rows: list[SiteRow]) -> dict[int, dict[str, str]]:
+    return {id(row): credential_snapshot(row) for row in rows}
+
+
+def changed_credential_fields(row: SiteRow, saved: dict[str, str] | None) -> set[str]:
+    """返回相对上次成功保存真正变化的凭据字段（空值变化也保留）。"""
+    current = credential_snapshot(row)
+    if saved is None:
+        return {"access_token", "refresh_token", "browser_state"}
+    return {
+        field
+        for field in ("access_token", "refresh_token", "browser_state")
+        if current[field] != str(saved.get(field) or "")
+    }
+
+
 def validate_rows(rows: list[SiteRow]) -> str | None:
     """保存前校验；返回错误文案，None 表示通过。"""
     for row in rows:
@@ -662,30 +713,70 @@ def persist_accounts(rows: list[SiteRow]) -> list[dict[str, Any]]:
     return accts
 
 
-def reconcile_token_cache(rows: list[SiteRow]) -> int:
-    """保存配置后，清掉与用户手填凭据冲突的运行期缓存条目；返回清理条数。
+def apply_credential_cache_changes(
+    rows: list[SiteRow],
+    saved_credentials: dict[int, dict[str, str]],
+) -> int:
+    """保存成功后按真实字段变化清理缓存；token/state 两组互不误伤。
 
-    读取时缓存优先（缓存里一般是刚续期出的新 token）。但用户刚手工粘贴凭据时这条
-    规则会反过来伤人：旧缓存把新填的值盖掉，表面上就是「填了有效 token 仍说没有」。
-    因此保存时做一次对账，冲突即清缓存，让手填值立刻生效。
+    使用对象 id 关联当前会话中的保存基线，名称/URL 改动也能找到旧身份并清理旧
+    缓存。新行会清理目标身份上的遗留缓存，防止重新创建同名渠道时继承旧凭据。
+    返回发生变化的缓存条目/字段组数量；失败不影响配置保存。
     """
-    cleared = 0
-    for row in rows:
-        access = row.access_token.strip()
-        refresh = row.refresh_token.strip()
-        if not access and not refresh:
-            continue
-        try:
-            from providers import token_cache
+    try:
+        from providers import token_cache
+    except Exception:
+        return 0
 
-            if token_cache.reconcile_with_config(
-                row.name, accounts_store.normalize_base_url(row.base_url), access, refresh
-            ):
-                cleared += 1
-        except Exception:
-            # 缓存只是加速产物：对账失败不该阻断配置保存。
+    changed = 0
+    current_ids = {id(row) for row in rows}
+
+    # 已删除的行：清理旧身份，避免以后重建同名渠道继承运行凭据。
+    for row_id, old in saved_credentials.items():
+        if row_id in current_ids:
             continue
-    return cleared
+        if token_cache.clear_tokens(old.get("name", ""), old.get("base_url", "")):
+            changed += 1
+
+    for row in rows:
+        current = credential_snapshot(row)
+        old = saved_credentials.get(id(row))
+        current_name = current["name"]
+        current_base = current["base_url"]
+        if old is None:
+            if token_cache.invalidate_fields(
+                current_name, current_base,
+                {"access_token", "refresh_token", "browser_state"},
+            ):
+                changed += 1
+            continue
+
+        old_identity = (old.get("name", ""), old.get("base_url", ""))
+        current_identity = (current_name, current_base)
+        if old_identity != current_identity:
+            if token_cache.clear_tokens(*old_identity):
+                changed += 1
+            if token_cache.invalidate_fields(
+                current_name, current_base,
+                {"access_token", "refresh_token", "browser_state"},
+            ):
+                changed += 1
+            continue
+
+        fields = changed_credential_fields(row, old)
+        invalidate: set[str] = set()
+        if fields & {"access_token", "refresh_token"}:
+            invalidate.update({"access_token", "refresh_token"})
+        if "browser_state" in fields:
+            invalidate.add("browser_state")
+        if invalidate and token_cache.invalidate_fields(current_name, current_base, invalidate):
+            changed += 1
+    return changed
+
+
+def reconcile_token_cache(rows: list[SiteRow]) -> int:
+    """旧调用兼容：把当前所有凭据视作显式变化，按字段组失效缓存。"""
+    return apply_credential_cache_changes(rows, {})
 
 
 # ── 剪贴板导入 / 凭据导出 ────────────────────────────────────────────────────
@@ -758,17 +849,33 @@ def failure_toast(status: str, message: str) -> str:
 
 
 # ── 状态缓存（批量结果 + GUI 实时结果按 saved_at 合并）────────────────────────
+def _is_newer(candidate: Any, existing: Any) -> bool:
+    """比较两个时间戳的真实先后。
+
+    此前直接按字符串比较，但 CI 写 Asia/Shanghai、GUI 写用户本地时区，且都不带
+    时区偏移，字典序不等于时间顺序。解析失败时保守视为「不更新」。
+    """
+    left = time_utils.parse_timestamp(candidate)
+    right = time_utils.parse_timestamp(existing)
+    if left is None:
+        return False
+    if right is None:
+        return True
+    return left > right
+
+
 class StatusStore:
     """站点状态缓存：内存字典 + 双文件（checkin_result / gui_status_cache）合并落盘。"""
 
     def __init__(self, results_dir: Path | None = None):
         self.results_dir = results_dir or accounts_store.RESULTS_DIR
         self.entries: dict[str, dict[str, Any]] = {}
+        self.today = time_utils.business_date()
 
     @staticmethod
     def status_key(row: SiteRow) -> str:
         base = accounts_store.normalize_base_url(row.base_url)
-        return f"{base}|{row.name}"
+        return f"{base}|{(row.name or '').strip()}"
 
     @staticmethod
     def task_key(row: SiteRow) -> str:
@@ -799,9 +906,24 @@ class StatusStore:
 
     # -- 加载 --
     def load(self) -> None:
+        """加载状态缓存；只接受属于业务时区「今天」的条目。
+
+        昨日的 checked_in/ok/status 如果继续加载，GUI 概览会把过期结果当成今日已完成
+        （实测跨日后仍显示「今日已签到」，直到手工刷新）。时间戳无法解析时同样视为
+        过期，避免旧格式数据造成错误结论。
+        """
         self.entries = {}
+        self.today = time_utils.business_date()
         self._load_batch_results()
         self._merge_gui_cache()
+
+    def _is_today(self, entry: dict[str, Any]) -> bool:
+        stamp = str(entry.get("business_date") or "").strip()
+        if stamp:
+            return stamp == getattr(self, "today", time_utils.business_date())
+        return time_utils.business_date_of(entry.get("saved_at")) == getattr(
+            self, "today", time_utils.business_date()
+        )
 
     def _load_batch_results(self) -> None:
         path = self.results_dir / "checkin_result.json"
@@ -811,7 +933,10 @@ class StatusStore:
             payload = json.loads(path.read_text(encoding="utf-8-sig"))
             rows = payload.get("results", []) if isinstance(payload, dict) else []
             saved_at = str(payload.get("generated_at") or "") if isinstance(payload, dict) else ""
+            business_day = str(payload.get("business_date") or "") if isinstance(payload, dict) else ""
         except Exception:
+            return
+        if not self._is_today({"saved_at": saved_at, "business_date": business_day}):
             return
         for item in rows:
             if not isinstance(item, dict):
@@ -837,6 +962,7 @@ class StatusStore:
                 "message": item.get("note") or item.get("message") or "",
                 "cached": True,
                 "saved_at": saved_at,
+                "business_date": business_day or time_utils.business_date_of(saved_at),
             }
 
     def _merge_gui_cache(self) -> None:
@@ -853,8 +979,10 @@ class StatusStore:
         for key, entry in entries.items():
             if not isinstance(entry, dict):
                 continue
+            if not self._is_today(entry):
+                continue
             existing = self.entries.get(key)
-            if existing is not None and str(entry.get("saved_at") or "") <= str(existing.get("saved_at") or ""):
+            if existing is not None and not _is_newer(entry.get("saved_at"), existing.get("saved_at")):
                 continue
             self.entries[key] = {
                 "quota_usd": entry.get("quota_usd"),
@@ -867,6 +995,8 @@ class StatusStore:
                 "message": str(entry.get("message") or ""),
                 "cached": True,
                 "saved_at": str(entry.get("saved_at") or ""),
+                "business_date": str(entry.get("business_date") or "")
+                or time_utils.business_date_of(entry.get("saved_at")),
             }
 
     # -- 更新 --
@@ -887,7 +1017,8 @@ class StatusStore:
             "message": message,
             "detail": result.get("detail"),
             "cached": False,
-            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "saved_at": time_utils.utc_iso(),
+            "business_date": time_utils.business_date(),
         }
         self.entries[key] = entry
         self.save()
@@ -913,7 +1044,8 @@ class StatusStore:
             "status": status,
             "message": message,
             "cached": False,
-            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "saved_at": time_utils.utc_iso(),
+            "business_date": time_utils.business_date(),
         }
         self.entries[key] = entry
         self.save()
@@ -923,10 +1055,17 @@ class StatusStore:
     def save(self) -> None:
         path = self.results_dir / "gui_status_cache.json"
         entries: dict[str, Any] = {}
+        today = getattr(self, "today", time_utils.business_date())
         for key, status in self.entries.items():
             if not isinstance(status, dict):
                 continue
             if status.get("quota_usd") is None and status.get("last_quota_usd") is None and not status.get("status"):
+                continue
+            business_day = str(status.get("business_date") or "") or time_utils.business_date_of(
+                status.get("saved_at")
+            )
+            # 顺手剔除过期条目：否则昨日状态会一直留在文件里，下次启动又被过滤一遍。
+            if business_day and business_day != today:
                 continue
             entries[key] = {
                 "quota_usd": status.get("quota_usd"),
@@ -936,6 +1075,7 @@ class StatusStore:
                 "status": str(status.get("status") or ""),
                 "message": str(status.get("message") or ""),
                 "saved_at": str(status.get("saved_at") or ""),
+                "business_date": business_day,
             }
         try:
             self.results_dir.mkdir(parents=True, exist_ok=True)
@@ -944,6 +1084,97 @@ class StatusStore:
         except Exception:
             # 持久化失败不影响 GUI 运行。
             pass
+
+
+# ── 稳定任务身份 / 站点租约 ──────────────────────────────────────────────────
+@dataclass(frozen=True)
+class TaskSnapshot:
+    row_id: str
+    name: str
+    base_url: str
+    status_key: str
+    channel_key: str
+    site_group_key: str
+    params: dict[str, Any]
+
+
+def make_task_snapshot(
+    row: SiteRow,
+    oauth_states: dict[str, Any],
+    *,
+    explicit_credential_fields: set[str] | frozenset[str] = frozenset(),
+) -> TaskSnapshot:
+    return TaskSnapshot(
+        row_id=row.runtime_id,
+        name=row.name.strip() or "未命名站点",
+        base_url=accounts_store.normalize_base_url(row.base_url),
+        status_key=StatusStore.status_key(row),
+        channel_key=StatusStore.task_key(row),
+        site_group_key=StatusStore.site_group_key(row),
+        params=task_params(
+            row,
+            oauth_states,
+            explicit_credential_fields=explicit_credential_fields,
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class TaskLease:
+    token: str
+    site_key: str
+    channel_keys: frozenset[str]
+
+
+class TaskLeaseRegistry:
+    """统一单签/批量的站点级租约；状态归属仍按渠道 key 区分。"""
+
+    def __init__(self) -> None:
+        self._sites: dict[str, str] = {}
+        self._channels: dict[str, str] = {}
+
+    def acquire(self, site_key: str, channel_keys: set[str] | frozenset[str]) -> TaskLease | None:
+        site = str(site_key or "").strip()
+        channels = frozenset(str(key or "").strip() for key in channel_keys if str(key or "").strip())
+        if not site or not channels:
+            return None
+        if site in self._sites or any(key in self._channels for key in channels):
+            return None
+        token = uuid.uuid4().hex
+        self._sites[site] = token
+        for key in channels:
+            self._channels[key] = token
+        return TaskLease(token=token, site_key=site, channel_keys=channels)
+
+    def acquire_single(self, row: SiteRow) -> TaskLease | None:
+        return self.acquire(StatusStore.site_group_key(row), {StatusStore.task_key(row)})
+
+    def acquire_group(self, snapshots: list[TaskSnapshot]) -> TaskLease | None:
+        if not snapshots:
+            return None
+        return self.acquire(
+            snapshots[0].site_group_key,
+            {snapshot.channel_key for snapshot in snapshots},
+        )
+
+    def release(self, lease: TaskLease | None) -> bool:
+        if lease is None or self._sites.get(lease.site_key) != lease.token:
+            return False
+        self._sites.pop(lease.site_key, None)
+        for key in lease.channel_keys:
+            if self._channels.get(key) == lease.token:
+                self._channels.pop(key, None)
+        return True
+
+    def is_channel_running(self, channel_key: str) -> bool:
+        return str(channel_key or "").strip() in self._channels
+
+    def is_site_running(self, site_key: str) -> bool:
+        return str(site_key or "").strip() in self._sites
+
+    @property
+    def running_channels(self) -> int:
+        return len(self._channels)
 
 
 # ── 概览统计 ─────────────────────────────────────────────────────────────────

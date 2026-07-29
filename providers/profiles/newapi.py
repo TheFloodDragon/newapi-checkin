@@ -343,7 +343,7 @@ class NewApiProfile(SiteProfile):
         if refreshed_state and refreshed_state != state_text:
             try:
                 from .. import token_cache
-                token_cache.save_browser_state(site.name, site.base_url, refreshed_state)
+                token_cache.save_site_browser_state(site, refreshed_state)
             except Exception:
                 pass
             site.browser_state = refreshed_state

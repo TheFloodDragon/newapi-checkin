@@ -83,16 +83,25 @@ def test_task_key_is_per_channel_not_per_site() -> None:
     assert core.StatusStore.site_group_key(a) == core.StatusStore.site_group_key(b)
 
 
-def test_locking_one_channel_leaves_siblings_runnable() -> None:
-    """锁住一个渠道后，同址的其他渠道仍必须可执行（回归本次修复的核心症状）。"""
+def test_locking_one_channel_blocks_siblings_on_same_site() -> None:
+    """站点级资源独占：同址渠道全部保留但不得并发。
+
+    渠道 key 仍然区分状态归属（避免结果互相覆盖），而站点租约保证同一 base_url
+    只有一个任务在跑，与 run__all_checkin 的 site_locks 语义一致。
+    """
     rows = [
         _row("渠道1", "https://multi.invalid"),
         _row("渠道2", "https://multi.invalid"),
         _row("渠道3", "https://multi.invalid"),
     ]
-    running = {core.StatusStore.task_key(rows[0])}
-    runnable = [r.name for r in rows if core.StatusStore.task_key(r) not in running]
-    assert runnable == ["渠道2", "渠道3"]
+    registry = core.TaskLeaseRegistry()
+    lease = registry.acquire_single(rows[0])
+
+    assert lease is not None
+    assert [r.name for r in rows[1:] if registry.acquire_single(r) is None] == ["渠道2", "渠道3"]
+    # 释放后其余渠道依次可执行，不会丢任务
+    registry.release(lease)
+    assert registry.acquire_single(rows[1]) is not None
 
 
 # ── refresh_token 状态提示 ───────────────────────────────────────────────────

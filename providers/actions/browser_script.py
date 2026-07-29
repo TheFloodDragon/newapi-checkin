@@ -140,7 +140,7 @@ def _persist_tokens(
     rotated = str(refresh_token or "").strip()
     if not token and not rotated:
         return False
-    saved = token_cache.save_tokens(site.name, site.base_url, token, rotated)
+    saved = token_cache.save_site_tokens(site, token, rotated)
     if token:
         site.access_token = token
     if rotated:
@@ -151,6 +151,86 @@ def _persist_tokens(
         except Exception:
             pass
     return saved
+
+
+def _renew_access_token(site: SiteConfig, profile: SiteProfile, reason: str) -> str:
+    """token 完全缺失时主动用 refresh_token 续期；已有 token 的 401 由 client 处理。"""
+    base_url = normalize_base_url(site.base_url)
+    refresh_http = getattr(profile, "refresh_token_via_http", None)
+    if not callable(refresh_http):
+        _api_log(site, f"{reason}，但站点适配器（{type(profile).__name__}）不支持纯 HTTP 续期")
+        return ""
+    configured = str(getattr(site, "refresh_token", "") or "").strip()
+    if not configured:
+        _api_log(
+            site,
+            f"{reason}，但未配置 refresh_token（{base_url}）——"
+            "请在管理界面「浏览器登录捕获」或手工填写 Refresh Token",
+        )
+        return ""
+    _api_log(site, f"{reason}，尝试用 refresh_token 纯 HTTP 续期（{base_url}，rt {len(configured)} 字符）")
+    try:
+        pair = refresh_http(site, log=lambda m: _api_log(site, m)) or {}
+    except Exception as exc:
+        _api_log(site, f"refresh_token 续期异常（{base_url}）：{type(exc).__name__}: {exc}")
+        return ""
+    renewed = normalize_access_token(str(pair.get("access_token") or ""))
+    if not renewed:
+        _api_log(site, f"refresh_token 续期未成功（{base_url}），将降级到账密登录 / 浏览器脚本")
+        return ""
+    _persist_tokens(
+        site,
+        renewed,
+        str(pair.get("refresh_token") or "").strip(),
+        log=lambda m: _api_log(site, m),
+    )
+    return renewed
+
+
+def _api_result_detail(client: Any, stage: str, *, status: Any = None, reward: Any = None) -> dict[str, Any]:
+    """构造 API-first 标准 detail，并尽力补齐当前余额。"""
+    is_usd = bool(getattr(client, "quota_is_usd", False))
+    detail: dict[str, Any] = {
+        "checkin_source": "api",
+        "api_first": True,
+        "api_stage": stage,
+        "quota_is_usd": is_usd,
+    }
+    status_quota = getattr(status, "quota_usd", None) if status is not None else None
+    if isinstance(status_quota, (int, float)):
+        # StatusInfo.quota_usd 已经是美元，必须覆盖单位标记。
+        detail["current_quota"] = status_quota
+        detail["quota_is_usd"] = True
+        return detail
+    reward_quota = getattr(reward, "current_quota", None) if reward is not None else None
+    if reward_quota is not None:
+        detail["current_quota"] = reward_quota
+        return detail
+    try:
+        user = client.fetch_user()
+    except Exception:
+        return detail
+    quota_raw = getattr(user, "quota_raw", None)
+    if quota_raw is not None:
+        detail["current_quota"] = quota_raw
+    return detail
+
+
+def _already_done_result(
+    site: SiteConfig,
+    client: Any,
+    stage: str,
+    *,
+    status: Any = None,
+    reward: Any = None,
+) -> CheckinResult:
+    return CheckinResult(
+        site.name,
+        normalize_base_url(site.base_url),
+        "already_done",
+        "今日已签到。",
+        detail=_api_result_detail(client, stage, status=status, reward=reward),
+    )
 
 
 def _try_api_checkin(site: SiteConfig, profile: SiteProfile) -> CheckinResult | None:
@@ -193,17 +273,14 @@ def _try_api_checkin(site: SiteConfig, profile: SiteProfile) -> CheckinResult | 
                 + (f"${quota:.2f}" if isinstance(quota, (int, float)) else "未知"),
             )
             if checked:
-                return CheckinResult(
-                    site.name, base_url, "already_done", "今日已签到。",
-                    detail={"checkin_source": "api", "api_first": True, "api_stage": stage},
-                )
+                return _already_done_result(site, client, stage, status=status)
 
         _api_log(site, f"[{stage}] 调用签到接口...")
         reward = client.do_checkin("")
-        detail = {"checkin_source": "api", "api_first": True, "api_stage": stage}
+        detail = _api_result_detail(client, stage, status=status, reward=reward)
         if getattr(reward, "already_done", False):
             _api_log(site, f"[{stage}] 接口返回今日已签到")
-            return CheckinResult(site.name, base_url, "already_done", "今日已签到。", detail=detail)
+            return _already_done_result(site, client, stage, status=status, reward=reward)
         raw = getattr(reward, "raw", None)
         if isinstance(raw, dict) and raw.get("unsupported_checkin"):
             _api_log(site, f"[{stage}] 站点无可用签到端点，交给浏览器脚本")
@@ -232,50 +309,10 @@ def _try_api_checkin(site: SiteConfig, profile: SiteProfile) -> CheckinResult | 
             site.name, base_url, "success", "签到成功（站点未返回本次获得额度）。", detail=detail,
         )
 
-    def _renew_via_refresh(reason: str) -> str:
-        """用 refresh_token 做纯 HTTP 续期，返回新 access_token（失败返回空串）。
-
-        两处都要用：token 完全缺失时（占位/被清空），以及 token 已过期时。
-        之前只在「完全缺失」时调用，导致「token 过期但 refresh_token 有效」这一
-        最常见情形被跳过——第 1 级用的是裸 token 客户端（无 refresher），过期即
-        失败，明明有效的 refresh_token 从未被使用，直接退化成开浏览器。
-        """
-        refresh_http = getattr(profile, "refresh_token_via_http", None)
-        if not callable(refresh_http):
-            _api_log(site, f"{reason}，但站点适配器（{type(profile).__name__}）不支持纯 HTTP 续期")
-            return ""
-        configured = str(getattr(site, "refresh_token", "") or "").strip()
-        if not configured:
-            # 明确指出「为什么没续期」：以前这里静默 return，日志上看不出是
-            # 没配 refresh_token 还是续期失败，两者的处理方式完全不同。
-            _api_log(
-                site,
-                f"{reason}，但未配置 refresh_token（{base_url}）——"
-                "请在管理界面「浏览器登录捕获」或手工填写 Refresh Token",
-            )
-            return ""
-        _api_log(site, f"{reason}，尝试用 refresh_token 纯 HTTP 续期（{base_url}，rt {len(configured)} 字符）")
-        try:
-            pair = refresh_http(site, log=lambda m: _api_log(site, m)) or {}
-        except Exception as exc:
-            _api_log(site, f"refresh_token 续期异常（{base_url}）：{type(exc).__name__}: {exc}")
-            return ""
-        renewed = normalize_access_token(str(pair.get("access_token") or ""))
-        if not renewed:
-            # profile 侧已用 log 回调打过服务端判据（状态码 / reason），这里补出
-            # 站点与后续动作，让「下一步该做什么」在同一行日志里可见。
-            _api_log(
-                site,
-                f"refresh_token 续期未成功（{base_url}），将降级到账密登录 / 浏览器脚本",
-            )
-            return ""
-        _persist_tokens(site, renewed, str(pair.get("refresh_token") or "").strip(),
-                        log=lambda m: _api_log(site, m))
-        return renewed
-
-    # ── 第 0 级：完全没有可用 access_token 时，先用 refresh_token 换一个 ──
+    # ── 第 0 级：完全没有可用 access_token 时，主动用 refresh_token 换一个 ──
+    # 已有 token 的 401 由 Sub2ApiClient 内部最多续期一次；外层不再重复轮换。
     if not token:
-        token = _renew_via_refresh("无可用 access_token")
+        token = _renew_access_token(site, profile, "无可用 access_token")
 
     # ── 第 1 级：已配置的 access_token（含 refresh_token 纯 HTTP 续期）──
     if token:
@@ -294,10 +331,7 @@ def _try_api_checkin(site: SiteConfig, profile: SiteProfile) -> CheckinResult | 
             kind = profile.classify(exc) if hasattr(profile, "classify") else "error"
             if kind == "already_done":
                 _api_log(site, "接口返回今日已签到")
-                return CheckinResult(
-                    site.name, base_url, "already_done", "今日已签到。",
-                    detail={"checkin_source": "api", "api_first": True, "api_stage": "token"},
-                )
+                return _already_done_result(site, client, "token")
             _api_log(site, f"token 阶段未能完成（{kind}）：{_describe_failure(exc)}")
         except Exception as exc:
             _api_log(site, f"token 阶段异常：{type(exc).__name__}: {exc}")
@@ -305,28 +339,6 @@ def _try_api_checkin(site: SiteConfig, profile: SiteProfile) -> CheckinResult | 
         # 说明「为什么没有 token」：配置留空、值损坏（非 ASCII/占位）还是被清掉，
         # 排查时结论完全不同。以前只有一句「未配置」，无法区分。
         _api_log(site, f"跳过 token 阶段：{_describe_missing_token(site)}")
-
-    # ── 第 1.5 级：token 过期但 refresh_token 可能仍有效 → 纯 HTTP 续期后重试 ──
-    # 这是实测中最常见的情形（access_token 只有几小时有效期），必须在动用账密
-    # 之前先试，否则等于浪费一个长期有效的凭据。
-    if token:
-        renewed = _renew_via_refresh("token 已失效")
-        if renewed and renewed != token:
-            token = renewed
-            try:
-                result = _attempt(build_client(site, AuthInfo(access_token=token)), "refresh")
-                if result is not None:
-                    return result
-            except ApiError as exc:
-                kind = profile.classify(exc) if hasattr(profile, "classify") else "error"
-                if kind == "already_done":
-                    return CheckinResult(
-                        site.name, base_url, "already_done", "今日已签到。",
-                        detail={"checkin_source": "api", "api_first": True, "api_stage": "refresh"},
-                    )
-                _api_log(site, f"refresh 阶段未能完成（{kind}）：{_describe_failure(exc)}")
-            except Exception as exc:
-                _api_log(site, f"refresh 阶段异常：{type(exc).__name__}: {exc}")
 
     # ── 第 2 级：纯 HTTP 账密登录换新 token（站点未启 Turnstile 时可行）──
     login = getattr(profile, "http_password_login", None)
@@ -343,17 +355,15 @@ def _try_api_checkin(site: SiteConfig, profile: SiteProfile) -> CheckinResult | 
             new_refresh = str((fresh or {}).get("refresh_token") or "").strip()
             # 写入运行期缓存（不动 ACCOUNTS.json），让下次运行可直接复用。
             _persist_tokens(site, new_token, new_refresh, log=lambda m: _api_log(site, m))
+            password_client = build_client(site, AuthInfo(access_token=new_token))
             try:
-                result = _attempt(build_client(site, AuthInfo(access_token=new_token)), "password")
+                result = _attempt(password_client, "password")
                 if result is not None:
                     return result
             except ApiError as exc:
                 kind = profile.classify(exc) if hasattr(profile, "classify") else "error"
                 if kind == "already_done":
-                    return CheckinResult(
-                        site.name, base_url, "already_done", "今日已签到。",
-                        detail={"checkin_source": "api", "api_first": True, "api_stage": "password"},
-                    )
+                    return _already_done_result(site, password_client, "password")
                 _api_log(site, f"账密阶段未能完成（{kind}）：{exc.message}")
             except Exception as exc:
                 _api_log(site, f"账密阶段异常：{exc}")
@@ -487,26 +497,21 @@ def run_action(site: SiteConfig, profile: SiteProfile, turnstile: str = "") -> C
 
 
 def query_action(site: SiteConfig, profile: SiteProfile) -> QueryStatus:
-    """只读查询不运行脚本，避免刷新状态时误触发点击签到。
-
-    首选纯 API 查额度：若配置了 access_token 且 profile 支持 HTTP 查询（如 sub2api），
-    直接用 access_token 读取余额/签到状态，不启动浏览器。查询失败（登录态失效等）
-    时回落到「需执行脚本」提示，由测试签到走浏览器降级。
-    """
+    """只读查询不运行脚本；token 缺失/过期时允许纯 HTTP 续期或账密登录。"""
     if not str(getattr(site, "script", "") or "").strip():
         return QueryStatus(ok=False, message="未配置 browser_script 脚本路径", status="need_config")
     auth_method = (site.auth_method or "").strip().lower()
     if auth_method not in {"browser", "oauth"}:
         return QueryStatus(ok=False, message="browser_script 仅支持 auth_method=browser/oauth", status="need_config")
 
-    # 纯 API 首选：用配置的 access_token 直接查额度（不启动浏览器）。
-    token = normalize_access_token(getattr(site, "access_token", "") or "")
-    build_client = getattr(profile, "build_client", None)
-    if token and callable(build_client):
-        try:
-            from ..base import AuthInfo
+    from ..base import AuthInfo
 
-            client = build_client(site, AuthInfo(access_token=token))
+    build_client = getattr(profile, "build_client", None)
+    if not callable(build_client):
+        return QueryStatus(ok=True, message="站点适配器不支持纯 API 查询，需执行脚本", status="success")
+
+    def _query(client: Any, stage: str) -> QueryStatus | None:
+        try:
             user = client.fetch_user()
             quota_usd = client.quota_to_usd(user.quota_raw)
             checked_in: bool | None = None
@@ -516,18 +521,45 @@ def query_action(site: SiteConfig, profile: SiteProfile) -> QueryStatus:
                     checked_in = status.checked_in_today
                 if quota_usd is None and status.quota_usd is not None:
                     quota_usd = status.quota_usd
-            except Exception:
-                pass
+            except Exception as exc:
+                _api_log(site, f"[query:{stage}] 签到状态读取失败：{exc}")
             if quota_usd is not None:
                 return QueryStatus(
                     ok=True,
                     quota_usd=quota_usd,
                     checked_in=checked_in,
-                    message="查询成功（access_token 直查）",
+                    message=f"查询成功（API {stage}）",
                     status="success",
                 )
-        except Exception:
-            # 登录态失效 / 接口不可用：回落到下方「需执行脚本」提示。
-            pass
+        except ApiError as exc:
+            kind = profile.classify(exc) if hasattr(profile, "classify") else "error"
+            _api_log(site, f"[query:{stage}] 查询失败（{kind}）：{_describe_failure(exc)}")
+        except Exception as exc:
+            _api_log(site, f"[query:{stage}] 查询异常：{type(exc).__name__}: {exc}")
+        return None
+
+    token = normalize_access_token(getattr(site, "access_token", "") or "")
+    if not token:
+        token = _renew_access_token(site, profile, "查询时无可用 access_token")
+    if token:
+        result = _query(build_client(site, AuthInfo(access_token=token)), "token")
+        if result is not None:
+            return result
+
+    # 纯 token/refresh 均不可用时，仍可尝试无 Turnstile 的 HTTP 账密登录；不启动浏览器。
+    login = getattr(profile, "http_password_login", None)
+    email, password = _script_credentials(site)
+    if callable(login) and email and password:
+        try:
+            fresh = login(site, email, password, log=lambda m: _api_log(site, m)) or {}
+        except Exception as exc:
+            _api_log(site, f"查询账密登录异常：{type(exc).__name__}: {exc}")
+            fresh = {}
+        new_token = normalize_access_token(str(fresh.get("access_token") or ""))
+        if new_token:
+            _persist_tokens(site, new_token, str(fresh.get("refresh_token") or ""))
+            result = _query(build_client(site, AuthInfo(access_token=new_token)), "password")
+            if result is not None:
+                return result
 
     return QueryStatus(ok=True, message="browser_script 站点需通过测试签到/定时签到执行脚本", status="success")

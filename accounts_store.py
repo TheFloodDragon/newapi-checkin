@@ -26,7 +26,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 from urllib.parse import urlparse
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -558,38 +558,27 @@ def _refresh_token_from_state(state_text: str) -> str:
         return ""
 
 
-def site_config_from_mapping(
+def configured_site_from_mapping(
     data: dict[str, Any],
     *,
     overrides: dict[str, Any] | None = None,
 ):
-    """把任意兼容配置映射规范化为唯一的 ``SiteConfig`` 构造路径。"""
-    from providers.base import SiteConfig
+    """纯配置构造：规范化映射并生成 SiteConfig，不读取任何运行期缓存。"""
+    from providers.base import RuntimeCredentialContext, SiteConfig
+    from providers import token_cache as _token_cache
 
     raw = dict(data or {})
     if overrides:
         raw.update(overrides)
     row = _normalize_account_entry(raw)
     base_url = normalize_base_url(str(row.get("base_url") or row.get("url") or ""))
-
-    # 运行期 token 缓存优先：签到过程中刷新出的 access_token / refresh_token 写在
-    # <缓存目录>/token_cache.json（不入 ACCOUNTS.json，避免后台任务反复改写用户配置、
-    # 也避免导出的 GitHub Secret 里塞进很快失效的短期值）。缓存里有更新的值就用它。
-    name_for_cache = str(row.get("name") or base_url)
-    try:
-        from providers import token_cache as _token_cache
-
-        cached = _token_cache.load_tokens(name_for_cache, base_url)
-    except Exception:
-        cached = {}
-    if cached.get("access_token"):
-        row["access_token"] = cached["access_token"]
-    if cached.get("refresh_token"):
-        row["refresh_token"] = cached["refresh_token"]
-    # browser_state 同理：签到过程中浏览器会刷新 cookie/localStorage，新登录态存进
-    # 缓存而不是 ACCOUNTS.json。缓存里有就用它，否则回落到配置里用户捕获的初始值。
-    if cached.get("browser_state"):
-        row["browser_state"] = cached["browser_state"]
+    access_token = str(row.get("access_token") or row.get("authorization") or "")
+    refresh_token = str(row.get("refresh_token") or "")
+    browser_state = str(row.get("browser_state") or "")
+    context = RuntimeCredentialContext(
+        token_basis=_token_cache.credential_basis(access_token, refresh_token, group="token"),
+        state_basis=_token_cache.credential_basis(browser_state=browser_state, group="state"),
+    )
 
     return SiteConfig(
         name=str(row.get("name") or base_url),
@@ -603,10 +592,10 @@ def site_config_from_mapping(
         api_variant=str(row.get("api_variant") or "auto"),
         cookie=str(row.get("cookie") or ""),
         user_id=str(row.get("user_id") or row.get("new_api_user") or ""),
-        access_token=str(row.get("access_token") or row.get("authorization") or ""),
-        refresh_token=str(row.get("refresh_token") or ""),
+        access_token=access_token,
+        refresh_token=refresh_token,
         cookie_file=str(row.get("cookie_file") or row.get("token_file") or ""),
-        browser_state=str(row.get("browser_state") or ""),
+        browser_state=browser_state,
         browser_profile=str(row.get("browser_profile") or ".browser_profile"),
         login_selector=str(row.get("login_selector") or ""),
         oauth_provider=normalize_oauth_provider(row.get("oauth_provider")) or "linuxdo",
@@ -618,7 +607,53 @@ def site_config_from_mapping(
         enabled=parse_enabled(row.get("enabled"), True),
         auto_refresh_cookie=parse_enabled(row.get("auto_refresh_cookie"), True),
         verify_ssl=parse_enabled(row.get("verify_ssl"), True),
+        runtime_credentials=context,
     )
+
+
+def runtime_site_from_mapping(
+    data: dict[str, Any],
+    *,
+    overrides: dict[str, Any] | None = None,
+    explicit_fields: Iterable[str] = (),
+    cache_policy: str = "compatible",
+):
+    """运行态构造：显式输入 > 兼容缓存 > 配置值。
+
+    explicit_fields 可包含 access_token/refresh_token/browser_state，即使字段值为空也
+    表示用户明确输入/清空，缓存不得回填。cache_policy=ignore 用于父进程已经解析
+    完凭据后的 worker，避免子进程再次叠加缓存。
+    """
+    from providers import token_cache as _token_cache
+
+    site = configured_site_from_mapping(data, overrides=overrides)
+    explicit = frozenset(
+        str(field) for field in explicit_fields
+        if str(field) in _token_cache.ALL_CREDENTIAL_FIELDS
+    )
+    site.runtime_credentials.explicit_fields = explicit
+    site.runtime_credentials.cache_policy = str(cache_policy or "compatible")
+    cached = _token_cache.resolve_cached_credentials(
+        site.name,
+        site.base_url,
+        configured_access_token=site.access_token,
+        configured_refresh_token=site.refresh_token,
+        configured_browser_state=site.browser_state,
+        explicit_fields=explicit,
+        cache_policy=site.runtime_credentials.cache_policy,
+    )
+    for field, value in cached.items():
+        setattr(site, field, value)
+    return site
+
+
+def site_config_from_mapping(
+    data: dict[str, Any],
+    *,
+    overrides: dict[str, Any] | None = None,
+):
+    """兼容入口：按来源感知规则构造运行态 SiteConfig。"""
+    return runtime_site_from_mapping(data, overrides=overrides)
 
 
 def load_raw_sites(path: Path | None = None) -> list[dict[str, Any]]:
@@ -1148,6 +1183,15 @@ def build_github_secret_payload(
         proxy = str(row.get("proxy") or "").strip()
         if proxy:
             out["proxy"] = proxy
+
+        # 这些非默认运行参数会改变 CI 行为，必须随 Secret 导出；默认值继续省略。
+        if not parse_enabled(row.get("verify_ssl"), True):
+            out["verify_ssl"] = False
+        referer_path = str(row.get("referer_path") or "/profile").strip() or "/profile"
+        if referer_path != "/profile":
+            out["referer_path"] = referer_path
+        if not parse_enabled(row.get("auto_refresh_cookie"), True):
+            out["auto_refresh_cookie"] = False
 
         exported_accounts.append(out)
 

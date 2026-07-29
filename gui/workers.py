@@ -50,7 +50,14 @@ class _ProviderTask(QRunnable):
         try:
             import providers
 
-            site = accounts_store.site_config_from_mapping(self.params)
+            runtime_params = dict(self.params)
+            explicit_fields = runtime_params.pop("_explicit_credential_fields", ())
+            cache_policy = str(runtime_params.pop("_cache_policy", "compatible") or "compatible")
+            site = accounts_store.runtime_site_from_mapping(
+                runtime_params,
+                explicit_fields=explicit_fields,
+                cache_policy=cache_policy,
+            )
             if self.action == "query":
                 qs = providers.query_status(site)
                 result = {

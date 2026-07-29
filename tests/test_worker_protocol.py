@@ -105,8 +105,9 @@ def test_site_task_keeps_secrets_out_of_argv(monkeypatch) -> None:
         "CHECKIN_ACCESS_TOKEN": "top-secret-token",
         "CHECKIN_REFRESH_TOKEN": "top-secret-refresh",
         "CHECKIN_USER_ID": "42",
-        "CHECKIN_PROXY": "http://user:password@proxy.invalid:8080",
-    }
+            "CHECKIN_PROXY": "http://user:password@proxy.invalid:8080",
+            "CHECKIN_CACHE_POLICY": "ignore",
+        }
     assert task.worker_protocol
 
 

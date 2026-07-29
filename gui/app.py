@@ -71,10 +71,13 @@ class App(QMainWindow):
         self._lock = False
         self._dirty = False
         self._saved_snapshot = ""
+        # 当前 GUI 会话内上次成功保存的凭据基线（按 SiteRow 对象 id 关联）。
+        # 用它区分真正的 token/state 编辑与普通配置保存，避免无关保存误删缓存。
+        self._saved_credentials: dict[int, dict[str, str]] = {}
         self._type_buttons: dict[str, QPushButton] = {}
         self._worker: BrowserWorker | None = None
         self._capture_dialog: QMessageBox | None = None
-        self._running: set[str] = set()  # 站点任务互斥键（base_url）
+        self._leases = core.TaskLeaseRegistry()
         self._batch_active = 0
 
         self.store = core.StatusStore()
@@ -597,9 +600,9 @@ class App(QMainWindow):
         self.browser_profile_wrap.layout().addWidget(self.browser_profile_edit)
 
         self.auto_refresh_wrap = self._field(
-            cred_layout, "Cookie 自动刷新", "默认开启；关闭后 Cookie 失效不再尝试自动续期"
+            cred_layout, "Cookie 文件自动清理", "默认开启；关闭后仍在内存去重，但不回写凭据文件"
         )
-        self.auto_refresh_check = QCheckBox("Cookie 失效时自动刷新")
+        self.auto_refresh_check = QCheckBox("自动回写去重后的 Cookie")
         self.auto_refresh_check.setObjectName("plainCheck")
         self.auto_refresh_check.setChecked(True)
         self.auto_refresh_wrap.layout().addWidget(self.auto_refresh_check)
@@ -783,7 +786,7 @@ class App(QMainWindow):
                 real_idx == self.cur,
                 on_toggle=lambda idx=real_idx: self._toggle_enabled(idx),
                 status=self.store.get(core.StatusStore.status_key(row)),
-                running=core.StatusStore.task_key(row) in self._running,
+                running=self._leases.is_channel_running(core.StatusStore.task_key(row)),
             )
             item.setSizeHint(widget.sizeHint())
             self.listw.addItem(item)
@@ -837,7 +840,7 @@ class App(QMainWindow):
             widget.update_row(
                 row,
                 self.store.get(core.StatusStore.status_key(row)),
-                running=core.StatusStore.task_key(row) in self._running,
+                running=self._leases.is_channel_running(core.StatusStore.task_key(row)),
             )
             widget.apply_selected(idx == self.cur)
 
@@ -1183,7 +1186,9 @@ class App(QMainWindow):
 
     def _render_summary_status(self, status: dict[str, Any] | None) -> None:
         has_site = self.cur is not None
-        running = has_site and core.StatusStore.task_key(self.rows[self.cur]) in self._running
+        running = has_site and self._leases.is_channel_running(
+            core.StatusStore.task_key(self.rows[self.cur])
+        )
         self.btn_refresh.setEnabled(has_site and not running)
         self.btn_checkin_now.setEnabled(has_site and not running)
         checked_in_now = False
@@ -1255,27 +1260,39 @@ class App(QMainWindow):
         self.chip_failed.set_value(str(stats.failed))
 
     # ── 站点任务（查询 / 签到）──
-    def _try_lock(self, idx: int, label: str) -> str:
+    def _row_index(self, row_id: str) -> int | None:
+        for index, row in enumerate(self.rows):
+            if row.runtime_id == row_id:
+                return index
+        return None
+
+    def _try_lock(self, idx: int, label: str) -> core.TaskLease | None:
         if idx < 0 or idx >= len(self.rows):
-            return ""
-        key = core.StatusStore.task_key(self.rows[idx])
-        if not key:
-            return ""
-        if key in self._running:
+            return None
+        lease = self._leases.acquire_single(self.rows[idx])
+        if lease is None:
             self._say(f"该站点已有任务运行中，已跳过新的{label}")
-            return ""
-        self._running.add(key)
+            return None
         self._refresh_row(idx)
         if idx == self.cur:
             self._update_summary(self.rows[idx])
-        return key
+        return lease
 
-    def _unlock(self, key: str, idx: int) -> None:
-        self._running.discard(key)
-        if 0 <= idx < len(self.rows):
+    def _unlock(self, lease: core.TaskLease | None, row_id: str) -> None:
+        self._leases.release(lease)
+        idx = self._row_index(row_id)
+        if idx is not None:
             self._refresh_row(idx)
             if idx == self.cur:
                 self._update_summary(self.rows[idx])
+
+    def _task_params_for_row(self, row: core.SiteRow) -> dict[str, Any]:
+        explicit = core.changed_credential_fields(row, self._saved_credentials.get(id(row)))
+        return core.task_params(
+            row,
+            self.oauth_states,
+            explicit_credential_fields=explicit,
+        )
 
     def _params_for_current(self) -> dict[str, Any] | None:
         if self.cur is None:
@@ -1286,30 +1303,33 @@ class App(QMainWindow):
         if not accounts_store.normalize_base_url(row.base_url):
             QMessageBox.warning(self, "提示", "请先填写站点地址。")
             return None
-        return core.task_params(row, self.oauth_states)
+        return self._task_params_for_row(row)
 
     def _refresh_status(self) -> None:
         params = self._params_for_current()
         if params is None or self.cur is None:
             return
         cur_idx = self.cur
+        row_id = self.rows[cur_idx].runtime_id
         key = core.StatusStore.status_key(self.rows[cur_idx])
-        task_key = self._try_lock(cur_idx, "查询")
-        if not task_key:
+        lease = self._try_lock(cur_idx, "查询")
+        if lease is None:
             return
         self._say("正在查询额度…")
 
         def on_done(result: dict[str, Any]) -> None:
             try:
                 entry = self.store.apply_query(key, result)
-                self._refresh_row(cur_idx)
-                if cur_idx == self.cur:
-                    self._update_summary(self.rows[cur_idx])
+                current_idx = self._row_index(row_id)
+                if current_idx is not None:
+                    self._refresh_row(current_idx)
+                    if current_idx == self.cur:
+                        self._update_summary(self.rows[current_idx])
                 self._update_overview()
                 ok = bool(result.get("ok"))
                 self._say(entry["message"] if ok else core.failure_toast(entry["status"], str(entry["message"])))
             finally:
-                self._unlock(task_key, cur_idx)
+                self._unlock(lease, row_id)
 
         self.runner.submit("query", params, on_done)
 
@@ -1321,9 +1341,10 @@ class App(QMainWindow):
         if params is None:
             return
         idx = self.cur
+        row_id = self.rows[idx].runtime_id
         key = core.StatusStore.status_key(self.rows[idx])
-        task_key = self._try_lock(idx, "签到")
-        if not task_key:
+        lease = self._try_lock(idx, "签到")
+        if lease is None:
             return
         name = self.rows[idx].name or "未命名站点"
         self._say(f"「{name}」签到中…")
@@ -1331,9 +1352,11 @@ class App(QMainWindow):
         def on_done(result: dict[str, Any]) -> None:
             try:
                 self.store.apply_checkin(key, result)
-                self._refresh_row(idx)
-                if idx == self.cur:
-                    self._update_summary(self.rows[idx])
+                current_idx = self._row_index(row_id)
+                if current_idx is not None:
+                    self._refresh_row(current_idx)
+                    if current_idx == self.cur:
+                        self._update_summary(self.rows[current_idx])
                 self._update_overview()
                 status = result.get("status", "error")
                 message = result.get("message", "")
@@ -1343,7 +1366,7 @@ class App(QMainWindow):
                     else f"{name}: 签到失败 [{status}] {message}"
                 )
             finally:
-                self._unlock(task_key, idx)
+                self._unlock(lease, row_id)
 
         self.runner.submit("checkin", params, on_done)
 
@@ -1353,18 +1376,21 @@ class App(QMainWindow):
         if params is None or self.cur is None:
             return
         cur_idx = self.cur
+        row_id = self.rows[cur_idx].runtime_id
         key = core.StatusStore.status_key(self.rows[cur_idx])
-        task_key = self._try_lock(cur_idx, "测试签到")
-        if not task_key:
+        lease = self._try_lock(cur_idx, "测试签到")
+        if lease is None:
             return
         self._say(f"正在测试签到（{params['site_profile']} / {params['auth_method']} / {params['checkin_action']}）…")
 
         def on_done(result: dict[str, Any]) -> None:
             try:
                 self.store.apply_checkin(key, result)
-                self._refresh_row(cur_idx)
-                if cur_idx == self.cur:
-                    self._update_summary(self.rows[cur_idx])
+                current_idx = self._row_index(row_id)
+                if current_idx is not None:
+                    self._refresh_row(current_idx)
+                    if current_idx == self.cur:
+                        self._update_summary(self.rows[current_idx])
                 self._update_overview()
                 status = result.get("status", "error")
                 msg = result.get("message", "") or status
@@ -1381,66 +1407,88 @@ class App(QMainWindow):
                     QMessageBox.warning(self, "签到未完成", f"[{status}] {msg}")
                     self._say(f"测试签到失败 [{status}] {msg}")
             finally:
-                self._unlock(task_key, cur_idx)
+                self._unlock(lease, row_id)
 
         self.runner.submit("checkin", params, on_done)
 
     # ── 批量任务 ──
-    def _collect_batch(self, label: str) -> list[tuple[str, list[int]]]:
-        """把启用站点按 base_url 分组，返回 [(分组键, [行号, ...]), ...]。
+    def _collect_batch(self, label: str) -> list[list[core.TaskSnapshot]]:
+        """把启用渠道按站点分组，返回不可变任务快照列表。
 
-        同一 base_url 下可能配了多个账号（同站多账号很常见）。旧实现对重复
-        base_url 只保留第一个、其余静默丢弃，导致 GUI「全部签到」漏签，而 CLI
-        的 site_locks 只是串行化、不会丢任务——同一份配置两条路径结果不同。
-        这里改为分组保留：组间并发、组内串行，与 CLI 语义对齐。
-
-        分组用 site_group_key（站点维度，控制限流），跳过判定用 task_key
-        （渠道维度，与单站点操作共用同一把锁）：同址的三个渠道要能各自独立
-        运行，不能因为其中一个在跑就把其余的一起跳过。
+        同一 base_url 下可能配了多个账号：组内串行执行（与 CLI 的 site_locks 语义
+        一致），组间并发。快照在提交时固定身份，回调不再依赖可变行号——运行中删除、
+        排序、改名都不会写错行或泄漏锁。已被其它任务占用的站点整组跳过：站点级资源
+        必须独占，否则单签与批量会并发打同一站点。
         """
         if self.cur is not None:
             self._flush()
-        groups: dict[str, list[int]] = {}
-        skipped_running = 0
-        for idx, row in enumerate(self.rows):
+        groups: dict[str, list[core.TaskSnapshot]] = {}
+        for row in self.rows:
             if not row.enabled:
                 continue
             group_key = core.StatusStore.site_group_key(row)
             if not group_key:
                 continue
-            if core.StatusStore.task_key(row) in self._running:
-                skipped_running += 1
+            groups.setdefault(group_key, []).append(
+                core.make_task_snapshot(
+                    row,
+                    self.oauth_states,
+                    explicit_credential_fields=core.changed_credential_fields(
+                        row, self._saved_credentials.get(id(row))
+                    ),
+                )
+            )
+        runnable: list[list[core.TaskSnapshot]] = []
+        skipped_running = 0
+        for group_key, snapshots in groups.items():
+            if self._leases.is_site_running(group_key):
+                skipped_running += len(snapshots)
                 continue
-            groups.setdefault(group_key, []).append(idx)
+            runnable.append(snapshots)
         if skipped_running:
             self._say(f"已跳过 {skipped_running} 个运行中的站点任务。")
-        if not groups:
+        if not runnable:
             QMessageBox.information(self, "提示", f"没有可{label}的启用站点（可能都在运行中）。")
-        return list(groups.items())
+        return runnable
 
     def _set_batch_buttons(self) -> None:
         idle = self._batch_active == 0
         self.btn_query_all.setEnabled(idle)
         self.btn_checkin_all.setEnabled(idle)
 
+    def _refresh_snapshot_row(self, snapshot: core.TaskSnapshot) -> None:
+        idx = self._row_index(snapshot.row_id)
+        if idx is None:
+            return
+        self._refresh_row(idx)
+        if idx == self.cur:
+            self._update_summary(self.rows[idx])
+
     def _run_batch(self, action: str, label: str) -> None:
         groups = self._collect_batch(label)
         if not groups:
             return
+        leases: list[core.TaskLease] = []
+        active_groups: list[list[core.TaskSnapshot]] = []
+        for snapshots in groups:
+            lease = self._leases.acquire_group(snapshots)
+            if lease is None:
+                continue
+            leases.append(lease)
+            active_groups.append(snapshots)
+        if not active_groups:
+            QMessageBox.information(self, "提示", f"没有可{label}的启用站点（可能都在运行中）。")
+            return
+
         self._batch_active += 1
         self._set_batch_buttons()
-        # 锁按渠道加：同址的多个渠道各自持锁，行状态才不会被一起点亮。
-        for _group_key, indices in groups:
-            for idx in indices:
-                if 0 <= idx < len(self.rows):
-                    self._running.add(core.StatusStore.task_key(self.rows[idx]))
-        for _key, indices in groups:
-            for idx in indices:
-                self._refresh_row(idx)
+        for snapshots in active_groups:
+            for snapshot in snapshots:
+                self._refresh_snapshot_row(snapshot)
         self._update_summary()
 
-        total = sum(len(indices) for _key, indices in groups)
-        core.bg_log("INFO", f"批量{label}开始", sites=total, groups=len(groups))
+        total = sum(len(snapshots) for snapshots in active_groups)
+        core.bg_log("INFO", f"批量{label}开始", sites=total, groups=len(active_groups))
         self._say(f"批量{label}：共 {total} 个站点…")
 
         completed = [0]
@@ -1456,62 +1504,49 @@ class App(QMainWindow):
             core.bg_log("INFO", summary)
             self._say(summary)
 
-        def run_group(group_key: str, indices: list[int], position: int = 0) -> None:
-            """同一 base_url 的渠道依次执行，避免并发打同一站点被限流。
-
-            锁是渠道级的，因此每个渠道跑完就立刻释放自己那把，不再等整组结束：
-            否则同址的其他渠道会在别人跑完前一直显示「运行中」。
-            """
-            if position >= len(indices):
+        def run_group(
+            snapshots: list[core.TaskSnapshot],
+            lease: core.TaskLease,
+            position: int = 0,
+        ) -> None:
+            """同站渠道依次执行；整组跑完才释放站点租约。"""
+            if position >= len(snapshots):
+                self._leases.release(lease)
+                for snapshot in snapshots:
+                    self._refresh_snapshot_row(snapshot)
                 if completed[0] >= total:
                     finish_batch()
                 return
 
-            idx = indices[position]
-            if idx >= len(self.rows):
-                run_group(group_key, indices, position + 1)
-                return
-            row = self.rows[idx]
-            params = core.task_params(row, self.oauth_states)
+            snapshot = snapshots[position]
 
             def on_done(result: dict[str, Any]) -> None:
-                # 在 try 之外取行：若放进 try 首行，该行抛异常时 finally 里的
-                # current 会 NameError，渠道锁就永久泄漏、该行一直卡在「运行中」。
-                current = self.rows[idx] if 0 <= idx < len(self.rows) else None
                 try:
-                    if current is not None:
-                        status_key = core.StatusStore.status_key(current)
-                        if action == "query":
-                            self.store.apply_query(status_key, result)
-                        else:
-                            self.store.apply_checkin(status_key, result)
-                        self._refresh_row(idx)
+                    # 结果归属提交时的身份：即使该行已被删除或改名，也不会写到别的渠道。
+                    if action == "query":
+                        self.store.apply_query(snapshot.status_key, result)
+                    else:
+                        self.store.apply_checkin(snapshot.status_key, result)
+                    self._refresh_snapshot_row(snapshot)
                     ok = bool(result.get("ok"))
                     if not ok:
                         failures[0] += 1
                     core.bg_log(
                         "INFO" if ok else "WARN",
                         f"批量{label}结果",
-                        site=(current.name if current else "") or "未命名站点",
+                        site=snapshot.name,
                         status=result.get("status"),
                         result_message=result.get("message"),
                     )
                 finally:
                     completed[0] += 1
                     self._say(f"{label}进度：{completed[0]}/{total}")
-                    # 本渠道跑完就立刻释放它自己的锁：同址的其他渠道各持一把锁，
-                    # 不再被这一个拖着一起显示「运行中」。
-                    if current is not None:
-                        self._running.discard(core.StatusStore.task_key(current))
-                        self._refresh_row(idx)
-                        if idx == self.cur:
-                            self._update_summary(self.rows[idx])
-                    run_group(group_key, indices, position + 1)
+                    run_group(snapshots, lease, position + 1)
 
-            self.runner.submit(action, params, on_done)
+            self.runner.submit(action, snapshot.params, on_done)
 
-        for group_key, indices in groups:
-            run_group(group_key, indices)
+        for snapshots, lease in zip(active_groups, leases):
+            run_group(snapshots, lease)
 
     def _query_all(self) -> None:
         self._run_batch("query", "查询")
@@ -1651,6 +1686,7 @@ class App(QMainWindow):
     def _mark_saved(self) -> None:
         self._dirty_timer.stop()
         self._saved_snapshot = core.config_snapshot(self.rows, self.oauth_states)
+        self._saved_credentials = core.credential_snapshots(self.rows)
         self._set_dirty(False)
 
     # ── 保存 / 导出 ──
@@ -1666,10 +1702,9 @@ class App(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "保存失败", str(exc))
             return
-        # 读取时 token 缓存优先于 ACCOUNTS.json（缓存里通常是刚续期出的新 token）。
-        # 但用户刚手工粘贴的凭据必须赢：否则旧缓存会把新填的值盖掉，表现为「填了
-        # 有效 token 却仍提示没有」。这里清掉与新填值冲突的缓存条目。
-        core.reconcile_token_cache(self.rows)
+        # 只处理相对上次成功保存真正变化的凭据字段。token 与 browser_state 分组
+        # 失效，普通配置保存不再误删刚续期出的有效缓存；删除/改名则清理旧身份。
+        core.apply_credential_cache_changes(self.rows, self._saved_credentials)
         self._mark_saved()
         self._say(f"已保存：{len(self.rows)} 个账号配置")
 
@@ -1740,15 +1775,16 @@ class App(QMainWindow):
         if params is None or self.cur is None:
             return
         cur_idx = self.cur
-        task_key = self._try_lock(cur_idx, "浏览器操作")
-        if not task_key:
+        row_id = self.rows[cur_idx].runtime_id
+        lease = self._try_lock(cur_idx, "浏览器操作")
+        if lease is None:
             return
         is_oauth = params.get("auth_method") == "oauth"
         provider_label = core.OAUTH_PROVIDER_LABELS.get(params.get("oauth_provider"), params.get("oauth_provider", ""))
         account = params.get("oauth_account", core.DEFAULT_OAUTH_ACCOUNT)
         self._say("正在打开浏览器，请在其中完成第三方登录…" if is_oauth else "正在打开浏览器，请完成站点登录…")
         worker = self._start_worker("capture", params)
-        worker.finished.connect(lambda: self._unlock(task_key, cur_idx))
+        worker.finished.connect(lambda: self._unlock(lease, row_id))
 
         dlg = QMessageBox(self)
         dlg.setWindowTitle("OAuth 登录态捕获" if is_oauth else "浏览器登录捕获")
@@ -1807,23 +1843,31 @@ class App(QMainWindow):
                     )
                     self._say(f"已暂存 {provider}:{account_key} 登录态，请点“保存全部”")
                 else:
-                    if self.cur is not None:
-                        self._lock = True
-                        self.state_edit.setPlainText(result["state"])
-                        if result.get("access_token"):
-                            self.token_edit.setText(str(result["access_token"]))
-                        # 必须写进输入框再 _flush：refresh_token 现在有对应输入框，
-                        # _flush 会以框内容为准回写行模型。若像早先那样在 _flush 之后
-                        # 直接改 row，下一次任意字段编辑触发的 _flush 就会用空框把它冲掉。
-                        refresh_token = str(result.get("refresh_token") or "").strip()
-                        if refresh_token:
-                            self.refresh_edit.setText(refresh_token)
-                        self._lock = False
+                    target_idx = self._row_index(row_id)
+                    if target_idx is None:
+                        QMessageBox.warning(self, "捕获完成", "原渠道已被删除，捕获结果未写入任何账号。")
+                        self._say("捕获完成，但原渠道已删除，结果已丢弃")
+                        return
+                    # 若目标仍是当前编辑行，先保存其它表单改动；随后直接更新目标模型，
+                    # 不能再依赖“当前选中行”的输入框，否则切换列表后会写错渠道。
+                    if target_idx == self.cur:
                         self._flush()
+                    target = self.rows[target_idx]
+                    target.browser_state = str(result["state"] or "").strip()
+                    access_token = str(result.get("access_token") or "").strip()
+                    refresh_token = str(result.get("refresh_token") or "").strip()
+                    if access_token:
+                        target.access_token = access_token
+                    if refresh_token:
+                        target.refresh_token = refresh_token
+                    if target_idx == self.cur:
+                        self._load(target_idx)
+                    self._refresh_row(target_idx)
+                    self._schedule_dirty()
                     QMessageBox.information(
-                        self, "捕获成功", result.get("message", "登录态已捕获并填入「站点登录状态」，记得点「保存全部」。")
+                        self, "捕获成功", result.get("message", "登录态已捕获并填入目标渠道，记得点「保存全部」。")
                     )
-                    self._say("登录态已填入，请点「保存全部」")
+                    self._say(f"已把登录态填入「{target.name}」，请点「保存全部」")
             else:
                 QMessageBox.warning(self, "未捕获到有效登录态", result.get("message", "请重试。"))
 
@@ -1881,8 +1925,9 @@ class App(QMainWindow):
         if params is None or self.cur is None:
             return
         cur_idx = self.cur
-        task_key = self._try_lock(cur_idx, "检测")
-        if not task_key:
+        row_id = self.rows[cur_idx].runtime_id
+        lease = self._try_lock(cur_idx, "检测")
+        if lease is None:
             return
         try:
             if params.get("auth_method") == "oauth":
@@ -1910,7 +1955,7 @@ class App(QMainWindow):
             if not params["browser_state"]:
                 self._say("未填登录态，将尝试用本地浏览器登录态检测…")
             worker = self._start_worker("verify", params)
-            worker.finished.connect(lambda locked=task_key: self._unlock(locked, cur_idx))
+            worker.finished.connect(lambda locked=lease: self._unlock(locked, row_id))
             worker.finished_ok.connect(
                 lambda r: (
                     QMessageBox.information(self, "登录态有效", r.get("message", ""))
@@ -1919,10 +1964,10 @@ class App(QMainWindow):
                 )
             )
             worker.start()
-            task_key = ""
+            lease = None
         finally:
-            if task_key:
-                self._unlock(task_key, cur_idx)
+            if lease is not None:
+                self._unlock(lease, row_id)
 
     # ── 其它 ──
     def _say(self, text: str) -> None:
@@ -1952,11 +1997,12 @@ class App(QMainWindow):
         core.remove_log_sink(self._log_bridge.line.emit)
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
-        if self._running:
+        running_channels = self._leases.running_channels
+        if running_channels:
             ret = QMessageBox.warning(
                 self,
                 "任务进行中",
-                f"有 {len(self._running)} 个站点任务正在运行，强制退出可能导致任务失败。\n\n确定要退出吗？",
+                f"有 {running_channels} 个站点任务正在运行，强制退出可能导致任务失败。\n\n确定要退出吗？",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )

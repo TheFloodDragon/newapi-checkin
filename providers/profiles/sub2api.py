@@ -86,7 +86,7 @@ def _persist_refreshed_token(
     try:
         from .. import token_cache
 
-        token_cache.save_tokens(site.name, site.base_url, token, refresh_token, browser_state=browser_state)
+        token_cache.save_site_tokens(site, token, refresh_token, browser_state=browser_state)
     except Exception:
         pass
 

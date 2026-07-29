@@ -148,7 +148,7 @@ def parse_args() -> argparse.Namespace:
         dest="auto_refresh_cookie",
         action="store_false",
         default=True,
-        help="禁止自动回写清理后的 Cookie 文件",
+        help="禁止把去重后的 Cookie 回写凭据文件（内存中仍会去重）",
     )
     parser.add_argument("--turnstile", default="", help="如站点要求 Turnstile，可临时传入验证值")
     parser.add_argument("--workers", type=int, default=0, help="同时执行的最大任务数，默认最多 8 个")
@@ -183,6 +183,18 @@ def _load_script_args(args: argparse.Namespace) -> dict[str, object]:
     if not isinstance(parsed, dict):
         raise ValueError("script_args 必须是 JSON 对象")
     return parsed
+
+
+def _explicit_credential_fields(args: argparse.Namespace) -> set[str]:
+    """判断单站入口中哪些凭据是调用方显式提供的（空值也算）。"""
+    fields: set[str] = set()
+    if "--access-token" in sys.argv or "CHECKIN_ACCESS_TOKEN" in os.environ:
+        fields.add("access_token")
+    if "CHECKIN_REFRESH_TOKEN" in os.environ:
+        fields.add("refresh_token")
+    if "CHECKIN_BROWSER_STATE" in os.environ:
+        fields.add("browser_state")
+    return fields
 
 
 def _execute(args: argparse.Namespace) -> tuple[dict[str, object] | list[dict[str, object]], int]:
@@ -224,7 +236,13 @@ def _execute(args: argparse.Namespace) -> tuple[dict[str, object] | list[dict[st
             "referer_path": args.referer_path,
             "auto_refresh_cookie": args.auto_refresh_cookie,
         }
-        sites = [accounts_store.site_config_from_mapping(raw_site)]
+        sites = [
+            accounts_store.runtime_site_from_mapping(
+                raw_site,
+                explicit_fields=_explicit_credential_fields(args),
+                cache_policy=os.environ.get("CHECKIN_CACHE_POLICY", "compatible"),
+            )
+        ]
     else:
         config_path = Path(args.config).resolve()
         try:

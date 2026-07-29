@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 from pathlib import Path
 
+import time_utils
 from gui import core
 
 
@@ -210,16 +212,19 @@ def _write(path: Path, payload: dict) -> None:
 
 
 def test_status_store_merges_by_saved_at(tmp_path: Path) -> None:
+    today = time_utils.business_date()
     _write(
         tmp_path / "checkin_result.json",
         {
-            "generated_at": "2026-07-27T08:00:00",
+            "generated_at": time_utils.utc_iso(),
+            "business_date": today,
             "results": [
                 {"site": "a", "base_url": "https://a.com", "status": "success", "current_quota": "$5.0"},
                 {"site": "b", "base_url": "https://b.com", "status": "need_login", "current_quota": "$9.9"},
             ],
         },
     )
+    now = time_utils.utc_now()
     _write(
         tmp_path / "gui_status_cache.json",
         {
@@ -227,12 +232,16 @@ def test_status_store_merges_by_saved_at(tmp_path: Path) -> None:
                 # 更新的手动查询应覆盖批量结果
                 "https://a.com|a": {
                     "quota_usd": 7.5, "checked_in": False, "ok": True, "status": "success",
-                    "message": "", "saved_at": "2026-07-27T09:00:00",
+                    "message": "",
+                    "saved_at": time_utils.utc_iso(now + timedelta(minutes=5)),
+                    "business_date": today,
                 },
                 # 更旧的条目不应覆盖
                 "https://b.com|b": {
                     "quota_usd": 1.0, "checked_in": True, "ok": True, "status": "success",
-                    "message": "", "saved_at": "2026-07-26T09:00:00",
+                    "message": "",
+                    "saved_at": time_utils.utc_iso(now - timedelta(minutes=5)),
+                    "business_date": today,
                 },
             }
         },
@@ -243,6 +252,102 @@ def test_status_store_merges_by_saved_at(tmp_path: Path) -> None:
     assert a["quota_usd"] == 7.5 and a["checked_in"] is False
     b = store.get("https://b.com|b")
     assert b["status"] == "need_login" and b["quota_usd"] is None and b["last_quota_usd"] == 9.9
+
+
+def test_status_store_merge_compares_across_timezones(tmp_path: Path) -> None:
+    """CI 写 +08:00、GUI 写 UTC 时，字符串比较会得出错误的先后顺序。"""
+    today = time_utils.business_date()
+    _write(
+        tmp_path / "checkin_result.json",
+        {
+            # UTC 02:00 == 北京 10:00，比下面的 09:00+08:00 更新
+            "generated_at": f"{today}T02:00:00Z",
+            "business_date": today,
+            "results": [
+                {"site": "a", "base_url": "https://a.com", "status": "success", "current_quota": "$5.0"},
+            ],
+        },
+    )
+    _write(
+        tmp_path / "gui_status_cache.json",
+        {
+            "entries": {
+                "https://a.com|a": {
+                    "quota_usd": 7.5, "checked_in": False, "ok": True, "status": "success",
+                    "message": "", "saved_at": f"{today}T09:00:00+08:00", "business_date": today,
+                }
+            }
+        },
+    )
+    store = core.StatusStore(results_dir=tmp_path)
+    store.load()
+    # GUI 条目其实更旧，字符串比较会误判成更新
+    assert store.get("https://a.com|a")["quota_usd"] == 5.0
+
+
+def test_status_store_expires_yesterday_entries(tmp_path: Path) -> None:
+    """昨日的「今日已签到」不得继续作为今日状态显示。"""
+    yesterday = (time_utils.utc_now() - timedelta(days=1)).isoformat(timespec="seconds")
+    _write(
+        tmp_path / "checkin_result.json",
+        {
+            "generated_at": yesterday,
+            "results": [
+                {"site": "a", "base_url": "https://a.com", "status": "success", "current_quota": "$5.0"},
+            ],
+        },
+    )
+    _write(
+        tmp_path / "gui_status_cache.json",
+        {
+            "entries": {
+                "https://b.com|b": {
+                    "quota_usd": 3.0, "checked_in": True, "ok": True, "status": "already_done",
+                    "message": "", "saved_at": yesterday,
+                }
+            }
+        },
+    )
+    store = core.StatusStore(results_dir=tmp_path)
+    store.load()
+    assert store.get("https://a.com|a") is None
+    assert store.get("https://b.com|b") is None
+
+
+def test_status_store_drops_unparsable_timestamps(tmp_path: Path) -> None:
+    _write(
+        tmp_path / "gui_status_cache.json",
+        {
+            "entries": {
+                "https://a.com|a": {
+                    "quota_usd": 3.0, "checked_in": True, "ok": True, "status": "success",
+                    "message": "", "saved_at": "not-a-timestamp",
+                }
+            }
+        },
+    )
+    store = core.StatusStore(results_dir=tmp_path)
+    store.load()
+    assert store.get("https://a.com|a") is None
+
+
+def test_status_store_prunes_expired_entries_on_save(tmp_path: Path) -> None:
+    store = core.StatusStore(results_dir=tmp_path)
+    store.apply_query("fresh", {"ok": True, "quota_usd": 1.0, "status": "success", "message": "m"})
+    store.entries["stale"] = {
+        "quota_usd": 9.0,
+        "last_quota_usd": 9.0,
+        "checked_in": True,
+        "ok": True,
+        "status": "already_done",
+        "message": "",
+        "saved_at": (time_utils.utc_now() - timedelta(days=2)).isoformat(timespec="seconds"),
+    }
+    store.save()
+
+    payload = json.loads((tmp_path / "gui_status_cache.json").read_text(encoding="utf-8"))
+    assert "fresh" in payload["entries"]
+    assert "stale" not in payload["entries"]
 
 
 def test_status_store_apply_query_keeps_last_quota_on_failure(tmp_path: Path) -> None:
@@ -435,3 +540,99 @@ def test_task_params_passes_cli_fields() -> None:
         {"name": "p", "base_url": "https://p.invalid"}), {})
     assert plain["referer_path"] == core.REFERER_PATH_DEFAULT
     assert plain["browser_profile"] == core.BROWSER_PROFILE_DEFAULT
+
+
+# ── GUI 显式凭据与字段级缓存失效 ──────────────────────────────────────────────
+def test_task_params_marks_only_changed_credentials_explicit() -> None:
+    row = core.SiteRow(
+        name="s",
+        base_url="https://s.invalid",
+        access_token="NEW",
+        refresh_token="RT",
+        browser_state="STATE",
+    )
+    saved = {
+        "name": "s",
+        "base_url": "https://s.invalid",
+        "access_token": "OLD",
+        "refresh_token": "RT",
+        "browser_state": "STATE",
+    }
+
+    changed = core.changed_credential_fields(row, saved)
+    params = core.task_params(row, {}, explicit_credential_fields=changed)
+
+    assert changed == {"access_token"}
+    assert params["_explicit_credential_fields"] == ["access_token"]
+
+
+def test_changed_credentials_detects_explicit_clear() -> None:
+    row = core.SiteRow(name="s", base_url="https://s.invalid", browser_state="")
+    saved = {
+        "name": "s",
+        "base_url": "https://s.invalid",
+        "access_token": "",
+        "refresh_token": "",
+        "browser_state": "OLD-STATE",
+    }
+    assert core.changed_credential_fields(row, saved) == {"browser_state"}
+
+
+def test_unrelated_save_does_not_clear_token_cache(tmp_path: Path, monkeypatch) -> None:
+    from providers import token_cache
+
+    monkeypatch.setattr(token_cache, "CACHE_PATH", tmp_path / "token_cache.json")
+    row = core.SiteRow(
+        name="s", base_url="https://s.invalid", access_token="SEED", proxy="http://old"
+    )
+    saved = core.credential_snapshots([row])
+    basis = token_cache.credential_basis("SEED", "", group="token")
+    token_cache.save_tokens("s", row.base_url, "FRESH", token_basis=basis)
+
+    row.proxy = "http://new"
+    assert core.apply_credential_cache_changes([row], saved) == 0
+    assert token_cache.load_tokens("s", row.base_url)["access_token"] == "FRESH"
+
+
+def test_token_edit_invalidates_tokens_but_keeps_state(tmp_path: Path, monkeypatch) -> None:
+    from providers import token_cache
+
+    monkeypatch.setattr(token_cache, "CACHE_PATH", tmp_path / "token_cache.json")
+    row = core.SiteRow(
+        name="s",
+        base_url="https://s.invalid",
+        access_token="OLD",
+        refresh_token="OLD-RT",
+        browser_state="SEED-STATE",
+    )
+    saved = core.credential_snapshots([row])
+    token_cache.save_tokens(
+        "s", row.base_url, "CACHED", "CACHED-RT", browser_state="CACHED-STATE",
+        token_basis="tb", state_basis="sb",
+    )
+
+    row.access_token = "NEW"
+    assert core.apply_credential_cache_changes([row], saved) == 1
+    cached = token_cache.load_tokens("s", row.base_url)
+    assert "access_token" not in cached and "refresh_token" not in cached
+    assert cached["browser_state"] == "CACHED-STATE"
+
+
+def test_state_edit_invalidates_state_but_keeps_tokens(tmp_path: Path, monkeypatch) -> None:
+    from providers import token_cache
+
+    monkeypatch.setattr(token_cache, "CACHE_PATH", tmp_path / "token_cache.json")
+    row = core.SiteRow(
+        name="s", base_url="https://s.invalid", access_token="SEED", browser_state="OLD"
+    )
+    saved = core.credential_snapshots([row])
+    token_cache.save_tokens(
+        "s", row.base_url, "CACHED", browser_state="CACHED-STATE",
+        token_basis="tb", state_basis="sb",
+    )
+
+    row.browser_state = "NEW"
+    assert core.apply_credential_cache_changes([row], saved) == 1
+    cached = token_cache.load_tokens("s", row.base_url)
+    assert cached["access_token"] == "CACHED"
+    assert "browser_state" not in cached

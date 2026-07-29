@@ -36,8 +36,8 @@ def resolve_path(path_text: str) -> Path:
     return SCRIPT_DIR / path
 
 
-def load_cookie_file(path: Path) -> AuthInfo:
-    """加载凭证文件，支持 Cookie + 用户 ID + Access token 三行格式。"""
+def load_cookie_file(path: Path, *, write_back_cleaned: bool = True) -> AuthInfo:
+    """加载凭证文件；Cookie 始终在内存清理，可选回写三行格式文件。"""
     if not path.exists():
         return AuthInfo()
     lines = path.read_text(encoding="utf-8").splitlines()
@@ -57,8 +57,8 @@ def load_cookie_file(path: Path) -> AuthInfo:
     else:
         cookie = normalize_cookie(raw_cookie)
 
-    # Cookie 被清理（去重）后自动回写干净版本，并保留第 3 行 Access token
-    if cookie != raw_cookie.strip() and cookie:
+    # Cookie 始终在内存清理；仅开关启用时回写，并保留第 3 行 Access token。
+    if write_back_cleaned and cookie != raw_cookie.strip() and cookie:
         try:
             extra = f"{access_token}\n" if access_token else ""
             with accounts_store.file_lock(path):
@@ -79,7 +79,10 @@ def load_auth(site: SiteConfig) -> AuthInfo:
         access_token=normalize_access_token(site.access_token),
     )
     if site.cookie_file:
-        file_auth = load_cookie_file(resolve_path(site.cookie_file))
+        file_auth = load_cookie_file(
+            resolve_path(site.cookie_file),
+            write_back_cleaned=site.auto_refresh_cookie,
+        )
         auth.cookie = auth.cookie or file_auth.cookie
         auth.new_api_user = auth.new_api_user or file_auth.new_api_user
         auth.access_token = auth.access_token or file_auth.access_token

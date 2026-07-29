@@ -35,7 +35,8 @@ from ..base import VERIFICATION_PATTERNS as _BASE_VERIFICATION_PATTERNS
 from ._common import build_http_client, credentials_ready
 
 SCRIPT_DIR = Path(__file__).resolve().parent.parent.parent
-STATE_PATH = SCRIPT_DIR / "login_grant_state.json"
+STATE_PATH = accounts_store.RESULTS_DIR / "login_grant_state.json"
+LEGACY_STATE_PATH = SCRIPT_DIR / "login_grant_state.json"
 
 # 在唯一词表基础上追加宽泛的「验证」：保活响应多为完整页面/提示文案，
 # 语境里出现「验证」基本就是人机验证，误伤登录报错的风险低（保持既有行为）。
@@ -45,14 +46,16 @@ VERIFICATION_PATTERNS = [*_BASE_VERIFICATION_PATTERNS, "验证"]
 # ── 本地状态持久化（跨次运行对比额度变化）────────────────────────────────────
 
 def _load_state() -> dict[str, Any]:
-    if not STATE_PATH.exists():
+    """优先读取新缓存目录状态；新文件缺失时兼容旧根目录文件。"""
+    source = STATE_PATH if STATE_PATH.exists() else LEGACY_STATE_PATH
+    if not source.exists():
         return {}
     try:
-        data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        data = json.loads(source.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise accounts_store.ConfigError(f"额度状态文件 {STATE_PATH.name} 损坏或不可读：{exc}") from exc
+        raise accounts_store.ConfigError(f"额度状态文件 {source.name} 损坏或不可读：{exc}") from exc
     if not isinstance(data, dict):
-        raise accounts_store.ConfigError(f"额度状态文件 {STATE_PATH.name} 顶层必须是 JSON 对象")
+        raise accounts_store.ConfigError(f"额度状态文件 {source.name} 顶层必须是 JSON 对象")
     return data
 
 

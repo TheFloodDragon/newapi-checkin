@@ -16,21 +16,32 @@ from __future__ import annotations
 from typing import Any
 
 from providers.actions import browser_script
-from providers.base import ApiError, CheckinReward, SiteConfig, StatusInfo
+from providers.base import ApiError, CheckinReward, SiteConfig, StatusInfo, UserInfo
 
 
 class FakeClient:
+    quota_is_usd = True
+
     def __init__(self, *, status: Any = None, status_error: ApiError | None = None,
-                 reward: CheckinReward | None = None) -> None:
+                 reward: CheckinReward | None = None, user_quota: float | None = 10.0) -> None:
         self._status = status
         self._status_error = status_error
         self._reward = reward or CheckinReward(quota_awarded=0.5)
+        self._user_quota = user_quota
         self.checkin_calls = 0
+        self.user_calls = 0
 
     def fetch_status(self) -> Any:
         if self._status_error is not None:
             raise self._status_error
         return self._status
+
+    def fetch_user(self) -> UserInfo:
+        self.user_calls += 1
+        return UserInfo(quota_raw=self._user_quota)
+
+    def quota_to_usd(self, value: Any) -> float | None:
+        return float(value) if value is not None else None
 
     def do_checkin(self, turnstile: str = "") -> CheckinReward:
         self.checkin_calls += 1
@@ -40,10 +51,17 @@ class FakeClient:
 class FakeProfile:
     """按 token 值分发客户端，模拟「旧 token 失效、新 token 可用」。"""
 
-    def __init__(self, clients: dict[str, FakeClient], login_result: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        clients: dict[str, FakeClient],
+        login_result: dict[str, str] | None = None,
+        refresh_result: dict[str, str] | None = None,
+    ) -> None:
         self.clients = clients
         self.login_result = login_result
+        self.refresh_result = refresh_result
         self.login_calls = 0
+        self.refresh_calls = 0
         self.lazy_calls = 0
 
     def build_client(self, site: SiteConfig, auth: Any) -> FakeClient:
@@ -58,6 +76,12 @@ class FakeProfile:
         if error.status == 401:
             return "need_login"
         return "error"
+
+    def refresh_token_via_http(self, site, log=None):
+        self.refresh_calls += 1
+        if log:
+            log("fake refresh")
+        return dict(self.refresh_result or {})
 
     def http_password_login(self, site, email, password, log=None):
         self.login_calls += 1
@@ -95,6 +119,8 @@ def test_stage1_token_already_checked_in_returns_without_login(monkeypatch) -> N
 
     assert result is not None and result.status == "already_done"
     assert result.detail["api_stage"] == "token"
+    assert result.detail["current_quota"] == 26.55
+    assert result.detail["quota_is_usd"] is True
     assert profile.login_calls == 0
     assert client.checkin_calls == 0
 
@@ -264,3 +290,78 @@ def test_refresh_failure_detail_is_exposed_by_profile() -> None:
     assert "auth/refresh" in text
     assert "HTTP 401" in text
     assert "REFRESH_TOKEN_INVALID" in text
+
+
+# ── 单次 refresh 与结构化状态 ────────────────────────────────────────────────
+def test_missing_token_proactively_refreshes_once_and_preserves_quota(monkeypatch) -> None:
+    _no_persist(monkeypatch)
+    fresh = FakeClient(status=StatusInfo(checked_in_today=True, quota_usd=88.5))
+    profile = FakeProfile(
+        {"new": fresh},
+        refresh_result={"access_token": "new", "refresh_token": "new-rt"},
+    )
+    site = _site(access_token="", refresh_token="old-rt")
+
+    result = browser_script._try_api_checkin(site, profile)
+
+    assert result is not None and result.status == "already_done"
+    assert result.detail["current_quota"] == 88.5
+    assert profile.refresh_calls == 1
+    assert site.access_token == "new" and site.refresh_token == "new-rt"
+
+
+def test_existing_token_failure_does_not_trigger_outer_second_refresh() -> None:
+    """已有 token 的 401 由真实 Sub2ApiClient 内部处理，action 外层不得再轮换。"""
+    expired = FakeClient(status_error=ApiError(401, None, "expired"))
+    profile = FakeProfile(
+        {"old": expired},
+        refresh_result={"access_token": "new", "refresh_token": "new-rt"},
+    )
+
+    assert browser_script._try_api_checkin(_site(refresh_token="old-rt"), profile) is None
+    assert profile.refresh_calls == 0
+
+
+def test_reward_already_done_preserves_current_quota() -> None:
+    client = FakeClient(
+        status=StatusInfo(checked_in_today=False),
+        reward=CheckinReward(already_done=True, current_quota=71.25),
+    )
+    result = browser_script._try_api_checkin(_site(), FakeProfile({"old": client}))
+
+    assert result is not None and result.status == "already_done"
+    assert result.detail["current_quota"] == 71.25
+    assert result.detail["quota_is_usd"] is True
+
+
+def test_query_uses_refresh_token_without_browser(monkeypatch) -> None:
+    _no_persist(monkeypatch)
+    fresh = FakeClient(status=StatusInfo(checked_in_today=True), user_quota=607.51)
+    profile = FakeProfile(
+        {"new": fresh},
+        refresh_result={"access_token": "new", "refresh_token": "new-rt"},
+    )
+    site = _site(access_token="", refresh_token="old-rt")
+
+    result = browser_script.query_action(site, profile)
+
+    assert result.ok is True
+    assert result.quota_usd == 607.51
+    assert result.checked_in is True
+    assert profile.refresh_calls == 1
+    assert profile.lazy_calls == 0
+
+
+def test_query_can_fall_back_to_http_password_login(monkeypatch) -> None:
+    _no_persist(monkeypatch)
+    fresh = FakeClient(status=StatusInfo(checked_in_today=False), user_quota=42.0)
+    profile = FakeProfile(
+        {"new": fresh},
+        login_result={"access_token": "new", "refresh_token": "new-rt"},
+    )
+    site = _site(access_token="", refresh_token="", script_args={"email": "a@b.c", "password": "pw"})
+
+    result = browser_script.query_action(site, profile)
+
+    assert result.ok is True and result.quota_usd == 42.0
+    assert profile.login_calls == 1
