@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -69,6 +70,29 @@ LOGIN_PATTERNS = ["登录", "unauthorized", "token", "not logged in", "access to
 UPGRADED_FLOW_PATTERNS = ["checkin_flow_upgraded", "新版流程", "签到接口已升级"]
 CHALLENGE_UNSUPPORTED_PATTERNS = ["404", "not found", "page not found", "no route", "unsupported"]
 
+# 图形验证码签到（jianzhile 等 fork）：先取图，识别后带 captcha_id + captcha_answer 提交。
+# 实测三种失败文案 —— 全部对应「换一张重试」，而不是「站点不支持」：
+CAPTCHA_ENDPOINT = "/api/user/checkin/captcha"
+CAPTCHA_MISSING_PATTERNS = ["请输入验证码", "captcha is required", "验证码不能为空"]
+CAPTCHA_RETRY_PATTERNS = [
+    "验证码错误", "验证码已失效", "验证码不正确", "captcha", "刷新后重试",
+]
+# captcha_id 单次有效（实测复用直接回「验证码已失效」），所以每次重试都要重新取图。
+CAPTCHA_MAX_ATTEMPTS = 4
+
+
+def _captcha_solver_available() -> bool:
+    """图形验证码识别器是否可用。
+
+    识别器只依赖 numpy（字模表内置在源码里），但仍做一次导入探测：
+    若包被裁剪或 numpy 缺失，应当如实降级为「需人工签到」而不是崩在签到途中。
+    """
+    try:
+        from captcha_ocr import newapi_bitmap  # noqa: F401
+    except Exception:
+        return False
+    return True
+
 
 def _is_antibot_block(error: ApiError) -> bool:
     """判断 ApiError 是否为「urllib 命中阿里云/反爬 JS 挑战页」而非真实业务错误。
@@ -92,6 +116,9 @@ class NewApiClient(ProfileClient):
         self.auth = auth
         self.base_url = normalize_base_url(site.base_url)
         self.referer = self.base_url + (site.referer_path if site.referer_path.startswith("/") else "/" + site.referer_path)
+        # 由 fetch_status 写入：站点是否开启签到图形验证码。None = 尚未查询。
+        # do_checkin 用它决定是否直接走验证码流程，省掉一次「先失败再回退」的往返。
+        self._captcha_required: bool | None = None
 
     # ── 底层请求 ──
     def request(self, method: str, path: str, body: bytes | None = None, *, retry_non_idempotent: bool = False) -> Any:
@@ -137,10 +164,12 @@ class NewApiClient(ProfileClient):
         stats = data.get("stats", {}) if isinstance(data, dict) else {}
         checked_in = stats.get("checked_in_today") if "checked_in_today" in stats else None
         # 部分 New API fork（如 jianzhile）签到需图形验证码：先 POST /api/user/checkin/captcha
-        # 取 captcha_id + captcha_image，人工/OCR 识别后带 captcha_answer 再签到。纯 HTTP
-        # 无法自动识别图片，这里标记为需人机验证，交由 action 层给出清晰的“需手动签到”结论。
-        captcha_required = bool(data.get("captcha_enabled")) if isinstance(data, dict) else False
-        return StatusInfo(checked_in_today=checked_in, turnstile_required=captcha_required, raw=data)
+        # 取 captcha_id + captcha_image，识别后带 captcha_answer 再签到。这类验证码已可由
+        # captcha_ocr.newapi_bitmap 纯离线识别（点阵字体 + 按色分割，实测 100%），所以
+        # **不再**报「需人机验证」；只有识别器不可用时才降级为需人工。
+        self._captcha_required = bool(data.get("captcha_enabled")) if isinstance(data, dict) else False
+        needs_human = self._captcha_required and not _captcha_solver_available()
+        return StatusInfo(checked_in_today=checked_in, turnstile_required=needs_human, raw=data)
 
     def fetch_user(self) -> UserInfo:
         try:
@@ -162,11 +191,24 @@ class NewApiClient(ProfileClient):
         return UserInfo(quota_raw=quota, username=username, raw=data)
 
     def do_checkin(self, turnstile: str = "") -> CheckinReward:
+        # 开启了图形验证码的 fork 走独立流程：先取图识别，再带答案提交。
+        # 已知需要验证码时直接走，避免先提交一次必然失败的请求。
+        if self._captcha_required:
+            return self._reward_from(self._captcha_checkin())
+
         variant = (self.site.api_variant or "auto").strip().lower()
-        if variant == "legacy":
-            data = self._legacy_with_fallback(turnstile)
-        else:
-            data = self._challenge_with_fallback(turnstile)
+        try:
+            if variant == "legacy":
+                data = self._legacy_with_fallback(turnstile)
+            else:
+                data = self._challenge_with_fallback(turnstile)
+        except ApiError as exc:
+            # 兜底：未先查状态就直签（或状态接口没暴露 captcha_enabled）时，
+            # 靠「请输入验证码」这一明确回执切到验证码流程。
+            if contains_any(exc.message, CAPTCHA_MISSING_PATTERNS):
+                self._captcha_required = True
+                return self._reward_from(self._captcha_checkin())
+            raise
         return self._reward_from(data)
 
     def classify(self, error: ApiError) -> str:
@@ -184,6 +226,66 @@ class NewApiClient(ProfileClient):
         return "error"
 
     # ── 签到接口变体 ──
+    def _fetch_captcha(self) -> tuple[str, str]:
+        """取一张签到验证码，返回 (captcha_id, data URL)。"""
+        data = unwrap_data(self.request("POST", CAPTCHA_ENDPOINT, retry_non_idempotent=True))
+        if not isinstance(data, dict):
+            raise ApiError(None, data, "验证码接口返回结构无法识别")
+        captcha_id = str(data.get("captcha_id") or "")
+        image = str(data.get("captcha_image") or "")
+        if not captcha_id or not image:
+            raise ApiError(None, data, "验证码接口未返回 captcha_id / captcha_image")
+        return captcha_id, image
+
+    def _captcha_checkin(self) -> Any:
+        """图形验证码签到：取图 → 离线识别 → 带答案提交，失败则换一张重试。
+
+        每次重试都必须重新取图：captcha_id 单次有效，复用会直接回「验证码已失效」。
+        识别器给出 exact=False（有多余像素或存在并列候选）时也主动换图，
+        因为在这套点阵验证码上 exact 基本等价于「确定正确」，猜提交只会白耗一次。
+        """
+        try:
+            from captcha_ocr import newapi_bitmap
+        except Exception as exc:  # pragma: no cover - 取决于环境
+            raise ApiError(
+                None, None,
+                "签到需要图形验证码，但识别器不可用（captcha_ocr 缺失或 numpy 未安装）。"
+                "请安装依赖后重试，或在浏览器手动签到。",
+            ) from exc
+
+        last_error: ApiError | None = None
+        tried: list[str] = []
+        for attempt in range(1, CAPTCHA_MAX_ATTEMPTS + 1):
+            captcha_id, image = self._fetch_captcha()
+            result = newapi_bitmap.solve_data_url(image)
+            if not result.text:
+                last_error = ApiError(None, None, f"验证码识别失败（第 {attempt} 次，未提取到字符）")
+                continue
+            if not result.exact and attempt < CAPTCHA_MAX_ATTEMPTS:
+                # 识别不确定：换一张比硬猜划算，且不消耗任何签到机会
+                tried.append(f"{result.text}?")
+                continue
+            tried.append(result.text)
+            body = json.dumps(
+                {"captcha_id": captcha_id, "captcha_answer": result.text}
+            ).encode("utf-8")
+            try:
+                return unwrap_data(
+                    self.request("POST", "/api/user/checkin", body, retry_non_idempotent=True)
+                )
+            except ApiError as exc:
+                if contains_any(exc.message, CAPTCHA_RETRY_PATTERNS):
+                    last_error = exc
+                    continue
+                raise
+        detail = "、".join(tried) if tried else "无"
+        raise ApiError(
+            None,
+            last_error.payload if last_error else None,
+            f"图形验证码连续 {CAPTCHA_MAX_ATTEMPTS} 次未通过（识别结果：{detail}）"
+            + (f"；末次回执：{last_error.message}" if last_error else ""),
+        )
+
     def _legacy_checkin(self, turnstile: str = "") -> Any:
         path = "/api/user/checkin"
         if turnstile:
