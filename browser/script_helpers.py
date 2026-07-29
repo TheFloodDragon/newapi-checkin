@@ -138,6 +138,44 @@ class ScriptHelpers:
             return ""
         return str(path)
 
+    # ── 图形验证码 ──
+    def solve_captcha(self, image: Any, scheme: str = "newapi_bitmap") -> str:
+        """识别签到图形验证码，返回答案文本；识别不确定时返回空串。
+
+        `image` 接受 data URL、base64 字符串、PNG 字节流或 numpy 数组 —— 站点脚本
+        通常直接把接口返回的 `captcha_image` 原样传进来。
+
+        返回空串而不是抛异常，也不是返回「猜一个」：验证码 id 大多单次有效，
+        识别不确定时换一张重试的成本远低于提交一次错误答案。调用方应据此循环。
+
+        目前只有 `newapi_bitmap` 一种方案（New API fork 的点阵验证码，见
+        captcha_ocr/newapi_bitmap.py）。纯 API 路径已在 providers/profiles/newapi.py
+        内置同一识别器，这里是给必须走浏览器的站点脚本用的。
+        """
+        if scheme != "newapi_bitmap":
+            self.log(f"未知验证码方案 {scheme!r}")
+            return ""
+        try:
+            from captcha_ocr import newapi_bitmap
+        except Exception as exc:
+            self.log(f"验证码识别器不可用：{exc}")
+            return ""
+
+        try:
+            if isinstance(image, str):
+                result = newapi_bitmap.solve_data_url(image)
+            elif isinstance(image, (bytes, bytearray)):
+                result = newapi_bitmap.solve_bytes(bytes(image))
+            else:
+                result = newapi_bitmap.solve_array(image)
+        except Exception as exc:
+            self.log(f"验证码识别失败：{exc}")
+            return ""
+        if not result.exact:
+            self.log(f"验证码识别不确定（{result.text or '空'}），建议换一张重试")
+            return ""
+        return result.text
+
     def success(
         self,
         message: str,
