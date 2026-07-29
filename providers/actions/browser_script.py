@@ -16,6 +16,8 @@ from ..base import (
     QueryStatus,
     SiteConfig,
     SiteProfile,
+    format_usd,
+    has_awarded_amount,
     normalize_access_token,
     normalize_base_url,
 )
@@ -211,12 +213,24 @@ def _try_api_checkin(site: SiteConfig, profile: SiteProfile) -> CheckinResult | 
             _api_log(site, f"[{stage}] 接口回 200 但无签到证据，交给浏览器脚本确认")
             return None
         awarded = getattr(reward, "quota_awarded", None)
+        is_usd = bool(getattr(client, "quota_is_usd", False))
         if awarded is not None:
             detail["quota_awarded"] = awarded
-            _api_log(site, f"[{stage}] 签到成功，获得 {awarded}")
-            return CheckinResult(site.name, base_url, "success", f"签到成功，获得额度：{awarded}", detail=detail)
-        _api_log(site, f"[{stage}] 签到成功")
-        return CheckinResult(site.name, base_url, "success", "签到成功。", detail=detail)
+            # 必须带上单位标记：sub2api 的额度本身就是美元，不标记会被汇总层
+            # 再除一次 500000（$0.50 → $0.0000）。
+            detail["quota_is_usd"] = is_usd
+        # 只有确实拿到非零金额才写进消息。站点签到成功但不回具体金额时常给 0，
+        # 直接拼进去会显示「获得额度：$0.0000」——既不是事实（并非奖励 0 元），
+        # 也让用户以为签到出了问题。此外这里以前直接拼原始值、不走 format_usd，
+        # newapi 的内部 quota 会原样输出（如「获得额度：250000」）。
+        if has_awarded_amount(awarded, is_usd=is_usd):
+            text = format_usd(awarded, is_usd=is_usd)
+            _api_log(site, f"[{stage}] 签到成功，获得 {text}")
+            return CheckinResult(site.name, base_url, "success", f"签到成功，获得额度：{text}", detail=detail)
+        _api_log(site, f"[{stage}] 签到成功（站点未返回本次获得额度）")
+        return CheckinResult(
+            site.name, base_url, "success", "签到成功（站点未返回本次获得额度）。", detail=detail,
+        )
 
     def _renew_via_refresh(reason: str) -> str:
         """用 refresh_token 做纯 HTTP 续期，返回新 access_token（失败返回空串）。

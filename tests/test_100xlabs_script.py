@@ -122,10 +122,23 @@ class FakeMouse:
 
 
 class FakeResponse:
-    def __init__(self, status: int, url: str, method: str = "POST") -> None:
+    def __init__(
+        self,
+        status: int,
+        url: str,
+        method: str = "POST",
+        body: Any = None,
+    ) -> None:
         self.status = status
         self.url = url
         self.request = SimpleNamespace(method=method)
+        self._body = body
+
+    async def json(self) -> Any:
+        """签到响应体。body=None 时模拟「响应不是 JSON」，与真实站点一致地抛错。"""
+        if self._body is None:
+            raise ValueError("not json")
+        return self._body
 
 
 class FakePage:
@@ -141,6 +154,7 @@ class FakePage:
         login_result: dict[str, Any] | None = None,
         api_checkin_result: dict[str, Any] | None = None,
         api_checkin_result_after_login: dict[str, Any] | None = None,
+        status_result: dict[str, Any] | None = None,
     ) -> None:
         self.elements = elements
         self.url = url
@@ -156,6 +170,9 @@ class FakePage:
         }
         self.api_checkin_result_after_login = api_checkin_result_after_login
         self.api_checkin_requests = 0
+        # 只读签到状态端点 GET /api/v1/check-in/status 的返回；None 表示端点不可用。
+        self.status_result = status_result
+        self.status_requests = 0
         self._login_succeeded = False
         # 密码登录兜底相关（仅登录闸门测试用）。
         self.has_password_field = has_password_field
@@ -178,6 +195,11 @@ class FakePage:
         self.turnstile_clicked = 0
 
     async def evaluate(self, expression: str, arg: Any = None) -> Any:
+        if "/api/v1/check-in/status'" in expression:
+            # 只读状态查询 GET /api/v1/check-in/status（必须排在签到端点判断之前，
+            # 否则 "/api/v1/check-in" 前缀会先命中签到分支）。
+            self.status_requests += 1
+            return self.status_result
         if "/api/v1/check-in'" in expression:
             # 签到接口 POST /api/v1/check-in（注意排在 auth/me 等更长路径判断之前）。
             self.api_checkin_requests += 1
@@ -257,9 +279,14 @@ class FakePage:
     def remove_listener(self, event: str, callback: Callable[[Any], None]) -> None:
         self.listeners.get(event, []).remove(callback)
 
-    def emit_response(self, status: int, url: str = "https://example.invalid/api/check-in") -> None:
+    def emit_response(
+        self,
+        status: int,
+        url: str = "https://example.invalid/api/check-in",
+        body: Any = None,
+    ) -> None:
         for callback in list(self.listeners.get("response", [])):
-            callback(FakeResponse(status, url))
+            callback(FakeResponse(status, url, body=body))
 
 
 class FakeHelpers:
@@ -699,3 +726,146 @@ def test_password_login_fallback_rejected_does_not_leak_credentials(
     rendered = repr(result)
     assert email not in rendered
     assert password not in rendered
+
+
+# ── 点击路径必须回传额度（回归：站点回了额度却只显示「签到成功」）──────────────
+def test_click_path_reports_amounts_from_response_body() -> None:
+    """点击签到后，响应体里的 reward_amount / balance 必须进入结果。
+
+    回归：click_and_confirm 的响应监听此前只记录 status/url、从不读 body，
+    站点明明回了 {"reward_amount":0.5,"balance":26.55} 也全被丢弃，结果只剩
+    「签到成功」而无额度——而 api_fallback 路径早就在读这些字段，两条路径产出不一致。
+    """
+    def finish(page: FakePage, element: FakeElement) -> None:
+        del element
+        page.emit_response(200, body={"reward_amount": 0.5, "balance": 26.55})
+
+    page = FakePage([FakeElement("签到", role="button", on_click=finish)])
+
+    result, _helpers = _run(page)
+
+    assert result["status"] == "success"
+    assert result["detail"]["quota_awarded"] == 0.5
+    assert result["detail"]["current_quota"] == 26.55
+    # 必须标记美元，否则聚合层会再除 500000（$0.50 → $0.0000）
+    assert result["detail"]["quota_is_usd"] is True
+
+
+def test_click_path_reads_amounts_nested_under_data() -> None:
+    """Sub2API 统一响应是 {code:0, data:{...}}，额度在 data 里。"""
+    def finish(page: FakePage, element: FakeElement) -> None:
+        del element
+        page.emit_response(200, body={"code": 0, "data": {"balance_added": 1.25, "balance": 100.0}})
+
+    page = FakePage([FakeElement("签到", role="button", on_click=finish)])
+
+    result, _helpers = _run(page)
+
+    assert result["status"] == "success"
+    assert result["detail"]["quota_awarded"] == 1.25
+    assert result["detail"]["current_quota"] == 100.0
+
+
+def test_click_path_without_json_body_still_succeeds() -> None:
+    """响应不是 JSON 时不能影响签到结论：额度只是附加信息。"""
+    def finish(page: FakePage, element: FakeElement) -> None:
+        del element
+        page.emit_response(200)  # body=None → json() 抛错
+
+    page = FakePage([FakeElement("签到", role="button", on_click=finish)])
+
+    result, _helpers = _run(page)
+
+    assert result["status"] == "success"
+    assert "quota_awarded" not in result["detail"]
+
+
+# ── 「今日已签到」也要带余额状态，与 API 路径对等 ──────────────────────────────
+def test_already_done_by_button_state_reports_balance_from_status_endpoint() -> None:
+    """页面判定已签到时，主动查状态端点补出余额与连续天数。
+
+    回归：这条分支在点击之前就返回，手上没有任何签到响应可读，此前只回一句
+    「今日已签到」而不带额度；同一站点走 API 路径却能报出「今日已签=True
+    余额=$607.51」，两条路径信息量不对等。字段名取自实测响应
+    GET /api/v1/check-in/status → {"data":{"balance":897,"today_reward":5,
+    "current_streak":3,"total_check_in_days":3,"checked_in_today":true}}。
+    """
+    page = FakePage(
+        [FakeElement("今日已签到", role="button", disabled=True)],
+        status_result={
+            "balance": 897.0,
+            "today_reward": 5.0,
+            "checked_in_today": True,
+            "current_streak": 3.0,
+            "total_check_in_days": 3.0,
+        },
+    )
+
+    result, _helpers = _run(page)
+
+    assert result["status"] == "already_done"
+    assert result["detail"]["completion_signal"] == "button_state"
+    assert result["detail"]["current_quota"] == 897.0
+    assert result["detail"]["consecutive_days"] == 3.0
+    assert result["detail"]["total_checkins"] == 3.0
+    assert result["detail"]["checked_in_today"] is True
+    # 余额是美元，必须标记，否则汇总层会再除 500000（$897 → $0.0018）
+    assert result["detail"]["quota_is_usd"] is True
+    assert page.status_requests == 1
+    assert page.clicked == []
+
+
+def test_already_done_still_works_when_status_endpoint_unavailable() -> None:
+    """状态端点不可用时照常返回 already_done：额度只是附加信息。"""
+    page = FakePage(
+        [FakeElement("今日已签到", role="button", disabled=True)],
+        status_result=None,
+    )
+
+    result, _helpers = _run(page)
+
+    assert result["status"] == "already_done"
+    assert "current_quota" not in result["detail"]
+    assert page.status_requests == 1
+
+
+def test_click_then_409_falls_back_to_status_query_for_balance() -> None:
+    """点击后拿到 409（今日已签到）时，补一次状态查询把余额带出来。
+
+    409 响应体通常只有一句「今日已签到」、不含余额，此前这条分支直接返回，
+    结果里没有任何额度信息。与上面 button_state 分支同理：已签到也该报余额。
+    """
+    def finish(page: FakePage, element: FakeElement) -> None:
+        del element
+        page.emit_response(409)
+
+    page = FakePage(
+        [FakeElement("签到", role="button", on_click=finish)],
+        status_result={"balance": 897.0, "current_streak": 3.0, "total_check_in_days": 3.0},
+    )
+
+    result, _helpers = _run(page)
+
+    assert result["status"] == "already_done"
+    assert result["detail"]["response_status"] == 409
+    assert result["detail"]["current_quota"] == 897.0
+    assert result["detail"]["consecutive_days"] == 3.0
+    assert page.status_requests == 1
+
+
+def test_click_then_409_with_balance_in_body_skips_extra_query() -> None:
+    """409 响应体自带余额时不再多打一次状态接口。"""
+    def finish(page: FakePage, element: FakeElement) -> None:
+        del element
+        page.emit_response(409, body={"message": "今日已签到", "balance": 500.0})
+
+    page = FakePage(
+        [FakeElement("签到", role="button", on_click=finish)],
+        status_result={"balance": 897.0},
+    )
+
+    result, _helpers = _run(page)
+
+    assert result["status"] == "already_done"
+    assert result["detail"]["current_quota"] == 500.0
+    assert page.status_requests == 0

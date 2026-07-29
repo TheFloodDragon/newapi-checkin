@@ -85,6 +85,18 @@ def quota_usd_value(value: Any, *, is_usd: bool = False) -> float | None:
     return usd if is_usd else usd / QUOTA_UNIT
 
 
+def has_awarded_amount(value: Any, *, is_usd: bool = False) -> bool:
+    """本次签到是否有「值得展示的获得额度」。
+
+    0 一律视为「没有金额信息」而不是「获得 $0」：站点签到成功但响应里不带具体
+    金额时常回 reward_amount=0 / quota=0，此前会被拼成「签到成功，获得额度：
+    $0.0000」——既不是事实（并非奖励 0 元），也让用户以为签到出了问题。
+    非数字（None / "" / 文本）同样返回 False，交由调用方走无金额分支。
+    """
+    usd = quota_usd_value(value, is_usd=is_usd)
+    return usd is not None and abs(usd) > 0
+
+
 def format_usd(value: Any, *, is_usd: bool = False, fallback: str | None = None) -> str:
     """美元展示：>=0.01 两位小数，否则四位小数；非数字返回 fallback（默认原样字符串）。"""
     usd = quota_usd_value(value, is_usd=is_usd)

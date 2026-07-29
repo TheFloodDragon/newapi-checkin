@@ -33,6 +33,8 @@ import _sub2api_common as common  # noqa: E402
 SPEC = common.SiteSpec(
     site_label="百倍",
     checkin_path="/api/v1/check-in",
+    # 实测 GET 该端点稳定回 {"data":{"checked_in_today":true,"today_reward":5,"balance":897}}。
+    status_path="/api/v1/check-in/status",
     login_reset_sentinel="__x100_login_reset",
     screenshot_prefix="100xlabs",
     default_start_path="/check-in",

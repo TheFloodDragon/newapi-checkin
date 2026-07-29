@@ -46,6 +46,11 @@ class SiteSpec:
     login_reset_sentinel: str
     # 截图文件名前缀（<缓存目录>/browser_script/<prefix>-*.png）。
     screenshot_prefix: str
+    # 只读的签到状态端点（GET）。实测百倍 /api/v1/check-in/status 稳定回
+    # {"data":{"checked_in_today":true,"today_reward":5,"balance":897}}，用于在
+    # 「靠页面文案判定已签到」时补出余额，让脚本路径与 API 路径的产出一致。
+    # 留空表示该 fork 没有状态端点，此时结果照旧不带额度。
+    status_path: str = ""
     default_start_path: str = "/check-in"
     email_env: str = ""
     password_env: str = ""
@@ -790,6 +795,74 @@ async def api_checkin(page: Any, spec: SiteSpec, origin: str) -> dict[str, Any] 
         return None
 
 
+def _query_status_js(status_path: str) -> str:
+    """生成只读状态查询脚本：GET 站点自己的签到状态端点。
+
+    端点选择经实测确定：百倍的 GET /api/v1/check-in/status 稳定返回
+    {"data":{"checked_in_today":true,"today_reward":5,"balance":897,...}}，
+    而 /api/v1/user/profile 实测读超时（HTTP 0）。签到状态端点本就是这条链路的
+    自然数据源，余额、今日奖励、连续天数一次拿齐，无需再猜别的端点。
+
+    不签到、不写任何状态；失败一律返回 null（额度是附加信息，不影响签到结论）。
+    """
+    return """async (baseUrl) => {
+    const token = String(localStorage.getItem('auth_token') || '').trim();
+    if (!token) return null;
+    const num = (value) => (typeof value === 'number' && isFinite(value)) ? value : null;
+    try {
+        const response = await fetch(baseUrl + '%s', {
+            credentials: 'include',
+            headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+        });
+        if (!response.ok) return null;
+        const text = await response.text();
+        let raw = null;
+        try { raw = JSON.parse(text); } catch (_) { return null; }
+        const d = raw && typeof raw.data === 'object' && raw.data ? raw.data : raw;
+        if (!d || typeof d !== 'object') return null;
+        return {
+            balance: num(d.balance ?? d.remaining ?? d.current_balance),
+            today_reward: num(d.today_reward ?? d.reward_amount),
+            checked_in_today: Boolean(d.checked_in_today ?? d.today_checked),
+            current_streak: num(d.current_streak),
+            total_check_in_days: num(d.total_check_in_days),
+        };
+    } catch (_) {
+        return null;
+    }
+}""" % status_path
+
+
+def origin_of(url: str) -> str:
+    """从任意站内 URL 取出 scheme://host 形式的 origin。
+
+    只为省掉给 wait_for_checkin_control 加一个 origin 参数：调用方本来就把
+    resolved_url 传进来了，而页内 fetch 只需要 origin。
+    """
+    text = str(url or "").strip()
+    scheme, sep, rest = text.partition("://")
+    if not sep:
+        return text.rstrip("/")
+    return f"{scheme}://{rest.split('/', 1)[0]}"
+
+
+async def query_status(page: Any, spec: SiteSpec, origin: str) -> dict[str, Any]:
+    """只读查询签到状态（余额 / 今日奖励 / 连续天数）；拿不到返回 {}。
+
+    「今日已签到」由页面文案或按钮状态判定时（wait_for_checkin_control 的两个
+    分支、点击后的 409），流程里没有任何签到响应可读，此前这类结果一律不带额度，
+    GUI 与汇总只能显示「今日已签到」而看不到余额——而 API 路径同样场景会输出
+    「今日已签=True 余额=$607.51」。补这一次只读查询让两条路径产出一致。
+    """
+    if not spec.status_path:
+        return {}
+    try:
+        data = await page.evaluate(_query_status_js(spec.status_path), origin)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 # ── 签到控件定位 ────────────────────────────────────────────────────────────
 async def find_already_control(page: Any, spec: SiteSpec, opts: ScriptOptions) -> tuple[str, Any] | None:
     """找到表示「今日已签到」的控件；未命中返回 None。
@@ -1001,6 +1074,40 @@ async def click_and_confirm(
     """
     base_extra = dict(extra_detail or {})
     response: dict[str, Any] = {}
+    body_tasks: list[Any] = []
+
+    async def _read_amounts(item: Any) -> None:
+        """读签到响应体里的 reward_amount / balance，写进 response。
+
+        点击路径此前只记录 status/url、从不读 body，站点明明回了
+        {"reward_amount":0.5,"balance":26.55} 也全被丢掉，结果只能显示
+        「签到成功」而无额度——api_fallback 路径早就在读这些字段了，两条路径
+        的产出不一致。读 body 失败一律忽略：额度是附加信息，不能影响签到结论。
+        """
+        try:
+            payload = await item.json()
+        except Exception:
+            return
+        data = payload.get("data") if isinstance(payload, dict) else None
+        source = data if isinstance(data, dict) else payload
+        if not isinstance(source, dict):
+            return
+
+        def _num(*keys: str) -> float | None:
+            for key in keys:
+                value = source.get(key)
+                if isinstance(value, bool) or value is None:
+                    continue
+                if isinstance(value, (int, float)):
+                    return float(value)
+            return None
+
+        reward = _num("reward_amount", "balance_added", "today_reward", "quota_awarded")
+        balance = _num("balance", "remaining", "current_balance", "current_quota")
+        if reward is not None:
+            response["reward"] = reward
+        if balance is not None:
+            response["balance"] = balance
 
     def _capture(item: Any) -> None:
         try:
@@ -1014,6 +1121,9 @@ async def click_and_confirm(
             if any(bad in lowered for bad in spec.response_exclude):
                 return
             response.update({"status": int(getattr(item, "status", 0) or 0), "url": url})
+            # 监听回调是同步的，读 body 必须 await：丢到后台任务里，轮询循环
+            # 每轮都会看一眼是否已填好额度。
+            body_tasks.append(asyncio.ensure_future(_read_amounts(item)))
         except Exception:
             return
 
@@ -1052,9 +1162,23 @@ async def click_and_confirm(
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + max(0, opts.completion_timeout_ms) / 1000
+
+        async def _settle_amounts() -> None:
+            """等已派发的 body 读取任务收尾，让额度尽量赶上本次返回。"""
+            if not body_tasks:
+                return
+            pending = [task for task in body_tasks if not task.done()]
+            if not pending:
+                return
+            try:
+                await asyncio.wait(pending, timeout=2)
+            except Exception:
+                pass
+
         while True:
             status = int(response.get("status", 0) or 0)
             if 200 <= status < 300:
+                await _settle_amounts()
                 return helpers.success(
                     spec.success_message,
                     {
@@ -1063,11 +1187,31 @@ async def click_and_confirm(
                         "response_status": status,
                         "response_url": response.get("url", ""),
                     },
+                    quota=response.get("balance"),
+                    awarded=response.get("reward"),
                 )
             if status == 409:
+                # 409 = 今日已签到。响应体里可能就带余额；没有则补一次只读状态查询，
+                # 让「已签到」结果也能报出余额，与 API 路径的产出保持一致。
+                await _settle_amounts()
+                balance = response.get("balance")
+                extra: dict[str, Any] = {}
+                if balance is None:
+                    info = await query_status(page, spec, origin_of(resolved_url))
+                    balance = info.get("balance")
+                    if info.get("current_streak") is not None:
+                        extra["consecutive_days"] = info["current_streak"]
+                    if info.get("total_check_in_days") is not None:
+                        extra["total_checkins"] = info["total_check_in_days"]
                 return helpers.already_done(
                     "今日已签到",
-                    {**base_detail, "completion_signal": "checkin_response", "response_status": status},
+                    {
+                        **base_detail,
+                        "completion_signal": "checkin_response",
+                        "response_status": status,
+                        **extra,
+                    },
+                    quota=balance,
                 )
             if status >= 400:
                 return helpers.error(
@@ -1080,32 +1224,47 @@ async def click_and_confirm(
                     },
                 )
 
+            # 以下几路信号同样带上额度：签到响应可能已经回来（body 里有
+            # reward_amount/balance），只是状态码分支恰好没命中（例如成功文案
+            # 先渲染出来）。不带的话同一次签到会因命中的信号不同而时有时无额度。
             for text in opts.success_texts:
                 if await visible_text(page, text):
+                    await _settle_amounts()
                     return helpers.success(
                         spec.success_message,
                         {**base_detail, "completion_signal": "success_text", "matched_text": text},
+                        quota=response.get("balance"),
+                        awarded=response.get("reward"),
                     )
 
             already_control = await find_already_control(page, spec, opts)
             if already_control:
                 text, _locator = already_control
+                await _settle_amounts()
                 return helpers.success(
                     spec.success_message,
                     {**base_detail, "completion_signal": spec.signal_already_control, "matched_text": text},
+                    quota=response.get("balance"),
+                    awarded=response.get("reward"),
                 )
 
             matched_already = await find_already_text(page, spec, opts)
             if matched_already:
+                await _settle_amounts()
                 return helpers.success(
                     spec.success_message,
                     {**base_detail, "completion_signal": spec.signal_post_click_text, "matched_text": matched_already},
+                    quota=response.get("balance"),
+                    awarded=response.get("reward"),
                 )
 
             if clicked_locator is not None and not await is_visible(clicked_locator):
+                await _settle_amounts()
                 return helpers.success(
                     spec.success_message,
                     {**base_detail, "completion_signal": "button_hidden"},
+                    quota=response.get("balance"),
+                    awarded=response.get("reward"),
                 )
 
             if loop.time() >= deadline:
@@ -1128,6 +1287,11 @@ async def click_and_confirm(
                 page.remove_listener("response", _capture)
             except Exception:
                 pass
+        # 取消仍在读 body 的后台任务：页面即将关闭，未 await 的任务会在事件循环
+        # 收尾时抛「Task was destroyed but it is pending」噪声日志。
+        for task in body_tasks:
+            if not task.done():
+                task.cancel()
 
 
 async def wait_for_checkin_control(
@@ -1150,30 +1314,42 @@ async def wait_for_checkin_control(
     log(helpers, f"等待签到按钮渲染（最多 {opts.button_wait_ms}ms）...")
     loop = asyncio.get_running_loop()
     deadline = loop.time() + max(0, opts.button_wait_ms) / 1000
+
+    async def _already(matched_text: str, signal: str) -> dict[str, Any]:
+        """组装「今日已签到」结果，并补上余额与连续天数。
+
+        这两个分支是在点击签到之前由页面文案/控件状态判定的，手上没有任何签到
+        响应可读，此前只能返回一句「今日已签到」而不带额度——同一个站点走 API
+        路径时却能报出「今日已签=True 余额=$607.51」，两条路径的信息量不对等。
+        这里主动查一次状态端点，查不到就照常返回（额度是附加信息，不影响结论）。
+        """
+        status = await query_status(page, spec, origin_of(resolved_url))
+        balance = status.get("balance")
+        detail: dict[str, Any] = {
+            "matched_text": matched_text,
+            "completion_signal": signal,
+            "target_url": resolved_url,
+            **login_detail,
+        }
+        # 连续天数/累计签到与 API 路径用同一批标准键，汇总层直接就能展示。
+        if status.get("current_streak") is not None:
+            detail["consecutive_days"] = status["current_streak"]
+        if status.get("total_check_in_days") is not None:
+            detail["total_checkins"] = status["total_check_in_days"]
+        if status.get("checked_in_today") is not None:
+            detail["checked_in_today"] = bool(status["checked_in_today"])
+        if balance is not None:
+            log(helpers, f"今日已签到，当前余额 ${balance:.2f}")
+        return helpers.already_done("今日已签到", detail, quota=balance)
+
     while True:
         already = await find_already_control(page, spec, opts)
         if already:
             text, _locator = already
-            return None, helpers.already_done(
-                "今日已签到",
-                {
-                    "matched_text": text,
-                    "completion_signal": spec.signal_already_control,
-                    "target_url": resolved_url,
-                    **login_detail,
-                },
-            )
+            return None, await _already(text, spec.signal_already_control)
         matched_text = await find_already_text(page, spec, opts)
         if matched_text:
-            return None, helpers.already_done(
-                "今日已签到",
-                {
-                    "matched_text": matched_text,
-                    "completion_signal": spec.signal_already_text,
-                    "target_url": resolved_url,
-                    **login_detail,
-                },
-            )
+            return None, await _already(matched_text, spec.signal_already_text)
 
         control = await find_checkin_control(page, opts)
         if control is not None:

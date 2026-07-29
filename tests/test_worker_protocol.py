@@ -199,3 +199,76 @@ def test_site_task_omits_transport_flags_at_defaults(monkeypatch) -> None:
     assert "--no-verify-ssl" not in argv
     assert "--no-auto-refresh-cookie" not in argv
     assert "--referer-path" not in argv
+
+
+# ── 阶段调用日志：批量签到成功时也必须可见 ──────────────────────────────────
+def _result_with_diagnostics(diagnostics: str, *, output: str = "", returncode: int = 0) -> runner.TaskResult:
+    payload = output or json.dumps(
+        {
+            "site": "s",
+            "base_url": "https://s.invalid",
+            "status": "success",
+            "message": "签到成功",
+            "detail": {},
+        },
+        ensure_ascii=False,
+    )
+    return runner.TaskResult(
+        name="s",
+        returncode=returncode,
+        output=payload,
+        diagnostics=diagnostics,
+        worker_protocol=True,
+    )
+
+
+def test_stage_logs_picks_known_prefixes_only() -> None:
+    """只挑阶段日志行，其余 stderr（可能含凭据回显）不纳入。"""
+    result = _result_with_diagnostics(
+        "\n".join(
+            [
+                "[api_first:百倍] 尝试纯 API 签到（使用已保存的 access_token）",
+                "[api_first:百倍] [token] 状态读取成功：今日已签=True 余额=$607.51",
+                "[sub2api:百倍] 已通过浏览器登录态刷新 auth_token",
+                "[browser_script:百倍] 已点击签到控件",
+                "Cookie: session=should-not-be-picked",
+                "[unknown:x] 不在白名单里的前缀",
+            ]
+        )
+    )
+
+    picked = runner.stage_logs(result)
+
+    assert len(picked) == 4
+    assert any("尝试纯 API 签到" in line for line in picked)
+    assert not any("should-not-be-picked" in line for line in picked)
+    assert not any("unknown" in line for line in picked)
+
+
+def test_stage_logs_empty_without_diagnostics() -> None:
+    assert runner.stage_logs(_result_with_diagnostics("")) == []
+
+
+def test_print_result_shows_stage_logs_on_success(capsys) -> None:
+    """回归：阶段日志此前只在 --verbose/失败时随原始输出出现，
+    批量签到成功时完全看不到，用户无法确认是走纯 API 还是退化到开浏览器。"""
+    result = _result_with_diagnostics("[api_first:s] 尝试纯 API 签到（使用已保存的 access_token）")
+
+    runner.print_result(result, verbose=False)
+    out = capsys.readouterr().out
+
+    assert "调用日志：" in out
+    assert "尝试纯 API 签到" in out
+    # 成功任务不应打印完整原始输出
+    assert "原始输出：" not in out
+
+
+def test_print_result_does_not_duplicate_when_raw_shown(capsys) -> None:
+    """要打印原始输出时不再单列调用日志，避免同样的行出现两次。"""
+    result = _result_with_diagnostics("[api_first:s] token 阶段未能完成", returncode=1)
+
+    runner.print_result(result, verbose=False)
+    out = capsys.readouterr().out
+
+    assert "原始输出：" in out
+    assert "调用日志：" not in out

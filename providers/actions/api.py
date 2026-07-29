@@ -16,6 +16,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..base import (
+    QUOTA_UNIT,
     ApiError,
     BrowserAuthError,
     CheckinReward,
@@ -26,6 +27,7 @@ from ..base import (
     SiteProfile,
     StatusInfo,
     format_usd,
+    has_awarded_amount,
 )
 from ._common import build_http_client, credentials_ready
 
@@ -197,9 +199,13 @@ def _checkin_once(site: SiteConfig, client: ProfileClient, turnstile: str) -> Ch
     _inject_current_quota(client, detail)
     if detail.get("unsupported_checkin"):
         return CheckinResult(site.name, base_url, "success", "站点未提供签到接口，已完成余额查询。", detail=detail)
-    if reward.quota_awarded is not None:
+    # 只有确实拿到非零金额才写进消息：站点签到成功但不回具体金额时常给 0，
+    # 拼成「获得额度：$0.0000」既不是事实也让人以为签到失败。
+    if has_awarded_amount(reward.quota_awarded, is_usd=client.quota_is_usd):
         awarded = format_usd(reward.quota_awarded, is_usd=client.quota_is_usd)
         return CheckinResult(site.name, base_url, "success", f"签到成功，获得额度：{awarded}", detail=detail)
+    if reward.quota_awarded is not None and not reward.checkin_unconfirmed:
+        return CheckinResult(site.name, base_url, "success", "签到成功（站点未返回本次获得额度）。", detail=detail)
 
     # 响应里没有任何签到成立的正面证据（无奖励额度、无连续天数、无已签标记）。
     # 这类响应过去被无条件报成「签到成功」，但实测存在 HTTP 200 却未真正发放的情况
@@ -208,8 +214,16 @@ def _checkin_once(site: SiteConfig, client: ProfileClient, turnstile: str) -> Ch
     if reward.checkin_unconfirmed:
         confirmed_quota = _quota_increased(client, quota_before, detail)
         if confirmed_quota is not None:
-            awarded = format_usd(confirmed_quota, is_usd=client.quota_is_usd)
-            detail["quota_awarded"] = confirmed_quota
+            # _quota_increased 返回的 delta **已经是美元**（内部走过 quota_to_usd）。
+            # 之前这里跟着 client.quota_is_usd 传给 format_usd，newapi 站点
+            # （quota_is_usd=False）会被再除一次 500000，$0.50 的真实增量显示成
+            # $0.0000——与「0 值」是两个独立成因，症状却一样。
+            awarded = format_usd(confirmed_quota, is_usd=True)
+            # detail 里的额度单位由 detail["quota_is_usd"] 统一描述（汇总层只认这一个
+            # 开关），因此存回站点原始单位，而不是新造一个只有这里会写的标记键。
+            detail["quota_awarded"] = (
+                confirmed_quota if client.quota_is_usd else confirmed_quota * QUOTA_UNIT
+            )
             return CheckinResult(site.name, base_url, "success", f"签到成功，获得额度：{awarded}", detail=detail)
         if _checked_in_after(client):
             return CheckinResult(site.name, base_url, "success", "签到成功（站点已标记今日已签到）。", detail=detail)

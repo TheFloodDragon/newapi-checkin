@@ -34,6 +34,7 @@ import _sub2api_common as common  # noqa: E402
 SPEC = common.SiteSpec(
     site_label="极速蹬",
     checkin_path="/api/v1/play/checkin",
+    status_path="/api/v1/play/checkin/status",
     login_reset_sentinel="__jsd_login_reset",
     screenshot_prefix="jisudeng",
     default_start_path="/check-in",

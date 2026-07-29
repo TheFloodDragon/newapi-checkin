@@ -428,7 +428,9 @@ def build_detail_note(status: str, message: str, detail: Any) -> str:
             parts.append(message)
         else:
             parts.append("今日已领取，无需重复签到")
-    if status == "success" and not is_blank(quota_awarded):
+    # 0 视为「站点没回具体金额」而非「获得 $0」：否则汇总行会出现
+    # 「获得额度：$0.0000」，看着像签到失败。非零才展示金额。
+    if status == "success" and providers_base.has_awarded_amount(quota_awarded, is_usd=already_usd):
         parts.append(f"获得额度：{format_quota(quota_awarded, already_usd=already_usd)}")
     elif "获得额度" in message:
         parts.append(message)
@@ -557,6 +559,40 @@ def task_result_to_summary(result: TaskResult) -> dict[str, Any]:
     }
 
 
+# 各阶段调用日志的前缀（子进程写 stderr，形如「[api_first:站点名] ...」）。
+# 这类行是排查「卡在哪一级凭据」的主要依据，因此始终打印；真正可能回显
+# Cookie/token 的完整原始输出仍只在 --verbose 或任务失败时才输出。
+STAGE_LOG_PREFIXES = (
+    "api_first:",
+    "sub2api:",
+    "newapi:",
+    "relogin:",
+    "browser_script:",
+)
+
+
+def stage_logs(result: TaskResult) -> list[str]:
+    """从子进程 stderr 里挑出各阶段调用日志（[api_first:站点] ... 这类行）。
+
+    这些行是「签到到底走了哪条路、卡在哪一级」的唯一线索，此前只在 --verbose
+    或任务失败时随「原始输出」整块打印，批量签到成功时完全看不到，用户无法确认
+    是走了纯 API 还是退化到开浏览器。按前缀白名单挑选，避免把可能回显凭据的
+    完整输出无条件打出来。
+    """
+    text = result.diagnostics or ""
+    if not text:
+        return []
+    picked: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("["):
+            continue
+        marker = stripped[1:].split("]", 1)[0]
+        if any(marker.startswith(prefix) for prefix in STAGE_LOG_PREFIXES):
+            picked.append(stripped)
+    return picked
+
+
 def print_result(result: TaskResult, verbose: bool = False) -> None:
     summary = task_result_to_summary(result)
     headline = f"[{summary['site']}] {summary['icon']} {summary['label']}"
@@ -575,7 +611,16 @@ def print_result(result: TaskResult, verbose: bool = False) -> None:
         print(f"  耗时：{summary['duration_seconds']:.1f}s", flush=True)
     # 默认不打印完整原始输出（可能含 Cookie/token 回显）；仅在 verbose 或任务失败时打印，且经脱敏。
     raw_output = "\n".join(part for part in (result.output, result.diagnostics) if part)
-    if raw_output and (verbose or not summary["ok"]):
+    show_raw = bool(raw_output) and (verbose or not summary["ok"])
+    # 阶段日志始终打印：批量签到时这是判断「走了纯 API 还是退化到开浏览器、卡在
+    # 哪一级凭据」的唯一线索，此前只随「原始输出」整块出现，成功任务完全看不到。
+    # 已经要打印原始输出时就不重复（那里本就包含这些行）。
+    stages = stage_logs(result)
+    if stages and not show_raw:
+        print("  调用日志：", flush=True)
+        for line in stages:
+            print(f"    {mask_secrets(line)}", flush=True)
+    if show_raw:
         print("  原始输出：", flush=True)
         print(textwrap.indent(mask_secrets(raw_output), "    "), flush=True)
     print(flush=True)

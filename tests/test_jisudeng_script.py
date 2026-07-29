@@ -92,10 +92,23 @@ class FakeLocator:
 
 
 class FakeResponse:
-    def __init__(self, status: int, url: str, method: str = "POST") -> None:
+    def __init__(
+        self,
+        status: int,
+        url: str,
+        method: str = "POST",
+        body: Any = None,
+    ) -> None:
         self.status = status
         self.url = url
         self.request = SimpleNamespace(method=method)
+        self._body = body
+
+    async def json(self) -> Any:
+        """签到响应体。body=None 时模拟「响应不是 JSON」，与真实站点一致地抛错。"""
+        if self._body is None:
+            raise ValueError("not json")
+        return self._body
 
 
 class FakeMouse:
@@ -244,9 +257,14 @@ class FakePage:
     def remove_listener(self, event: str, callback: Callable[[Any], None]) -> None:
         self.listeners.get(event, []).remove(callback)
 
-    def emit_response(self, status: int, url: str = "https://www.jisudeng.com/api/v1/play/checkin") -> None:
+    def emit_response(
+        self,
+        status: int,
+        url: str = "https://www.jisudeng.com/api/v1/play/checkin",
+        body: Any = None,
+    ) -> None:
         for callback in list(self.listeners.get("response", [])):
-            callback(FakeResponse(status, url))
+            callback(FakeResponse(status, url, body=body))
 
 
 class FakeHelpers:
