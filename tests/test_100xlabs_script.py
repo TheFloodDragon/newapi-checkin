@@ -354,16 +354,42 @@ def _emit_success(page: FakePage, element: FakeElement) -> None:
     page.emit_response(200)
 
 
+def test_page_auth_operations_share_one_refresh_state_machine() -> None:
+    scripts = (
+        SCRIPT.common._AUTHENTICATED_JS,
+        SCRIPT.common._query_status_js(SCRIPT.SPEC.status_path),
+        SCRIPT.common._api_checkin_js(SCRIPT.SPEC.checkin_path),
+    )
+
+    for script in scripts:
+        # 每个 page.evaluate 操作只嵌入一份共享 refresh 状态机。
+        assert script.count("/api/v1/auth/refresh") == 1
+        assert "let refreshAttempted = false" in script
+        assert "if (refreshAttempted) return '';" in script
+        assert "if (response.status === 401)" in script
+        assert "if (refreshed) response = await request(token);" in script
+        # refresh token 轮换时，新 token 必须与 access token 一起写回 localStorage。
+        assert "localStorage.setItem('auth_token', accessToken)" in script
+        assert "localStorage.setItem('refresh_token', newRefreshToken)" in script
+
+    status_script = scripts[1]
+    assert "localStorage.getItem('refresh_token')" in status_script
+    assert "requestWithAuth((accessToken)" in status_script
+
+
 def test_clicks_checkin_now_and_now_buttons() -> None:
     for label in ("Check in now", "now"):
         page = FakePage([FakeElement(label, role="button", on_click=_emit_success)])
 
-        result, _ = _run(page)
+        result, helpers = _run(page)
 
         assert result["status"] == "success"
         assert result["detail"]["completion_signal"] == "checkin_response"
         assert page.clicked == [label]
         assert page.waits == []
+        assert helpers.goto_calls == [
+            ("/check-in", {"timeout": 60000, "wait_until": "commit"})
+        ]
 
 
 def test_force_click_recovers_from_temporary_overlay() -> None:
@@ -642,12 +668,17 @@ def test_password_login_fallback_signs_in_then_checks_in(monkeypatch: Any) -> No
         login_result={"ok": True, "status": 200, "two_factor": False, "message": ""},
     )
 
-    result, _ = _run(page, {"button_wait_ms": 1, "poll_interval_ms": 20})
+    result, helpers = _run(page, {"button_wait_ms": 1, "poll_interval_ms": 20})
 
     assert result["status"] == "success"
     assert page.prepared_login == [email, password]
     assert len(page.login_requests) == 1
     assert page.login_requests[0][1:] == [email, password, "real-turnstile-token"]
+    assert [target for target, _kwargs in helpers.goto_calls] == [
+        "/check-in",
+        "/login?redirect=/check-in",
+        "/check-in",
+    ]
     rendered = repr(result)
     assert email not in rendered
     assert password not in rendered

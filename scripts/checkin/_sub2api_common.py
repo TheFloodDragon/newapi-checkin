@@ -202,57 +202,83 @@ async def on_login_page(page: Any) -> bool:
 
 # ── 登录态验证 / 刷新 ───────────────────────────────────────────────────────
 
-_AUTHENTICATED_JS = """async (baseUrl) => {
-    const checkMe = async (token) => {
-        if (!token) return false;
-        try {
-            const response = await fetch(baseUrl + '/api/v1/auth/me', {
-                credentials: 'include',
-                headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
-            });
-            return Boolean(response.ok);
-        } catch (_) {
-            return false;
-        }
+# authenticated / query_status / api_checkin 都在页面上下文发带 Bearer token 的请求。
+# 统一由这段状态机读取 token、刷新并重试原请求，避免三个调用点各自维护略有差异的
+# refresh 实现。每次 page.evaluate 创建一个 requester；它在整个操作中最多 refresh 一次。
+_PAGE_AUTH_REQUEST_HELPERS_JS = """
+    const parseBody = async (response) => {
+        const text = await response.text();
+        let raw = null;
+        try { raw = JSON.parse(text); } catch (_) { /* 非 JSON */ }
+        return raw;
     };
-    const refresh = async () => {
-        const rt = String(localStorage.getItem('refresh_token') || '').trim();
-        if (!rt) return '';
+    let token = String(localStorage.getItem('auth_token') || '').trim();
+    let refreshAttempted = false;
+    const refreshOnce = async () => {
+        if (refreshAttempted) return '';
+        refreshAttempted = true;
+        const refreshToken = String(localStorage.getItem('refresh_token') || '').trim();
+        if (!refreshToken) return '';
         try {
             const response = await fetch(baseUrl + '/api/v1/auth/refresh', {
                 method: 'POST',
                 credentials: 'include',
                 headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-                body: JSON.stringify({ refresh_token: rt }),
+                body: JSON.stringify({ refresh_token: refreshToken }),
             });
             if (!response.ok) return '';
-            const text = await response.text();
-            let raw = null;
-            try { raw = JSON.parse(text); } catch (_) { /* 非 JSON */ }
+            const raw = await parseBody(response);
             const payload = raw && typeof raw.data === 'object' && raw.data ? raw.data : raw;
-            const access = payload && typeof payload.access_token === 'string'
-                ? payload.access_token.trim() : '';
-            if (access) {
-                localStorage.setItem('auth_token', access);
-                const newRefresh = payload && typeof payload.refresh_token === 'string'
-                    ? payload.refresh_token.trim() : '';
-                if (newRefresh) localStorage.setItem('refresh_token', newRefresh);
-                const expiresIn = Number(payload && payload.expires_in);
-                if (Number.isFinite(expiresIn) && expiresIn > 0) {
-                    localStorage.setItem('token_expires_at', String(Date.now() + expiresIn * 1000));
-                }
+            const accessToken = payload && typeof payload.access_token === 'string'
+                ? payload.access_token.trim()
+                : '';
+            if (!accessToken) return '';
+            token = accessToken;
+            localStorage.setItem('auth_token', accessToken);
+            const newRefreshToken = payload && typeof payload.refresh_token === 'string'
+                ? payload.refresh_token.trim()
+                : '';
+            if (newRefreshToken) localStorage.setItem('refresh_token', newRefreshToken);
+            const expiresIn = Number(payload && payload.expires_in);
+            if (Number.isFinite(expiresIn) && expiresIn > 0) {
+                localStorage.setItem('token_expires_at', String(Date.now() + expiresIn * 1000));
             }
-            return access;
+            return accessToken;
         } catch (_) {
             return '';
         }
     };
-    let token = String(localStorage.getItem('auth_token') || '').trim();
-    if (await checkMe(token)) return true;
-    const refreshed = await refresh();
-    if (refreshed) return await checkMe(refreshed);
-    return false;
-}"""
+    const requestWithAuth = async (request) => {
+        if (!token) await refreshOnce();
+        if (!token) return null;
+        let response = await request(token);
+        if (response.status === 401) {
+            const refreshed = await refreshOnce();
+            if (refreshed) response = await request(token);
+        }
+        return response;
+    };
+"""
+
+
+def _page_auth_script(operation_js: str) -> str:
+    """把一次页内鉴权操作包进共享 token/refresh 状态机。"""
+    return "async (baseUrl) => {\n" + _PAGE_AUTH_REQUEST_HELPERS_JS + operation_js + "\n}"
+
+
+_AUTHENTICATED_JS = _page_auth_script(
+    """
+    try {
+        const response = await requestWithAuth((accessToken) => fetch(baseUrl + '/api/v1/auth/me', {
+            credentials: 'include',
+            headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' },
+        }));
+        return Boolean(response && response.ok);
+    } catch (_) {
+        return false;
+    }
+"""
+)
 
 
 async def authenticated(page: Any, origin: str) -> bool:
@@ -387,11 +413,10 @@ async def submit_login(
 
 
 async def persist_state(context: Any, site: Any) -> None:
-    """把浏览器当前 storage_state 写回 ACCOUNTS.json，让 refresh_token 滚动续期。
+    """把浏览器当前 storage_state 写入运行期缓存，让 refresh_token 滚动续期。
 
-    每次成功签到都续存最新登录态，从根本上缓解「登录态频繁失效」：只要脚本
-    跑过一次，refresh_token 就会被刷新并存回，下次无需重新登录。任何异常都
-    静默忽略（回写失败不影响本次签到结果）。
+    每次登录闸门通过后都续存最新登录态；下次运行优先复用缓存，无需改写用户的
+    ACCOUNTS.json。任何异常都静默忽略（缓存失败不影响本次签到结果）。
     """
     if context is None:
         return
@@ -418,7 +443,7 @@ async def persist_state(context: Any, site: Any) -> None:
         # 写运行期缓存而非 ACCOUNTS.json：浏览器每次打开站点都会刷新 cookie /
         # localStorage，写回配置会让用户文件被后台任务反复改写（也会和 GUI 里的
         # 手工编辑抢锁）。登录态属运行期产物，缓存已 gitignore。
-        token_cache.save_browser_state(site_name, site_base, encoded)
+        token_cache.save_site_browser_state(site, encoded)
     except Exception:
         return
 
@@ -671,24 +696,19 @@ async def login_with_password(
 
 def _api_checkin_js(checkin_path: str) -> str:
     """生成调用站点签到接口的 JS。各 fork 端点不同，由 SiteSpec 指定。"""
-    return """async (baseUrl) => {
-    const parseBody = async (response) => {
-        const text = await response.text();
-        let raw = null;
-        try { raw = JSON.parse(text); } catch (_) { /* 非 JSON */ }
-        return raw;
-    };
-    const doCheckin = async (token) => {
-        const response = await fetch(baseUrl + '%s', {
-            method: 'POST',
-            credentials: 'include',
-            headers: {
-                Authorization: `Bearer ${token}`,
-                Accept: 'application/json',
-                'Content-Type': 'application/json',
-            },
-            body: '{}',
-        });
+    return _page_auth_script(
+        """
+    const doCheckin = (accessToken) => fetch(baseUrl + '%s', {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+            Authorization: `Bearer ${accessToken}`,
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+        },
+        body: '{}',
+    });
+    const readOutcome = async (response) => {
         const raw = await parseBody(response);
         const payload = raw && typeof raw.data === 'object' && raw.data ? raw.data : raw;
         const code = raw && typeof raw === 'object'
@@ -722,63 +742,28 @@ def _api_checkin_js(checkin_path: str) -> str:
             message: message.replace(/[\\r\\n]/g, ' ').slice(0, 160),
         };
     };
-    // 复刻站点前端 axios 拦截器：401 时用 refresh_token 刷新 access_token。
-    const refreshToken = async () => {
-        const rt = String(localStorage.getItem('refresh_token') || '').trim();
-        if (!rt) return '';
-        try {
-            const response = await fetch(baseUrl + '/api/v1/auth/refresh', {
-                method: 'POST',
-                credentials: 'include',
-                headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-                body: JSON.stringify({ refresh_token: rt }),
-            });
-            if (!response.ok) return '';
-            const raw = await parseBody(response);
-            const payload = raw && typeof raw.data === 'object' && raw.data ? raw.data : raw;
-            const access = payload && typeof payload.access_token === 'string'
-                ? payload.access_token.trim()
-                : '';
-            if (access) {
-                localStorage.setItem('auth_token', access);
-                const newRefresh = payload && typeof payload.refresh_token === 'string'
-                    ? payload.refresh_token.trim()
-                    : '';
-                if (newRefresh) localStorage.setItem('refresh_token', newRefresh);
-                const expiresIn = Number(payload && payload.expires_in);
-                if (Number.isFinite(expiresIn) && expiresIn > 0) {
-                    localStorage.setItem('token_expires_at', String(Date.now() + expiresIn * 1000));
-                }
-            }
-            return access;
-        } catch (_) {
-            return '';
-        }
-    };
-    let token = String(localStorage.getItem('auth_token') || '').trim();
-    if (!token) {
-        token = await refreshToken();
-        if (!token) {
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    try {
+        let response = await requestWithAuth(doCheckin);
+        if (!response) {
             return { ok: false, status: 401, already: false, code: 'NO_TOKEN', message: '' };
         }
-    }
-    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-    try {
-        let outcome = await doCheckin(token);
-        if (outcome.status === 401) {
-            const refreshed = await refreshToken();
-            if (refreshed) outcome = await doCheckin(refreshed);
-        }
+        let outcome = await readOutcome(response);
         // 502/503/504 等网关错误是服务端瞬时故障（非端点变更），重试至多两次。
+        // 所有重试复用同一个 requester，因此整次签到最多 refresh 一次。
         for (let i = 0; i < 2 && outcome.status >= 502 && outcome.status <= 504; i++) {
             await sleep(1500 * (i + 1));
-            outcome = await doCheckin(token);
+            response = await requestWithAuth(doCheckin);
+            if (!response) break;
+            outcome = await readOutcome(response);
         }
         return outcome;
     } catch (_) {
         return { ok: false, status: 0, already: false, code: 'FETCH_ERROR', message: '' };
     }
-}""" % checkin_path
+"""
+        % checkin_path
+    )
 
 
 async def api_checkin(page: Any, spec: SiteSpec, origin: str) -> dict[str, Any] | None:
@@ -805,32 +790,31 @@ def _query_status_js(status_path: str) -> str:
 
     不签到、不写任何状态；失败一律返回 null（额度是附加信息，不影响签到结论）。
     """
-    return """async (baseUrl) => {
-    const token = String(localStorage.getItem('auth_token') || '').trim();
-    if (!token) return null;
+    return _page_auth_script(
+        """
     const num = (value) => (typeof value === 'number' && isFinite(value)) ? value : null;
     try {
-        const response = await fetch(baseUrl + '%s', {
+        const response = await requestWithAuth((accessToken) => fetch(baseUrl + '%s', {
             credentials: 'include',
-            headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
-        });
-        if (!response.ok) return null;
-        const text = await response.text();
-        let raw = null;
-        try { raw = JSON.parse(text); } catch (_) { return null; }
-        const d = raw && typeof raw.data === 'object' && raw.data ? raw.data : raw;
-        if (!d || typeof d !== 'object') return null;
+            headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' },
+        }));
+        if (!response || !response.ok) return null;
+        const raw = await parseBody(response);
+        const data = raw && typeof raw.data === 'object' && raw.data ? raw.data : raw;
+        if (!data || typeof data !== 'object') return null;
         return {
-            balance: num(d.balance ?? d.remaining ?? d.current_balance),
-            today_reward: num(d.today_reward ?? d.reward_amount),
-            checked_in_today: Boolean(d.checked_in_today ?? d.today_checked),
-            current_streak: num(d.current_streak),
-            total_check_in_days: num(d.total_check_in_days),
+            balance: num(data.balance ?? data.remaining ?? data.current_balance),
+            today_reward: num(data.today_reward ?? data.reward_amount),
+            checked_in_today: Boolean(data.checked_in_today ?? data.today_checked),
+            current_streak: num(data.current_streak),
+            total_check_in_days: num(data.total_check_in_days),
         };
     } catch (_) {
         return null;
     }
-}""" % status_path
+"""
+        % status_path
+    )
 
 
 def origin_of(url: str) -> str:
@@ -962,7 +946,7 @@ async def click_checkin(
 
 
 # ── 页面就绪 ────────────────────────────────────────────────────────────────
-async def settle_page(page: Any, helpers: Any, target: str, opts: ScriptOptions) -> None:
+async def navigate_and_settle(page: Any, helpers: Any, target: str, opts: ScriptOptions) -> None:
     """导航到目标页并尽力等待 SPA 首屏数据落地。
 
     先等 domcontentloaded，再尽力等一次 networkidle：签到按钮要等前端 XHR 拉完

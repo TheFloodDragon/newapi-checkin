@@ -338,8 +338,21 @@ def test_clicks_checkin_button_and_accepts_success_response() -> None:
     assert result["status"] == "success"
     assert result["detail"]["completion_signal"] == "checkin_response"
     assert page.clicked == ["立即签到"]
-    assert helpers.goto_calls[0][0] == "/check-in"
+    assert helpers.goto_calls == [
+        ("/check-in", {"timeout": 60000, "wait_until": "commit"})
+    ]
     assert page.listeners == {"response": []}
+
+
+def test_status_query_uses_shared_refresh_token_flow() -> None:
+    script = SCRIPT.common._query_status_js(SCRIPT.SPEC.status_path)
+
+    assert SCRIPT.SPEC.status_path in script
+    assert script.count("/api/v1/auth/refresh") == 1
+    assert "localStorage.getItem('refresh_token')" in script
+    assert "if (response.status === 401)" in script
+    assert "if (refreshAttempted) return '';" in script
+    assert "localStorage.setItem('refresh_token', newRefreshToken)" in script
 
 
 def test_already_done_state_does_not_click() -> None:
@@ -532,12 +545,17 @@ def test_password_login_fallback_signs_in_then_checks_in(monkeypatch: Any) -> No
         login_result={"ok": True, "status": 200, "two_factor": False, "message": ""},
     )
 
-    result, _ = _run(page, {"button_wait_ms": 1, "poll_interval_ms": 20})
+    result, helpers = _run(page, {"button_wait_ms": 1, "poll_interval_ms": 20})
 
     assert result["status"] == "success"
     assert page.prepared_login == [email, password]
     assert len(page.login_requests) == 1
     assert page.login_requests[0][1:] == [email, password, "real-turnstile-token"]
+    assert [target for target, _kwargs in helpers.goto_calls] == [
+        "/check-in",
+        "/login?redirect=/check-in",
+        "/check-in",
+    ]
     # 凭据不得泄漏进结果。
     rendered = repr(result)
     assert email not in rendered

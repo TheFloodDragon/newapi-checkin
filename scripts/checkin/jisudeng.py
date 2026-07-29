@@ -84,8 +84,7 @@ async def run(page: Any, context: Any, site: Any, helpers: Any) -> dict[str, Any
     # 地落为「已登出」，页面干净停在 /login，再交给账密登录兜底。
     await common.add_init_script(context, common.preflight_init_script())
 
-    await helpers.goto(start_target, timeout=opts.goto_timeout, wait_until=opts.wait_until)
-    await common.settle_page(page, helpers, start_target, opts)
+    await common.navigate_and_settle(page, helpers, start_target, opts)
 
     # 登录闸门：只以页面是否真正落在 /login 为判据。不能主动用 localStorage 的
     # auth_token 探测 /auth/me——SPA 加载时会用 refresh_token 换出只存在内存的新
@@ -97,16 +96,15 @@ async def run(page: Any, context: Any, site: Any, helpers: Any) -> dict[str, Any
         login_result = await do_login()
         if login_result is not None:
             return login_result
-        await helpers.goto(start_target, timeout=opts.goto_timeout, wait_until="commit")
-        await common.settle_page(page, helpers, start_target, opts)
+        await common.navigate_and_settle(page, helpers, start_target, opts)
         if await common.on_login_page(page):
             return helpers.need_login(
                 "极速蹬登录后仍停留在登录页，请检查凭据或稍后重试",
                 {"target_url": resolved_url, "login_fallback": "redirect_failed", **login_detail},
             )
 
-    # 登录闸门已通过。把浏览器当前 storage_state 回写 ACCOUNTS.json，让
-    # refresh_token 滚动续期，缓解「登录态频繁失效」。
+    # 登录闸门已通过。把当前 storage_state 写入运行期缓存，让滚动续期后的
+    # refresh_token 在下次运行继续复用，而不改写用户账号配置。
     await common.persist_state(context, site)
 
     # SPA 的签到按钮要等前端拉完签到数据才渲染；轮询等待已签到状态或可点按钮。
