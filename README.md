@@ -1,390 +1,655 @@
-# checkin —— 公益站自动签到
+# newapi-checkin
 
-轻量、以标准库为主的自动签到调度器，覆盖 New API / Sub2API 系公益站。支持接口签到、访问保活、OAuth 重登发额度，以及自定义浏览器脚本；浏览器路径使用 [Camoufox](https://camoufox.com)（Firefox 反检测浏览器）突破 Cloudflare / 阿里云 WAF。
+面向 **New API / Sub2API 系中转站**的自动签到、额度查询与登录态管理工具。
 
-本项目以 [MIT License](LICENSE) 开源。
+项目把站点差异、认证方式和签到动作拆成三个独立维度，优先使用纯 HTTP；只有在 Token 续期、OAuth 重登、Cloudflare / 阿里云 WAF 或页面交互确实需要时，才启动 Camoufox 浏览器。
 
-## 快速开始
+- 纯 API 签到、余额查询与访问保活
+- New API challenge / legacy 双流程按错误类型条件化回退
+- Sub2API Token、Refresh Token、账密与浏览器多级降级
+- Linux.do / GitHub OAuth 登录态共享与自动重登
+- 仓库内 Python 站点脚本：纯 HTTP 钩子与浏览器钩子
+- New API 图形验证码离线识别
+- 极速蹬签到后每日答题
+- 深浅主题图形管理界面
+- GitHub Actions 定时签到、缓存与脱敏报告
+
+> [!WARNING]
+> `ACCOUNTS.json`、OAuth 登录态、`browser_state`、Token 和 Cookie 都属于敏感凭据。它们已被 `.gitignore` 忽略，但仍应只保存在本机或 GitHub Secret 中，切勿提交、截图或公开转发。
+
+---
+
+## 1. 选择适合的运行方式
+
+| 场景 | 推荐配置 | 是否启动浏览器 |
+|---|---|---:|
+| 站点有稳定签到接口，已有 Token / Cookie | `access_token` 或 `cookie` + `api` | 否 |
+| New API fork 的签到要求图形验证码 | `access_token` + `api` + `scripts/newapi_captcha.py` | 否 |
+| New API 接口被阿里云 WAF 拦截 | `browser` + `api` | 需要，用于过 WAF 和导出 Cookie |
+| 站点没有签到接口，只需保活和监控额度 | `access_token` / `cookie` + `visit` | 否 |
+| 额度在第三方 OAuth 登录回调时发放 | `oauth` + `relogin` | 需要 |
+| 站点只有页面签到按钮或私有交互 | `browser` / `oauth` + `browser_script` | API 可完成时不启动，否则启动 |
+| Sub2API Token 可能过期 | 配置 `access_token` + `refresh_token` | 通常不需要 |
+
+浏览器脚本并不等于“每次都开浏览器”。`browser_script` 会先尝试纯 API、Refresh Token 和可用的纯 HTTP 账密登录；只有这些路径都不能给出明确结果时才启动浏览器。
+
+---
+
+## 2. 快速开始
+
+### 2.1 环境要求
+
+- Python **3.11+**
+- 推荐使用 [uv](https://docs.astral.sh/uv/)
+- 使用 GUI：安装 `gui` extra
+- 使用图形验证码脚本或运行测试：安装 `dev` extra（其中包含 Pillow）
+- 使用浏览器流程：下载 Camoufox 浏览器
+- 使用 New API challenge 流程：本机需要 Node.js；未安装时应安装 Node.js，或把对应站点显式设为 `api_variant=legacy`
+
+### 2.2 安装
 
 ```bash
-# 1. 安装依赖（推荐 uv，使用锁定版本）
+# 基础运行环境
 uv sync
-# 浏览器路径（browser / oauth / relogin / browser_script）首次运行前拉取 Camoufox
+
+# 图形管理界面
+uv sync --extra gui
+
+# 测试工具 + Pillow（scripts/newapi_captcha.py 需要）
+uv sync --extra dev
+
+# browser / oauth / relogin / browser_script 首次运行前执行一次
 uv run python -m camoufox fetch
+```
 
-# 2. 从示例生成本地凭据文件（ACCOUNTS.json 已被 .gitignore，不会入库）
+`uv.lock` 固定了实际解析版本。`pyproject.toml` 当前主要依赖如下：
+
+| 用途 | 依赖 |
+|---|---|
+| 浏览器自动化 | `camoufox[geoip]==0.4.11` |
+| CAPTCHA / 数值计算 | `numpy>=2.4.6` |
+| CAPTCHA 交互 | `playwright-captcha==0.1.5` |
+| GUI extra | `PySide6==6.11.1` |
+| dev extra | `pillow>=12.3.0`、`pytest==8.4.2`、`ruff==0.15.21` |
+
+### 2.3 创建配置
+
+Git Bash / Linux / macOS：
+
+```bash
 cp ACCOUNTS.example.json ACCOUNTS.json
-# 按需编辑 ACCOUNTS.json，填入各站点的 access_token / cookie / oauth_states
+```
 
-# 3. 运行所有启用站点
+PowerShell：
+
+```powershell
+Copy-Item ACCOUNTS.example.json ACCOUNTS.json
+```
+
+推荐直接打开管理界面完成配置：
+
+```bash
+uv run python manage_accounts.py
+```
+
+也可以手工编辑 `ACCOUNTS.json`，然后批量执行：
+
+```bash
 uv run python run__all_checkin.py
 ```
 
-> ⚠️ **凭据安全**：`ACCOUNTS.json`、`oauth_states`、`browser_state` 等含敏感登录态，已在 `.gitignore` 中忽略，**切勿提交进仓库**。GitHub Actions 部署时改为存入仓库 Secret `ACCOUNTS`（见「GitHub Actions 部署」）。
+Windows 还可双击 `run_all_checkin.bat`。
 
-## 依赖与版本锁定
+---
 
-依赖在 `pyproject.toml` 中被**精确锁定**，并生成 `uv.lock`，保证本地与 CI 完全一致：
-
-| 用途 | 包 | 版本 |
-|------|----|------|
-| 运行时 | `camoufox[geoip]` | `0.4.11` |
-| 运行时 | `playwright-captcha` | `0.1.5` |
-| GUI（可选 `--extra gui`） | `PySide6` | `6.11.1` |
-| 开发（可选 `--extra dev`） | `pytest` | `8.4.2` |
-| 开发（可选 `--extra dev`） | `ruff` | `0.15.21` |
-
-```bash
-uv sync                 # 运行时依赖
-uv sync --extra gui     # 额外安装 GUI（PySide6）
-uv sync --extra dev     # 额外安装测试/静态检查工具
-uv sync --locked        # 严格按 uv.lock 安装（CI 使用）
-```
-
-challenge 新版签到需要本机 **Node.js**（执行 WASM PoW，见 `checkin_challenge.js`）；缺失时会退回 legacy 接口或提示安装。
-
-## 数据模型：三个正交维度
-
-签到能力拆成三个互相独立、可自由组合的维度：
-
-| 维度 | 字段 | 含义 | 可选值 |
-|------|------|------|--------|
-| **站点适配器** | `site_profile` | 接口长什么样（路径 / 请求头 / 响应解析 / 额度换算） | `newapi` / `sub2api` |
-| **登录方式** | `auth_method` | 如何获得已认证会话 | `access_token` / `cookie` / `browser` / `oauth` |
-| **签到方式** | `checkin_action` | 如何触发发额度 | `api` / `relogin` / `visit` / `browser_script` |
-
-辅助字段：
-
-- `api_variant`（仅 `newapi` + `api`）：接口变体偏好，`auto`（challenge 优先，默认）/ `legacy`（旧接口优先）。两种变体互为失败兜底。
-- `oauth_provider` + `oauth_account`（`auth_method=oauth` 或 `checkin_action=relogin`）：选择共享 OAuth 登录态，支持同一 provider 下多个账号。
-- `script` / `script_args` / `script_timeout`：仓库内相对 Python 脚本路径、脚本参数 JSON 对象、脚本超时秒数。两种签到方式都能挂脚本，但钩子不同：
-  - `checkin_action=browser_script`：**必填**，脚本的 `run(page, context, site, helpers)` 在 Camoufox 里执行；
-  - `checkin_action=api`：**可选**，脚本的 `do_checkin(client, log)` 走纯 HTTP，用于站点私改的签到流程（如 New API fork 的图形验证码），返回 `None` 则回落默认签到。`script_timeout` 对它无意义（超时由 HTTP 层管）。
-
-**有意义的组合**：
-
-| site_profile | auth_method | checkin_action | 适用场景 |
-|--------------|-------------|----------------|----------|
-| newapi | access_token / cookie | api | 普通 New API 站签到（challenge / legacy） |
-| newapi | browser | api | 阿里云 WAF 站点混合签到：站点级 `browser_state` 启浏览器过 WAF 导出 cookie，再用 HTTP 发签到请求 |
-| sub2api | access_token | api | Sub2API 前端登录 token / 可选 API Key；优先试 `/v1/usage`，`INVALID_API_KEY` 时回退前端登录态接口 |
-| sub2api | browser | api | Sub2API 每次先用站点级 `browser_state` 刷新 auth_token 再查询 |
-| sub2api | oauth | api | Sub2API 每次先用选定 OAuth 账号刷新 auth_token 再查询 |
-| newapi | access_token / cookie | visit | 无签到接口、登录即发额度站点的「保活 + 余额监控」 |
-| newapi | oauth | relogin | 浏览器自动重放第三方 OAuth 登录，**真正触发发额度** |
-| newapi / sub2api | oauth / browser | browser_script | 恢复浏览器登录态后执行仓库内自定义 Python 脚本 |
-
-代码组织（`providers/` 包）：
-
-- `base.py`     —— 共用模型（`SiteConfig` / `ProfileClient` / `CheckinResult` 等）、HTTP 与文本工具；
-- `auth.py`     —— 登录方式：把凭据加载/规范化为统一 `AuthInfo`；
-- `profiles/`   —— 站点适配器（`newapi.py` / `sub2api.py`），只管「接口长什么样」；
-- `actions/`    —— 签到方式（`api.py` / `relogin.py` / `visit.py` / `browser_script.py`），只管「如何触发发额度」；
-- `__init__.py` —— 组装入口：`run_checkin` 按 `site_profile` 选 profile，按 `checkin_action` 执行动作，动作内部按 `auth_method` 准备认证。
-
-`SiteConfig` 的构造统一收敛到 `accounts_store.site_config_from_mapping()`，CLI、批量调度与 GUI 共用同一条规范化路径。
-
-> **旧字段自动迁移**：旧配置的 `type` + `checkin_mode` 会在读取时自动映射为新三维字段并**写回** `ACCOUNTS.json`（`legacy/challenge → api`，`login_grant → visit`，`browser_oauth → oauth+relogin`；`challenge/legacy` 顺带写入 `api_variant`）。旧版 `oauth_states.provider.state` 会迁移为 `oauth_states.provider.accounts.default.state`。
-
-## 配置文件（ACCOUNTS.json）
-
-`ACCOUNTS.json` 统一保存站点配置、启用状态与凭据，已被 `.gitignore` 忽略，仅本地或 GitHub Secret 中保存。参见 `ACCOUNTS.example.json`。
-
-**三维字段全集**：
-
-```json5
-{
-  "accounts": [
-    {
-      "name": "某 New API 站",
-      "base_url": "https://example.com",
-      "site_profile": "newapi",              // 站点适配器：newapi / sub2api
-      "auth_method": "cookie",               // 登录方式：access_token / cookie / browser / oauth
-      "checkin_action": "api",               // 签到方式：api / visit / relogin / browser_script
-      "api_variant": "auto",                 // 接口变体偏好（仅 newapi + api）：auto / legacy
-      "enabled": true,
-      "cookie": "session=xxx",               // Cookie（auth_method=cookie 时必填）
-      "access_token": "eyJ...",              // Bearer token（auth_method=access_token 时必填）
-      "user_id": "1234",                     // newapi 的 New-Api-User 请求头
-      "proxy": "http://user:pass@host:port"  // 可选：HTTP 签到仅支持 http/https 代理
-    },
-    {
-      "name": "Sub2API",
-      "base_url": "https://sub.100xlabs.space",
-      "site_profile": "sub2api",
-      "auth_method": "access_token",
-      "checkin_action": "api",
-      "access_token": "eyJhbGc...",
-      "user_id": "19653"
-    },
-    {
-      "name": "AgentRouter 站",
-      "base_url": "https://agentrouter.org",
-      "site_profile": "newapi",
-      "auth_method": "oauth",
-      "checkin_action": "relogin",           // OAuth 重登签到（真正触发发额度）
-      "oauth_provider": "linuxdo",           // linuxdo / github
-      "oauth_account": "default"             // provider 下的账号名；登录态存顶层 oauth_states
-    },
-    {
-      "name": "浏览器脚本站",
-      "base_url": "https://example.100xlabs.com",
-      "site_profile": "newapi",
-      "auth_method": "oauth",
-      "checkin_action": "browser_script",
-      "script": "scripts/checkin/100xlabs.py",
-      "script_args": { "start_path": "/check-in", "checkin_text": "签到" },
-      "script_timeout": 120,
-      "oauth_provider": "linuxdo",
-      "oauth_account": "default"
-    }
-  ],
-  "oauth_states": {
-    "linuxdo": {
-      "accounts": {
-        "default": { "state": "eyJvcmlnaW4iOi...", "username": "", "updated_at": "2026-07-05T12:00:00" }
-      }
-    },
-    "github": {
-      "accounts": {
-        "default": { "state": "eyJvcmlnaW4iOi...", "username": "", "updated_at": "2026-07-05T12:00:00" }
-      }
-    }
-  }
-}
-```
-
-**简化版（只写必填字段）**：
-
-```json5
-[
-  { "name": "简单站", "base_url": "https://elysiver.h-e.top",
-    "site_profile": "newapi", "auth_method": "access_token", "checkin_action": "api",
-    "access_token": "eyJ...", "user_id": "14573" },
-  { "name": "Sub2API", "base_url": "https://sub.100xlabs.space",
-    "site_profile": "sub2api", "auth_method": "access_token", "checkin_action": "api",
-    "access_token": "eyJh..." }
-]
-```
-
-支持的顶层形态：`{"accounts": [...]}`、`{"accounts": {"站点名": {...}}}`、`[...]`。旧对象格式与 `type` + `checkin_mode` 仍能识别并自动迁移。
-
-**配置读写的健壮性约定**：
-
-- **损坏即失败**：`ACCOUNTS.json` 存在但不是合法 JSON（例如上次写入被中断）时，读取会抛 `ConfigError` 并附带清晰提示，而**不会**静默当作空配置或回退——避免下次保存覆盖真实数据。
-- **原子写入 + 文件锁**：账号、共享 OAuth 登录态、额度状态（`login_grant_state.json`）、汇总结果与 CI 报告的写入均采用「同目录临时文件 + `fsync` + `os.replace`」并持有跨进程文件锁，并发签到不会互相覆盖（lost update）。
-- **保留未知元数据**：写回时保留 `ACCOUNTS.json` 顶层未知字段与账号条目里的自定义字段，不会丢失。
-- **唯一身份更新**：刷新 token / 登录态回写时要求 `name` + `base_url` 唯一定位账号；出现歧义会拒绝写入而非误改。
-
-## 代理与安全模型
-
-**代理**：
-
-- **HTTP 签到路径**（`api` / `visit`）使用标准库 `urllib`，仅支持 **http/https 代理**；填入 `socks5://` 会被明确拒绝并提示。代理通过显式 `ProxyHandler` 注入，不隐式继承进程级环境代理。
-- **浏览器路径**（`browser` / `oauth` / `relogin` / `browser_script`）由 Camoufox 驱动，支持 http/https/socks5 代理。
-- 站点未配 `proxy` 时回退到全局 `CHECKIN_PROXY`（CI 可从 Secret 注入住宅代理）。
-
-**凭据与脱敏**：
-
-- 批量调度器把 cookie / access_token / user_id / proxy 等敏感值通过**环境变量**传给子进程，**不出现在命令行参数**中（避免进程列表泄露）。
-- 子进程 worker 的 **stdout 是机器协议通道**：只输出单行紧凑 JSON；所有诊断/日志改走 stderr。
-- 打印到控制台、写入结果 JSON 与 CI Markdown 报告前，统一经 `mask_utils` 脱敏，覆盖 Cookie、`Bearer`、`Authorization`、JWT、`sk-*`、OAuth `state`、以及 URL 中的 `user:password@` 凭据；结果结构会递归清理敏感键。
-
-## 运行
-
-```bash
-# 批量执行所有启用站点；每站点独立子进程，结果写入 .cache-checkin/checkin_result.json
-uv run python run__all_checkin.py
-uv run python run__all_checkin.py --verbose   # 额外打印每个任务的完整原始输出（已脱敏）
-
-# 直接读 ACCOUNTS.json（按三维字段路由）
-uv run python checkin.py
-
-# 临时签到单站点（三维字段 + 凭据）
-uv run python checkin.py --base-url https://x --site-profile newapi --auth-method access_token --checkin-action api --access-token xxx --user-id 123
-uv run python checkin.py --base-url https://x --site-profile sub2api --auth-method access_token --checkin-action api --access-token xxx
-```
-
-Windows 可双击 `run_all_checkin.bat`。
-
-> **worker 协议**：`run__all_checkin.py` 为每个站点启动 `checkin.py --worker` 子进程，读取其 stdout 的单行 JSON 结果，并严格校验字段、状态合法性与退出码一致性；协议不符或退出码与状态矛盾会被判为失败，而不是根据「退出码 0」猜成功。
-
-## 额度显示
-
-所有额度统一显示为 USD：
-
-- `newapi`：站点返回内部 quota，按 `/500000` 换算为美元；
-- `sub2api`：优先使用 `GET /v1/usage`，按 `remaining ?? quota.remaining ?? balance` 识别余额，单位取 `unit ?? quota.unit ?? "USD"`；不可用时回退前端登录态接口。`quota_is_usd` 标记确保不会二次换算。
-
-## 登录即发额度类站点（如 AgentRouter）
-
-部分中转站**没有任何独立签到接口**，额度是在**第三方 OAuth 登录（Linux.do / GitHub）回调时发放**。两种应对方式：
-
-### `visit`：保活 + 余额监控（不触发发放）
-
-纯标准库 HTTP，不引入浏览器：调 `/api/user/self` 保活并读额度，持久化到 `login_grant_state.json`（原子写 + 锁）跨次对比增量；额度增长 → `success`，无变化 → `already_done`，登录失效 → `need_login`。它**不触发发放**，真正领取仍需在浏览器手动登录一次。
-
-### `relogin`：浏览器自动重放 OAuth（真正触发发放）
-
-用 Camoufox 复用顶层共享的第三方登录态，优先走站点前端 `/login` / `/register` 的 OAuth 按钮，失败时按 `/api/status` + `/api/oauth/state` 直连拼出 Linux.do / GitHub 授权 URL，完成 OAuth 回调触发发额度，再读 `/api/user/self` 对比前后额度。
-
-核心浏览器逻辑集中在 `browser/` 子包（CLI 与 GUI 共享）：
-
-- `browser/session.py` —— capture / verify / oauth checkin 共享逻辑（**async**，基于 Camoufox）；`run_sync()` 在已有运行中事件循环时会切到独立线程执行，避免死锁；
-- `browser/state.py`   —— 登录态编码/解码（storage_state → base64(gzip(json))），带严格 base64 校验、限长流式解压（防 zip bomb）与 schema 校验；
-- `browser/bypass.py`  —— 绕过引擎（Camoufox 启动、Cloudflare cf_clearance、WAF cookies、滑块拖拽）；
-- `browser/popups.py`  —— 弹窗自动关闭守卫（MutationObserver 注入）；
-- `browser/script_runner.py` / `browser/script_helpers.py` —— browser_script 运行器与脚本便捷 helper；
-- `browser/poc_oauth.py` —— 命令行入口（setup / run）。
-
-**登录态格式**：Playwright storage_state（跨平台 JSON，含 cookies + localStorage），经 gzip + base64 压缩、未加密，保护依赖 `.gitignore` + GitHub Secret（与 cookie/access_token 同级）。
-
-**⚠️ relogin 站点不保存站点级 `browser_state`。** Linux.do / GitHub 登录态统一保存在顶层 `oauth_states[provider].accounts[oauth_account]`，多站点可通过各自的 `oauth_provider` + `oauth_account` 复用。共享态过期时，OAuth 重放会停在第三方登录页并报 `need_login`。
-
-### `browser` + `api`：过 WAF 拿 cookie + HTTP 签到
-
-针对**有签到接口、但被阿里云 WAF 挡住纯 HTTP** 的 New API 站点：用站点级 `browser_state` 启动 Camoufox 过 WAF、导出 `acw_tc` 等 WAF cookie 与 session cookie，立刻关闭浏览器，再把 cookie 交给 HTTP `api` 逻辑完成签到。比 `relogin` 快、比纯 `cookie` 更能过 WAF。WAF 持续风控时快速失败并返回 `need_verification`（提示配置住宅代理），不误报 `need_login`；刷新出的 storage_state 会回写 `browser_state` 供复用。
-
-### `api` + 脚本：站点私改的签到流程
-
-有些 New API fork 给签到加了**图形验证码**。这属于个别站点的私改（端点、字段名、图像形态各不相同，随时可能再出现第三种），所以不做进通用适配器，而是做成脚本 `scripts/newapi_captcha.py` —— 在管理界面把该站点的「脚本路径」填成它即可，签到方式保持 `api`：
-
-```json5
-{
-  "name": "SheApi",
-  "base_url": "https://www.sheapi.top",
-  "site_profile": "newapi",
-  "auth_method": "access_token",
-  "checkin_action": "api",
-  "script": "scripts/newapi_captcha.py",  // 需要图形验证码时才填
-  "user_id": "<New-Api-User>",
-  "access_token": "<access_token>",
-  "enabled": true
-}
-```
-
-脚本自己判断该站是否真的需要验证码（两套方言的开关分别在签到状态的 `captcha_enabled` 与 `/api/status` 的 `checkin_captcha_enabled`）；不需要就返回 `None`，通用层照原样走默认签到流程，所以填上它不会影响不需要验证码的日子。
-
-识别在 `captcha_ocr/`（按图像尺寸派发到两套识别器，纯离线、只依赖 numpy + pillow），逆向与验收记录见 `docs/captcha_algorithm.md`。取图不消耗签到机会，所以读数不够可信时脚本会换一张重试，而不是硬猜 —— 猜错会作废一次验证码。
-
-没配脚本却撞上验证码时，签到会失败并在消息里直接告诉你要去填哪个脚本路径。
-
-### `browser_script`：仓库内自定义浏览器脚本
-
-适合没有稳定接口、但页面上有「签到/领取」按钮的站点。程序按 `auth_method` 恢复登录态、启动 Camoufox、**只允许加载仓库内相对路径 Python 文件**（禁止绝对路径、`..`、URL），调用脚本的 `run(page, context, site, helpers)` 并返回 `{status, message, detail}`。内置示例：`scripts/checkin/100xlabs.py`、`scripts/checkin/jisudeng.py`。脚本可直接用 Playwright 的 `page/context`，也可用 `helpers.goto()` / `helpers.click_text()` / `helpers.screenshot()` / `helpers.success()` 等便捷方法。
-
-极速蹬配置示例（该站登录启用了 Cloudflare Turnstile，首次需在有头浏览器中手动登录并保存站点 `browser_state`，不要把邮箱密码写进脚本或仓库）：
-
-```json5
-{
-  "name": "极速蹬",
-  "base_url": "https://www.jisudeng.com",
-  "site_profile": "newapi",
-  "auth_method": "browser",
-  "checkin_action": "browser_script",
-  "script": "scripts/checkin/jisudeng.py",
-  "script_args": { "start_url": "/check-in" },
-  "script_timeout": 120,
-  "browser_state": "<完成邮箱登录和 Turnstile 后捕获的站点登录态>",
-  "enabled": true
-}
-```
-
-`auth_method=browser` 时可额外选择 `oauth_fallback_provider` + `oauth_fallback_account`，也可保持“不使用”：程序始终优先使用站点级 `browser_state`，登录态缺失或脚本明确返回 `need_login` 时，最多用共享 OAuth 登录态自动完成一次站点登录并重试脚本；若未选择 OAuth，则直接报告站点登录态失效、签到失败。OAuth 登录期间会在目标站点自动关闭公告、协议、守则、须知等遮挡弹窗，但不会在 Linux.do / GitHub 授权页启用该规则。
-
-极速蹬还有一份与签到独立的**每日答题**（Quiz Quest，实测 5 道选择题、答对一题 $0.1，也可能改发优惠券）。签到成立后会自动做掉，结果写在 `detail.quiz`，答题失败只反映在那里、不会改写签到结论。它挂在纯 HTTP 首选路径与浏览器脚本两处，所以无论当天是否需要开浏览器都会执行。
-
-答题的题库、判定与两种传输**全部收在 `scripts/checkin/jisudeng.py`**：这套玩法只属于这个站点，散到通用层会让人找不到题库在哪。通用层只认两个钩子——`run(page, context, site, helpers)`（浏览器路径）与 `run_http_extras(client, log)`（纯 HTTP 路径，返回 `{detail 键: 摘要}`），本身不知道「答题」是什么，其它站点想加自己的日常任务照此实现即可。
-
-答题接口不返回正确答案、提交后也只给总分，因此题库离线维护在该脚本的 `ANSWERS`（按题面匹配、值存正确选项原文，避免站点调换选项顺序时答错）。遇到未收录的新题会按「最长选项」猜一次，题面与全部选项直接打进日志、并追加到 `.cache-checkin/play_quiz_unknown.json` 供补录。
-
-该站登录由服务端强制 Cloudflare Turnstile（纯 HTTP 账密登录必被拒），所以浏览器只用来「重新拿一次 token」：脚本跑完后运行器会把 `storage_state` 与 localStorage 里的 `auth_token`/`refresh_token` 一起存进 `.cache-checkin/token_cache.json`，之后的运行只要 token 或 refresh_token 还有效，签到与答题就全走纯 HTTP、不启动浏览器。这对所有 `browser_script` 站点都生效（此前续存写在脚本里，而脚本拿到的是脱敏站点视图，算出的凭据基线与真实配置不符，写出的缓存下次会被判为过期而忽略，等于从未续存）。
-
-运行期缓存只判定、不删除：改动账号凭据后，程序在缓存条目上打一个「配置已变」标记，值仍保留在 `.cache-checkin/token_cache.json` 里。带凭据基线（basis）的条目本来就按基线判定，把凭据改回原值即可自动重新命中。这样改错再改回、或仅仅重命名站点，都不会白丢一份仍然有效的登录态。
-
-## 图形界面（GUI）
+## 3. 图形管理界面
 
 ```bash
 uv sync --extra gui
 uv run python manage_accounts.py
 ```
 
-实现位于 `gui/` 包（`manage_accounts.py` 为薄壳入口）：`core.py` 纯逻辑层（行归一化 / auth 矫正 / 任务参数装配 / 状态缓存，均有单测）、`theme.py` 深浅双主题、`workers.py` 后台任务、`app.py` 主窗口。
+新版管理界面由 `gui/` 包实现，`manage_accounts.py` 只是薄入口。界面采用组件化布局和统一主题令牌：
 
-- **概览条**：站点数 / 今日已签 / 已知总额度 / 异常数，右侧「全部查询」「全部签到」批量操作（结果以摘要 toast + 日志明细呈现）；
-- 左侧站点列表（搜索 / 拖拽排序 / 启停），右侧编辑「站点配置 + 凭据」：选择站点类型、登录方式与签到方式（三维字段）；
-- `auth_method=oauth` 或 `checkin_action=relogin` 时出现 OAuth 提供商 + 账号控件，可**捕获 / 检测 OAuth 登录态**；捕获结果先加入当前内存配置并显示“未保存”，点击 `保存全部` 后写入顶层 `oauth_states`；relogin 站点不保存站点级 `browser_state`；
-- `auth_method=browser` 时出现站点级「浏览器登录态」输入区；自定义浏览器脚本还会显示「可选 OAuth」，直接列出顶层共享 `oauth_states` 中已有的账号；
-- 「脚本路径 / 参数 JSON」在 `browser_script` 与 `api` 下都会出现（前者必填、后者可选，字段提示会跟着切换），「脚本超时」只在 `browser_script` 下显示；路径必须是仓库内相对 `.py`，保存时就会校验文件是否存在；
-- **测试签到 / 查询额度 / 立即签到**：按当前三维字段跑一次，当场看结果；
-- 底部「日志」面板实时展示脱敏后台日志；顶栏可切换深 / 浅主题（默认深色，偏好自动记忆）；
-- **代理**：在「认证凭据」区填 `proxy`；
-- `保存全部` 写回 `ACCOUNTS.json`（原子写 + 锁）；`导出 Secret` 把最小化 JSON 复制到剪贴板。
+- **顶栏**：应用标题、深浅主题切换、已保存 / 未保存状态；
+- **概览条**：启用站点、今日已签、已知总额度、异常数，以及“全部查询”“全部签到”；
+- **站点侧栏**：搜索、拖拽排序、启停、签到状态与额度摘要；
+- **站点摘要卡**：当前额度、今日状态、复制、删除、立即签到；
+- **双栏编辑区**：站点信息与认证凭据按约 40/60 排列；
+- **折叠日志区**：后台日志实时进入主界面，可记忆展开状态；
+- **底部操作栏**：重新加载、导出 GitHub Secret、保存全部；
+- **交互反馈**：按钮加载状态、列表与统计过渡动画、输入焦点光效，以及 info / success / error Toast。
 
-## 浏览器一键采集凭据（collector.js）
+常用快捷键：
 
-在已登录的站点页面打开 F12 → Console，粘贴 `collector.js` 内容回车。脚本自动识别站点类型，直接输出**新三维字段**（`site_profile` / `auth_method` / `checkin_action`）的账号配置块，可原样粘进 `ACCOUNTS.json` 的 `accounts` 数组，无需再经旧字段迁移。
+| 快捷键 | 操作 |
+|---|---|
+| `Ctrl+S` | 保存全部 |
+| `Ctrl+N` | 新增站点 |
+| `Ctrl+L` | 重新加载 |
+| `Delete` | 删除当前站点 |
 
-采集内容与推断规则：
+表单会根据三个运行维度动态显示字段：
 
-- **Sub2API**：从 localStorage 读 `auth_token` 作为 `access_token`，并一并采集 **`refresh_token`**（长效凭证，让纯 HTTP 路径能自行续期，避免每次 JWT 过期都拉起浏览器）；余额优先探测 `/api/v1/user/profile` → `/api/v1/auth/me` → `/api/v1/usage`。顺带探测签到端点（`/api/v1/check-in`、`/api/v1/play/checkin`），命中哪个就在输出里注明。
-- **New API**：读 `/api/user/self` 取 `user_id` 与 `access_token`；若检测到该账号**无本地密码且仅第三方 OAuth 登录**（`linux_do_id` / `github_id` 等），会自动推断为 `auth_method=oauth` + `checkin_action=relogin` 并补上 `oauth_provider`，同时提示这类站点「登录即发额度」。
-- `/v1/usage` 返回 `INVALID_API_KEY` 属正常现象：它要求专用 `sk-*` API Key，而非前端登录态 token。
+- `newapi + api`：显示 `api_variant`；
+- `api`：可选填写纯 HTTP 脚本路径；
+- `browser_script`：必须填写脚本路径，并显示 `script_args` 与 `script_timeout`；
+- `browser`：显示站点级 `browser_state` 和浏览器操作；
+- `oauth` / `relogin`：显示共享 OAuth provider / account；
+- 支持的场景可额外选择 OAuth fallback；
+- Sub2API 的 Access Token / Refresh Token 属于接口凭据，即使认证方式选择 browser / oauth 也仍可编辑。
 
-> 采集结果含明文凭据，只粘贴到本地 `ACCOUNTS.json`（已被 `.gitignore`），不要提交或转发。
+脚本路径会在保存前校验：只允许仓库内相对 `.py` 文件，拒绝 URL、绝对路径和 `..`，并确认文件真实存在。
 
-## CLI：捕获与测试浏览器登录态
+---
 
-```bash
-# 首次捕获：有头浏览器人工登录第三方 provider/account，完成后打印共享 oauth_state
-uv run python browser/poc_oauth.py setup --oauth-provider linuxdo --oauth-account default
-uv run python browser/poc_oauth.py setup --oauth-provider github  --oauth-account default
+## 4. 配置模型
 
-# 测试：注入共享态后自动重放 OAuth，观察额度变化
-uv run python browser/poc_oauth.py run --base-url https://agentrouter.org --oauth-provider linuxdo --oauth-account default --user-id 68124
+每个站点由三个正交字段决定运行方式：
 
-# 可选：--proxy http://user:pass@host:port（浏览器路径支持 http/https/socks5）
+| 维度 | 字段 | 可选值 | 作用 |
+|---|---|---|---|
+| 站点适配器 | `site_profile` | `newapi` / `sub2api` | 接口路径、请求头、响应解析和额度单位 |
+| 认证方式 | `auth_method` | `access_token` / `cookie` / `browser` / `oauth` | 如何获得已认证会话 |
+| 签到动作 | `checkin_action` | `api` / `visit` / `relogin` / `browser_script` | 如何触发签到或额度发放 |
+
+### 4.1 常用字段
+
+| 字段 | 说明 |
+|---|---|
+| `name` | 本地显示名称，同一配置内应唯一 |
+| `base_url` | 站点根地址，自动规范化 |
+| `enabled` | 是否参与批量签到 |
+| `user_id` | New API 的 `New-Api-User` 请求头 |
+| `access_token` | Bearer Token；Sub2API 浏览器流程也会优先使用它走纯 API |
+| `refresh_token` | Sub2API 长效续期凭据 |
+| `cookie` | `auth_method=cookie` 时使用 |
+| `api_variant` | New API API 流程：`auto` 或 `legacy` |
+| `script` | 仓库内相对 Python 脚本路径 |
+| `script_args` | 仅 `browser_script` 的脚本参数对象 |
+| `script_timeout` | 仅 `browser_script` 的运行超时 |
+| `browser_state` | 站点级 Playwright storage state，gzip + base64 编码 |
+| `oauth_provider` | `linuxdo` 或 `github` |
+| `oauth_account` | 同一 provider 下的共享登录态名称 |
+| `oauth_fallback_provider` | 主凭据失效后的可选 OAuth 兜底 |
+| `proxy` | 单站点代理；未填时可回退全局 `CHECKIN_PROXY` |
+| `verify_ssl` | 默认 `true`；仅证书异常时谨慎关闭 |
+| `referer_path` | New API 请求的 Referer 路径，默认 `/profile` |
+| `cookie_file` | 兼容三行凭据文件：Cookie / 用户 ID / Access Token |
+| `browser_profile` | 浏览器持久化 Profile 路径前缀 |
+| `auto_refresh_cookie` | 是否把去重后的 Cookie 回写凭据文件 |
+
+### 4.2 最小配置示例
+
+```json
+{
+  "accounts": [
+    {
+      "name": "普通 New API",
+      "base_url": "https://newapi.example.com",
+      "site_profile": "newapi",
+      "auth_method": "access_token",
+      "checkin_action": "api",
+      "user_id": "10001",
+      "access_token": "<access_token>",
+      "enabled": true
+    },
+    {
+      "name": "带签到验证码的 New API fork",
+      "base_url": "https://captcha.example.com",
+      "site_profile": "newapi",
+      "auth_method": "access_token",
+      "checkin_action": "api",
+      "script": "scripts/newapi_captcha.py",
+      "user_id": "10002",
+      "access_token": "<access_token>",
+      "enabled": true
+    },
+    {
+      "name": "Sub2API 浏览器脚本站",
+      "base_url": "https://sub.example.com",
+      "site_profile": "sub2api",
+      "auth_method": "browser",
+      "checkin_action": "browser_script",
+      "script": "scripts/checkin/jisudeng.py",
+      "script_args": {
+        "start_url": "/check-in"
+      },
+      "script_timeout": 120,
+      "access_token": "<auth_token>",
+      "refresh_token": "<refresh_token>",
+      "browser_state": "<站点登录态>",
+      "enabled": true
+    },
+    {
+      "name": "OAuth 登录发额度站",
+      "base_url": "https://router.example.com",
+      "site_profile": "newapi",
+      "auth_method": "oauth",
+      "checkin_action": "relogin",
+      "oauth_provider": "linuxdo",
+      "oauth_account": "default",
+      "user_id": "10003",
+      "enabled": true
+    }
+  ],
+  "oauth_states": {
+    "linuxdo": {
+      "accounts": {
+        "default": {
+          "state": "<共享 Linux.do storage_state>",
+          "username": "",
+          "updated_at": ""
+        }
+      }
+    }
+  }
+}
 ```
 
-## GitHub Actions 部署
+支持的顶层形态：
 
-`.github/workflows/auto_checkin.yml` 每日定时运行：
+- `{"accounts": [...]}`
+- `{"accounts": {"站点名": {...}}}`
+- `[...]`
 
-1. 用 `astral-sh/setup-uv` 固定 uv 版本 + `actions/setup-python` **Python 3.14**；
-2. `uv sync --locked --extra dev` 按 `uv.lock` 严格安装；
-3. **质量门**：`ruff check .` + `pytest` + `compileall`，任一失败即让 job 失败；
-4. 把 Secret `ACCOUNTS` **原子写入** `ACCOUNTS.json` 并设 `0600` 权限；
-5. `ci/detect_browser.py`（`python -m ci.detect_browser`）判断是否存在浏览器任务；配置解析失败会直接失败，不静默判为「无需浏览器」；
-6. **仅当需要浏览器任务**时才安装 xvfb / Camoufox、执行 Playwright Firefox 驱动补丁、并用 `xvfb-run` 有头运行；纯 HTTP 任务直接运行；
-7. 可选 Clash/mihomo 本地代理（Secret `CLASH_CONFIG`，见 `ci/setup_proxy.sh`）；
-8. 生成脱敏后的 `checkin_report.md` 输出到 Step Summary。
+旧版 `type` + `checkin_mode` 会自动迁移为新三维字段，并在安全写回时保留未知顶层元数据和账号自定义字段。旧版 `oauth_states.provider.state` 也会迁移为多账号结构。
 
-部署步骤：本地用 GUI「捕获 OAuth 登录态」或 `browser/poc_oauth.py setup` 生成共享态 → `导出 Secret` → 存为仓库 Secret `ACCOUNTS`（值为 `ACCOUNTS.json` 完整内容）。
+---
 
-> **注意**：
-> - 登录态（`oauth_states` / `browser_state`）会过期，过期后报 `need_login`，需重新捕获并更新 Secret；
-> - relogin 站点只保存 `oauth_provider` + `oauth_account`，不要内联站点级 `browser_state`；
-> - 浏览器默认有头运行（阿里云 WAF 对无头敏感）；设 `CHECKIN_HEADLESS=true` 才无头。
+## 5. 各签到动作的真实行为
 
-### 阿里云 WAF 与出口 IP 信誉（重要）
+### 5.1 `api`：接口签到
 
-新版阿里云 WAF（`aliyun_waf_aa` / `aliyun_waf_bb` 挑战）按「客户端信号 + 出口 IP 信誉」联合风控。数据中心 / CI 机房 IP（如 GitHub Actions）信誉极低，即使真实有头浏览器也常年过不了。表现为日志反复 `WAF 挑战求解失败`、`status=200 ... waf=True`。此时签到返回 `need_verification`（**不是登录态失效**）。代码内置 WAF 熔断：连续 2 次整轮失败即判定 IP 被风控，短路后续求解，快速失败。解法：为该账号配置**住宅代理**（优先中国大陆 / 亚太），或改在住宅 IP 环境运行。
+通用步骤：
 
-## 开发与验证
+1. 按 `auth_method` 准备 HTTP 凭据；
+2. 查询今日签到状态；
+3. 已签到则返回 `already_done`；
+4. 可选调用站点脚本的 `do_checkin(client, log)`；
+5. 脚本返回 `None` 时走 profile 默认签到；
+6. 用奖励字段、签到后状态或前后额度差验证签到是否真的成立；
+7. 补充当前额度并统一输出美元格式。
+
+New API：
+
+- `api_variant=auto`：challenge 优先，仅在端点不支持或特定网络失败时回退 legacy；
+- `api_variant=legacy`：legacy 优先，仅在站点明确提示流程已升级时回退 challenge；
+- 登录失败、验证码错误和普通业务拒绝不会被当作“换一种接口再试”；
+- challenge 使用 `checkin_challenge.js` 和 Node.js 执行 WASM PoW。
+
+Sub2API：
+
+- 探测 `/api/v1/check-in`、`/api/v1/play/checkin` 等 fork 端点；
+- 标准 Sub2API 没有签到接口时，完成登录态验证与余额查询，不伪造奖励；
+- Access Token 登录失效时优先使用 Refresh Token 纯 HTTP 续期。
+
+### 5.2 `api + script`：私有 HTTP 签到流程
+
+API 脚本约定：
+
+```python
+def do_checkin(client, log=None):
+    # 返回 CheckinReward 表示脚本已接管签到
+    # 返回 None 表示回退 profile 默认签到
+    ...
+```
+
+当前内置脚本：
+
+```json
+{
+  "checkin_action": "api",
+  "script": "scripts/newapi_captcha.py"
+}
+```
+
+`scripts/newapi_captcha.py` 支持两类已知 New API fork 验证码方言：
+
+- `POST /api/user/checkin/captcha` + `captcha_answer`；
+- `GET /api/captcha?scene=checkin` + `captcha_code`。
+
+脚本按图片尺寸选择离线识别器。读数不够可信时会重新取图，避免把一次性 `captcha_id` 浪费在硬猜上。详细算法和验收记录见 [`docs/captcha_algorithm.md`](docs/captcha_algorithm.md)。
+
+> 使用该脚本需要 Pillow：执行 `uv sync --extra dev`。
+
+### 5.3 `visit`：访问保活与额度监控
+
+适用于没有签到接口、但访问用户接口可以保持登录或观察额度的站点。
+
+- 请求用户接口并读取额度；
+- 与 `.cache-checkin/login_grant_state.json` 中的历史值比较（根目录同名文件只用于旧版兼容读取）；
+- 额度增加时返回 `success`；
+- 无变化时返回 `already_done`，但不会声称它一定在今天领取；
+- `visit` 本身不会触发 OAuth 登录奖励。
+
+### 5.4 `relogin`：OAuth 重登触发发放
+
+适用于“登录即发额度”的站点：
+
+1. 复用顶层 `oauth_states` 中选定的 Linux.do / GitHub 登录态；
+2. 优先点击站点前端 OAuth 登录入口；
+3. 必要时根据 `/api/status` 和 `/api/oauth/state` 直连授权；
+4. 完成回调后读取额度并综合页面成功提示、回跳状态和额度变化判断结果。
+
+中途出现过 Cloudflare 挑战并不会自动否决结果；只要已经成功回到目标站点且存在成功证据，仍会判定成功。真正停在第三方登录页或 WAF 持续阻断时才返回失败状态。
+
+### 5.5 `browser_script`：API 优先的浏览器脚本
+
+浏览器脚本约定：
+
+```python
+async def run(page, context, site, helpers):
+    return {
+        "status": "success",
+        "message": "签到成功",
+        "detail": {}
+    }
+```
+
+实际执行顺序：
+
+1. 已保存 `access_token` 纯 HTTP 签到；
+2. Token 失效时尝试 `refresh_token` 续期；
+3. 脚本提供账密且站点未启用 Turnstile 时，尝试纯 HTTP 登录换 Token；
+4. 仍无法完成时恢复站点 `browser_state`；
+5. 必要时让脚本自行账密登录并处理 Turnstile；
+6. 配置了 OAuth fallback 时，主登录态失效后最多再尝试一次共享 OAuth 登录态；
+7. 运行结束后由通用运行器保存新的 storage state、Access Token 和 Refresh Token。
+
+纯 HTTP 阶段成功后，脚本还可定义附加任务：
+
+```python
+def run_http_extras(client, log=None):
+    return {
+        "quiz": {
+            "outcome": "submitted",
+            "message": "每日答题完成"
+        }
+    }
+```
+
+附加任务结果写入 `detail`，失败不会推翻已经成立的签到结论。
+
+---
+
+## 6. 内置站点脚本
+
+| 路径 | 类型 | 用途 |
+|---|---|---|
+| `scripts/newapi_captcha.py` | API 脚本 | New API fork 图形验证码签到 |
+| `scripts/checkin/100xlabs.py` | 浏览器脚本 | 100xLabs 系页面签到与登录处理 |
+| `scripts/checkin/jisudeng.py` | 浏览器脚本 + HTTP extras | 极速蹬签到、登录态刷新和每日答题 |
+
+脚本统一经 `browser/script_loader.py` 加载：
+
+- 只允许仓库内相对路径；
+- 只允许 `.py` 文件；
+- 禁止 URL、绝对路径和 `..`；
+- 每次运行重新加载模块，避免执行旧缓存代码。
+
+### 极速蹬每日答题
+
+`jisudeng.py` 内置离线题库 `ANSWERS`。签到成功或今日已签后，会尝试完成每日 Quiz：
+
+- 已收录题目按题面匹配正确选项文本；
+- 未收录题目记录题面和选项，并写入 `.cache-checkin/play_quiz_unknown.json`；
+- 结果写入 `detail.quiz`；
+- 答题接口不可用或答题失败不会改变签到结论。
+
+---
+
+## 7. 凭据采集与登录态
+
+### 7.1 `collector.js`
+
+在已经登录的站点页面打开开发者工具 Console，粘贴 `collector.js` 并执行。
+
+它会：
+
+- 根据 localStorage / sessionStorage 中的 Token 启发式判断 New API / Sub2API；
+- 读取 `user_id`、Access Token 和可见 Cookie；
+- Sub2API 额外读取 Refresh Token；
+- 探测余额和签到端点；
+- 对仅第三方登录的 New API 站建议 `oauth + relogin`；
+- 输出可直接导入 GUI 或粘贴进 `ACCOUNTS.json` 的三维配置。
+
+采集结果只是初始建议，仍需人工核对：
+
+- 没有读到 Sub2API Token 时可能被误判为 New API；
+- JavaScript 无法读取 httpOnly Cookie；
+- 纯第三方登录账号当前默认建议 Linux.do，实际使用 GitHub 时需手工修改 `oauth_provider`；
+- 它不采集站点 `browser_state` 或共享 `oauth_states`，这两类状态仍需通过 GUI 或 OAuth CLI 捕获；
+- 接口返回 401 / 403 / 500 等非 404 状态时，端点探测可能仍认为该接口存在。
+
+### 7.2 GUI 捕获
+
+管理界面支持：
+
+- 捕获和验证站点级 `browser_state`；
+- 按 provider / account 捕获 Linux.do、GitHub 共享 OAuth 登录态；
+- 浏览器捕获成功后回填 Access Token / Refresh Token；
+- 导出只包含启用站点及其实际引用 OAuth 状态的 GitHub Secret JSON。
+
+### 7.3 OAuth CLI
+
+```bash
+# 捕获共享 Linux.do 登录态
+uv run python browser/poc_oauth.py setup \
+  --oauth-provider linuxdo \
+  --oauth-account default
+
+# 捕获共享 GitHub 登录态
+uv run python browser/poc_oauth.py setup \
+  --oauth-provider github \
+  --oauth-account default
+
+# 测试 OAuth 重登
+uv run python browser/poc_oauth.py run \
+  --base-url https://router.example.com \
+  --oauth-provider linuxdo \
+  --oauth-account default \
+  --user-id 10003
+```
+
+`oauth_states` / `browser_state` 是压缩后的 Playwright storage state，**不是加密数据**。
+
+---
+
+## 8. 运行命令
+
+### 8.1 批量运行
+
+```bash
+# 执行 ACCOUNTS.json 中所有启用站点
+uv run python run__all_checkin.py
+
+# 打印完整原始输出；仍会经过脱敏
+uv run python run__all_checkin.py --verbose
+
+# 指定最大并发数
+uv run python run__all_checkin.py --workers 4
+```
+
+批量调度器会：
+
+- 每个账号启动独立 worker 子进程；
+- 同一 `base_url` 下的账号串行，不同站点并发；
+- 为 HTTP 和浏览器任务设置不同墙钟超时；
+- 用环境变量传递 Cookie、Token、代理、登录态和脚本参数，避免出现在进程命令行；
+- 严格校验 worker JSON 协议及退出码；
+- 把脱敏结果写入 `.cache-checkin/checkin_result.json`；
+- 即使任务成功，也显示 API-first / 浏览器降级等关键阶段日志。
+
+### 8.2 直接读取配置运行
+
+```bash
+uv run python checkin.py
+```
+
+### 8.3 临时运行单站点
+
+```bash
+uv run python checkin.py \
+  --base-url https://newapi.example.com \
+  --name demo \
+  --site-profile newapi \
+  --auth-method access_token \
+  --checkin-action api \
+  --access-token '<token>' \
+  --user-id 10001
+```
+
+敏感值更推荐通过环境变量传递：
+
+- `CHECKIN_COOKIE`
+- `CHECKIN_ACCESS_TOKEN`
+- `CHECKIN_REFRESH_TOKEN`
+- `CHECKIN_USER_ID`
+- `CHECKIN_BROWSER_STATE`
+- `CHECKIN_SCRIPT_ARGS`
+- `CHECKIN_PROXY`
+
+---
+
+## 9. 运行期缓存
+
+短期 Token、轮换后的 Refresh Token 和浏览器运行态保存在：
+
+```text
+.cache-checkin/token_cache.json
+```
+
+缓存不会无条件覆盖配置：
+
+- 配置凭据会生成不可逆 SHA-256 basis；
+- basis 与当前配置一致时才允许缓存覆盖；
+- GUI / CLI 显式输入始终优先，包括显式清空；
+- 父进程解析完成后，worker 使用 `CHECKIN_CACHE_POLICY=ignore`，避免二次套用旧缓存；
+- 修改凭据时只标记“配置已变”，不立即删除缓存值；
+- 把凭据改回原值后，仍匹配 basis 的缓存可以重新命中；
+- 缓存身份由规范化 `base_url + name` 组成，修改名称或地址会产生新身份，旧条目虽不会被物理删除，但也不会自动迁移到新身份。
+
+这样既避免旧 GitHub Actions cache 覆盖新 Secret，也不会因为一次凭据误改永久丢失仍然有效的登录态。
+
+---
+
+## 10. 代理、WAF 与验证
+
+### 代理
+
+- HTTP 路径基于标准库 `urllib`，支持 `http://` / `https://` 代理；
+- 浏览器路径由 Camoufox 驱动，可使用 HTTP / HTTPS / SOCKS5；
+- 站点 `proxy` 优先，未配置时回退 `CHECKIN_PROXY`。
+
+### Cloudflare / Turnstile
+
+- browser / oauth / browser_script 可处理页面挑战、弹窗和部分验证码；
+- Sub2API 纯 HTTP 账密登录会先读取公开设置，站点启用 Turnstile 时直接回退浏览器；
+- 复杂验证无法自动通过时返回 `need_verification`，不会伪装成登录失效。
+
+### 阿里云 WAF
+
+New API 的 `browser + api` 会让浏览器负责执行 JS 挑战并导出 WAF Cookie，再用 HTTP 完成签到。数据中心和 GitHub Actions 出口 IP 可能因信誉过低持续失败；这种情况应配置住宅代理，或在住宅网络环境运行。
+
+---
+
+## 11. GitHub Actions
+
+工作流：`.github/workflows/auto_checkin.yml`
+
+默认计划：每天 **01:30 UTC（北京时间 09:30）**，也支持手动触发。
+
+运行流程：
+
+1. 恢复 `.cache-checkin`；
+2. 使用 Python 3.14 和 `uv sync --locked --extra dev` 安装依赖；
+3. 从仓库 Secret `ACCOUNTS` 原子写入 `ACCOUNTS.json` 并设置权限；
+4. 解析启用账号，判断是否存在 browser / oauth / relogin / browser_script / OAuth fallback；
+5. 仅在需要时安装系统字体、Xvfb 和 Camoufox；
+6. 可选从 `CLASH_CONFIG` 启动本地 Clash / mihomo；
+7. 运行 `run__all_checkin.py`；
+8. 生成脱敏的 `checkin_report.md` 并写入 Step Summary；
+9. 保存新的 `.cache-checkin`，供下次复用 Token 与登录态。
+
+> [!CAUTION]
+> GitHub Actions 缓存的整个 `.cache-checkin` 可能包含明文运行期 Token、压缩编码的浏览器登录态、失败截图、签到结果和未收录答题内容。请把 Actions cache 视为敏感数据，不要下载后公开转发。
+
+需要配置的 Secret：
+
+| Secret | 必需 | 说明 |
+|---|---:|---|
+| `ACCOUNTS` | 是 | GUI“导出 Secret”得到的完整 JSON |
+| `CHECKIN_PROXY` | 否 | 全局代理地址 |
+| `CLASH_CONFIG` | 否 | Clash / mihomo 配置内容 |
+
+浏览器任务在 CI 中通过 Xvfb 有头运行；默认 `CHECKIN_HEADLESS=false`。
+
+---
+
+## 12. 结果状态与排查
+
+| 状态 | 含义 | 常见处理 |
+|---|---|---|
+| `success` | 本次签到或发放有明确成功证据 | 无需处理 |
+| `already_done` | 今日已签，或保活后额度没有变化 | 无需处理 |
+| `need_login` | Token、Cookie 或共享 OAuth 状态失效 | 重新采集凭据或登录态 |
+| `need_verification` | Turnstile、CAPTCHA、WAF 或出口 IP 风控 | 手工验证、配置脚本或更换代理 |
+| `need_config` | 必填字段、脚本路径或凭据缺失 | 检查 GUI 表单和配置 |
+| `network_error` | 429、5xx、超时等临时网络失败 | 稍后重试或检查代理 |
+| `error` | 业务拒绝、脚本异常或无法确认签到成立 | 查看阶段日志和脱敏原始返回 |
+
+程序不会把“HTTP 200 但没有奖励、已签标记或额度增长证据”的响应直接报成成功。
+
+---
+
+## 13. 安全设计
+
+- `ACCOUNTS.json`、`.cache-checkin/`、`.browser_profile/`、旧版 `login_grant_state.json`、`*.lock` 已被忽略；
+- `.gitignore` 只能防止普通提交，不能代替本机磁盘权限、备份保护和 Actions cache 权限控制；
+- 配置、结果、状态和报告使用文件锁与原子替换写入；
+- 配置损坏时失败关闭，不会静默当作空配置覆盖原文件；
+- 批量 worker 的 stdout 只承载单行 JSON 协议，诊断日志写 stderr；
+- Cookie、Bearer、JWT、`sk-*`、OAuth state、敏感键和代理 URL 凭据统一脱敏；
+- 脚本只能从仓库内安全加载；
+- 登录态为压缩编码而非加密，安全性依赖本地权限和 GitHub Secret。
+
+---
+
+## 14. 开发与验证
 
 ```bash
 uv sync --extra dev
-uv run pytest                       # 单元/回归测试（tests/）
-uv run ruff check .                 # 静态检查
-uv run python -m compileall -q .    # 语法编译
-uv lock --check                     # 校验 uv.lock 与 pyproject 同步
+uv run pytest
+uv run ruff check .
+uv run python -m compileall -q .
+uv lock --check
 ```
 
-`tests/` 覆盖 worker 协议、HTTP 代理与幂等重试、原子存储与并发、browser state 校验、脱敏与报告安全等关键路径。
+主要目录：
 
-## 安全要点
+```text
+providers/
+  profiles/               # New API / Sub2API 接口适配器
+  actions/                # api / visit / relogin / browser_script
+browser/
+  session.py              # 登录态捕获、验证、OAuth 重登、WAF 混合流程
+  script_loader.py        # 安全脚本加载器
+  script_runner.py        # browser_script 运行与登录态续存
+  script_helpers.py       # 脚本 helper
+captcha_ocr/              # CAPTCHA 识别器与模板
+scripts/
+  newapi_captcha.py       # API 图形验证码脚本
+  checkin/                # 浏览器站点脚本
+ci/                       # 浏览器检测、代理与报告
+gui/                      # PySide6 管理界面
+tests/                    # 单元与回归测试
+```
 
-- `ACCOUNTS.json` / `.cache-checkin/` / `.browser_profile/` / `login_grant_state.json` / `*.lock` 均已被 `.gitignore` 忽略；
-- `oauth_states.*.accounts.*.state` / `browser_state` 为未加密 base64（storage_state JSON），保护依赖不入库 + GitHub Secret 加密存储；
-- 控制台、结果文件与 CI 报告统一脱敏（`mask_utils.py`）；
-- Cloudflare / 阿里云 WAF 自动绕过，失败报 `need_verification`；滑块自动拖拽，复杂验证码需人工完成后重新捕获。
+验证码逆向与识别细节见 [`docs/captcha_algorithm.md`](docs/captcha_algorithm.md)，历史架构优化记录见 [`docs/OPTIMIZATION.md`](docs/OPTIMIZATION.md)。
+
+---
+
+## License
+
+[MIT License](LICENSE)
