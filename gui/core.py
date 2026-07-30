@@ -62,6 +62,15 @@ ACTION_LABELS = {
 OAUTH_PROVIDER_LABELS = {"linuxdo": "Linux.do", "github": "GitHub"}
 API_VARIANT_LABELS = {"auto": "自动 (challenge 优先)", "legacy": "旧版接口 (legacy)"}
 
+# 「脚本路径」在两种签到方式下挂的是不同钩子，提示必须区分：
+# - browser_script：脚本的 run(page, context, site, helpers) 在 Camoufox 里跑；
+# - api          ：脚本的 do_checkin(client, log) 走纯 HTTP，用于站点私改的签到玩法
+#                  （如 New API fork 的图形验证码），返回 None 则回落默认签到流程。
+SCRIPT_HINT_BROWSER = "仓库内相对路径；浏览器里执行 run()，例如 scripts/checkin/100xlabs.py"
+SCRIPT_PLACEHOLDER_BROWSER = "scripts/checkin/100xlabs.py"
+SCRIPT_HINT_API = "可留空。纯 HTTP 接管签到，用于图形验证码等私改流程；留空走默认签到"
+SCRIPT_PLACEHOLDER_API = "scripts/newapi_captcha.py（需要图形验证码时填）"
+
 
 # ── 脱敏日志（沿用旧版语义）───────────────────────────────────────────────────
 _SENSITIVE_LOG_KEYS = {
@@ -381,6 +390,13 @@ def task_params(
 class FormPlan:
     show_variant: bool = False
     show_script: bool = False
+    # 脚本超时只对浏览器脚本有意义（它限的是 Camoufox 里 run() 的执行时间）。
+    # api 方式下的脚本是纯 HTTP 的，超时由 HTTP 层自己管，显示这个框只会误导。
+    show_script_timeout: bool = False
+    # 「脚本路径」这一个字段在两种签到方式下挂的是不同钩子，提示必须跟着变，
+    # 否则 api 方式下会照着 browser_script 的示例去填一个浏览器脚本。
+    script_hint: str = SCRIPT_HINT_BROWSER
+    script_placeholder: str = SCRIPT_PLACEHOLDER_BROWSER
     show_oauth: bool = False
     show_fallback: bool = False
     show_state_box: bool = False
@@ -471,13 +487,20 @@ def build_form_plan(row: SiteRow, oauth_states: dict[str, Any]) -> FormPlan:
     is_browser = auth == "browser"
     is_oauth = auth == "oauth"
     is_script = action == "browser_script"
+    # api 方式也能挂脚本：站点私改的签到玩法（如 New API fork 的图形验证码）都做成
+    # 脚本，通过这个字段启用，通用适配器不必为个别站点背分支。
+    # 见 providers/actions/api.py 的 _script_checkin 与 scripts/newapi_captcha.py。
+    allow_api_script = action == "api"
     needs_oauth = is_oauth or action == "relogin" or (is_script and auth == "oauth")
     allow_fallback = can_optional_oauth(row.type, action, auth)
     fallback_provider, fallback_account = normalized_fallback(row)
 
     plan = FormPlan(
         show_variant=row.type == "newapi" and action == "api",
-        show_script=is_script,
+        show_script=is_script or allow_api_script,
+        show_script_timeout=is_script,
+        script_hint=SCRIPT_HINT_API if allow_api_script else SCRIPT_HINT_BROWSER,
+        script_placeholder=SCRIPT_PLACEHOLDER_API if allow_api_script else SCRIPT_PLACEHOLDER_BROWSER,
         show_oauth=needs_oauth,
         show_fallback=allow_fallback,
         show_state_box=is_browser or needs_oauth or allow_fallback,
@@ -619,10 +642,14 @@ def validate_rows(rows: list[SiteRow]) -> str | None:
     if len(names) != len(set(names)):
         return "站点名称重复，请改为唯一名称。"
     for row in rows:
-        if row.checkin_action != "browser_script":
-            continue
-        if not row.script.strip():
+        # browser_script 必须有脚本；api 的脚本是可选增强，留空即走默认签到。
+        if row.checkin_action == "browser_script" and not row.script.strip():
             return f"「{row.name or '未命名站点'}」选择了自定义浏览器脚本，但未填写脚本路径。"
+        if row.checkin_action not in {"browser_script", "api"} or not row.script.strip():
+            continue
+        error = _script_path_error(row.script.strip())
+        if error:
+            return f"「{row.name or '未命名站点'}」的脚本路径{error}"
         text = row.script_args_text.strip() or "{}"
         try:
             parsed = json.loads(text)
@@ -630,6 +657,21 @@ def validate_rows(rows: list[SiteRow]) -> str | None:
             return f"「{row.name or '未命名站点'}」的脚本参数不是合法 JSON：{exc}"
         if not isinstance(parsed, dict):
             return f"「{row.name or '未命名站点'}」的脚本参数必须是 JSON 对象。"
+    return None
+
+
+def _script_path_error(script_path: str) -> str | None:
+    """脚本路径是否可用；可用返回 None，否则返回接在「脚本路径」后面的原因。
+
+    在保存时就查，而不是等到签到当天才在日志里失败：路径写错（打错字、写了绝对路径）
+    是最常见的配置错误，而签到往后台跑，报错要隔很久才会被看到。
+    """
+    try:
+        from browser import script_loader
+
+        script_loader.resolve_script_path(script_path)
+    except Exception as exc:  # noqa: BLE001 - 校验失败只需给文案
+        return f"不可用：{exc}"
     return None
 
 
@@ -717,11 +759,15 @@ def apply_credential_cache_changes(
     rows: list[SiteRow],
     saved_credentials: dict[int, dict[str, str]],
 ) -> int:
-    """保存成功后按真实字段变化清理缓存；token/state 两组互不误伤。
+    """保存配置后标记「凭据已变」，但不再删除任何运行期缓存。
 
-    使用对象 id 关联当前会话中的保存基线，名称/URL 改动也能找到旧身份并清理旧
-    缓存。新行会清理目标身份上的遗留缓存，防止重新创建同名渠道时继承旧凭据。
-    返回发生变化的缓存条目/字段组数量；失败不影响配置保存。
+    以前这里会在凭据变化、改名、删行时删除/清空 token_cache 条目。那是有害的：
+    删除不可逆——用户改错又改回来、或只是重排/改名，本来仍然有效的运行期 token
+    与登录态就被永久丢掉，下次运行必须重新走一遍 Turnstile / OAuth 登录。
+
+    现在只写一个时间戳（`token_invalidated_at` / `state_invalidated_at`），由读取侧
+    按「标记时间 vs 写入时间」决定是否使用；带 basis 的条目本来就由 basis 判定，
+    配置改回原值即可自动重新命中。返回被标记的条目/字段组数量。
     """
     try:
         from providers import token_cache
@@ -730,46 +776,36 @@ def apply_credential_cache_changes(
 
     changed = 0
     current_ids = {id(row) for row in rows}
+    all_fields = {"access_token", "refresh_token", "browser_state"}
 
-    # 已删除的行：清理旧身份，避免以后重建同名渠道继承运行凭据。
+    # 已删除的行：标记而非清空，重建同名渠道时不会误继承旧凭据，也不丢数据。
     for row_id, old in saved_credentials.items():
         if row_id in current_ids:
             continue
-        if token_cache.clear_tokens(old.get("name", ""), old.get("base_url", "")):
+        if token_cache.mark_credentials_changed(old.get("name", ""), old.get("base_url", ""), all_fields):
             changed += 1
 
     for row in rows:
         current = credential_snapshot(row)
         old = saved_credentials.get(id(row))
-        current_name = current["name"]
-        current_base = current["base_url"]
-        if old is None:
-            if token_cache.invalidate_fields(
-                current_name, current_base,
-                {"access_token", "refresh_token", "browser_state"},
+        name, base = current["name"], current["base_url"]
+        if old is None or (old.get("name", ""), old.get("base_url", "")) != (name, base):
+            # 新行或改了身份：旧身份与新身份都打标记，等价于「这套凭据换了」。
+            if old is not None and token_cache.mark_credentials_changed(
+                old.get("name", ""), old.get("base_url", ""), all_fields
             ):
                 changed += 1
-            continue
-
-        old_identity = (old.get("name", ""), old.get("base_url", ""))
-        current_identity = (current_name, current_base)
-        if old_identity != current_identity:
-            if token_cache.clear_tokens(*old_identity):
-                changed += 1
-            if token_cache.invalidate_fields(
-                current_name, current_base,
-                {"access_token", "refresh_token", "browser_state"},
-            ):
+            if token_cache.mark_credentials_changed(name, base, all_fields):
                 changed += 1
             continue
 
         fields = changed_credential_fields(row, old)
-        invalidate: set[str] = set()
+        mark: set[str] = set()
         if fields & {"access_token", "refresh_token"}:
-            invalidate.update({"access_token", "refresh_token"})
+            mark.update({"access_token", "refresh_token"})
         if "browser_state" in fields:
-            invalidate.add("browser_state")
-        if invalidate and token_cache.invalidate_fields(current_name, current_base, invalidate):
+            mark.add("browser_state")
+        if mark and token_cache.mark_credentials_changed(name, base, mark):
             changed += 1
     return changed
 

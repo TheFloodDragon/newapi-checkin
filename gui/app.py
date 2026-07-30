@@ -470,10 +470,10 @@ class App(QMainWindow):
             self.variant_combo.addItem(core.API_VARIANT_LABELS.get(m, m), m)
         self.variant_wrap.layout().addWidget(self.variant_combo)
 
-        self.script_wrap = self._field(site_layout, "脚本路径", "仓库内相对路径，例如 scripts/checkin/100xlabs.py")
+        self.script_wrap = self._field(site_layout, "脚本路径", core.SCRIPT_HINT_BROWSER)
         self.script_edit = QLineEdit()
         self.script_edit.setObjectName("input")
-        self.script_edit.setPlaceholderText("scripts/checkin/100xlabs.py")
+        self.script_edit.setPlaceholderText(core.SCRIPT_PLACEHOLDER_BROWSER)
         self.script_wrap.layout().addWidget(self.script_edit)
 
         self.script_args_wrap = self._field(site_layout, "脚本参数 JSON", "传给 site.script_args")
@@ -688,10 +688,19 @@ class App(QMainWindow):
             h.setObjectName("hintText")
             h.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
             top.addWidget(h, 1)
+            # 存下来供 _set_field_hint 改写：同一个字段在不同签到方式下含义不同
+            # （脚本路径在 api 与 browser_script 下要给不同的示例）。
+            wrap.setProperty("hintLabel", h)
         top.addStretch(0)
         lay.addLayout(top)
         parent_layout.addWidget(wrap)
         return wrap
+
+    @staticmethod
+    def _set_field_hint(wrap: QWidget, text: str) -> None:
+        label = wrap.property("hintLabel")
+        if label is not None:
+            label.setText(text)
 
     def _line(self, parent_layout, label: str, hint: str = "", mono: bool = False) -> QLineEdit:
         wrap = self._field(parent_layout, label, hint)
@@ -1135,7 +1144,9 @@ class App(QMainWindow):
         self.variant_wrap.setVisible(plan.show_variant)
         self.script_wrap.setVisible(plan.show_script)
         self.script_args_wrap.setVisible(plan.show_script)
-        self.script_timeout_wrap.setVisible(plan.show_script)
+        self.script_timeout_wrap.setVisible(plan.show_script_timeout)
+        self._set_field_hint(self.script_wrap, plan.script_hint)
+        self.script_edit.setPlaceholderText(plan.script_placeholder)
         self.oauth_provider_wrap.setVisible(plan.show_oauth)
         self.oauth_account_wrap.setVisible(plan.show_oauth)
         self.oauth_fallback_wrap.setVisible(plan.show_fallback)

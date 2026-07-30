@@ -146,13 +146,59 @@ def test_validate_rows_errors() -> None:
     assert core.validate_rows([core.SiteRow(name="a", base_url="")]) is not None
     dup = [core.SiteRow(name="a", base_url="https://a.com"), core.SiteRow(name="a", base_url="https://b.com")]
     assert "重复" in (core.validate_rows(dup) or "")
-    bad_script = core.SiteRow(
+    # 脚本参数不是 JSON：脚本路径必须用真实存在的文件，否则先撞上路径校验
+    bad_args = core.SiteRow(
         name="a", base_url="https://a.com", checkin_action="browser_script", auth_method="browser",
-        script="x.py", script_args_text="not json",
+        script="scripts/checkin/jisudeng.py", script_args_text="not json",
     )
-    assert "JSON" in (core.validate_rows([bad_script]) or "")
+    assert "JSON" in (core.validate_rows([bad_args]) or "")
     ok = core.SiteRow(name="a", base_url="https://a.com")
     assert core.validate_rows([ok]) is None
+
+
+def test_validate_rows_checks_script_path_exists() -> None:
+    """路径写错要在保存时就拦住：签到跑在后台，隔很久才会被看到。"""
+    missing = core.SiteRow(
+        name="a", base_url="https://a.com", checkin_action="browser_script", auth_method="browser",
+        script="scripts/checkin/nope.py",
+    )
+    assert "不存在" in (core.validate_rows([missing]) or "")
+
+    escaping = core.SiteRow(
+        name="a", base_url="https://a.com", checkin_action="browser_script", auth_method="browser",
+        script="/etc/passwd",
+    )
+    assert core.validate_rows([escaping]) is not None
+
+
+def test_api_action_script_is_optional_but_validated() -> None:
+    """api 的脚本是可选增强（图形验证码等私改流程），留空合法、写错要拦。"""
+    blank = core.SiteRow(name="a", base_url="https://a.com", checkin_action="api")
+    assert core.validate_rows([blank]) is None
+
+    good = core.SiteRow(name="a", base_url="https://a.com", checkin_action="api",
+                        script="scripts/newapi_captcha.py")
+    assert core.validate_rows([good]) is None
+
+    typo = core.SiteRow(name="a", base_url="https://a.com", checkin_action="api",
+                        script="scripts/checkin/newapi_captchaa.py")
+    assert core.validate_rows([typo]) is not None
+
+
+def test_form_plan_shows_script_for_api_with_its_own_hint() -> None:
+    """同一个「脚本路径」字段在两种方式下含义不同，提示必须跟着变。"""
+    api_plan = core.build_form_plan(core.SiteRow(name="s", base_url="https://a.com"), {})
+    assert api_plan.show_script
+    assert not api_plan.show_script_timeout, "纯 HTTP 脚本没有浏览器超时的概念"
+    assert api_plan.script_hint == core.SCRIPT_HINT_API
+
+    bs_plan = core.build_form_plan(
+        core.SiteRow(name="s", base_url="https://a.com", auth_method="browser",
+                     checkin_action="browser_script"),
+        {},
+    )
+    assert bs_plan.show_script and bs_plan.show_script_timeout
+    assert bs_plan.script_hint == core.SCRIPT_HINT_BROWSER
 
 
 def test_persist_accounts_shapes() -> None:
@@ -594,10 +640,12 @@ def test_unrelated_save_does_not_clear_token_cache(tmp_path: Path, monkeypatch) 
     assert token_cache.load_tokens("s", row.base_url)["access_token"] == "FRESH"
 
 
-def test_token_edit_invalidates_tokens_but_keeps_state(tmp_path: Path, monkeypatch) -> None:
+def test_credential_edit_keeps_cache_entry(tmp_path: Path, monkeypatch) -> None:
+    """改凭据不再删缓存：删除不可逆，改错又改回来就白丢一份可用登录态。"""
     from providers import token_cache
 
-    monkeypatch.setattr(token_cache, "CACHE_PATH", tmp_path / "token_cache.json")
+    cache = tmp_path / "token_cache.json"
+    monkeypatch.setattr(token_cache, "CACHE_PATH", cache)
     row = core.SiteRow(
         name="s",
         base_url="https://s.invalid",
@@ -608,31 +656,40 @@ def test_token_edit_invalidates_tokens_but_keeps_state(tmp_path: Path, monkeypat
     saved = core.credential_snapshots([row])
     token_cache.save_tokens(
         "s", row.base_url, "CACHED", "CACHED-RT", browser_state="CACHED-STATE",
-        token_basis="tb", state_basis="sb",
+        token_basis=token_cache.credential_basis("OLD", "OLD-RT", group="token"),
+        state_basis=token_cache.credential_basis(browser_state="SEED-STATE", group="state"),
     )
 
     row.access_token = "NEW"
-    assert core.apply_credential_cache_changes([row], saved) == 1
+    assert core.apply_credential_cache_changes([row], saved) == 1, "应记一次标记，而不是删除"
     cached = token_cache.load_tokens("s", row.base_url)
-    assert "access_token" not in cached and "refresh_token" not in cached
+    assert cached["access_token"] == "CACHED", "值必须留着：改回原凭据即可重新命中"
     assert cached["browser_state"] == "CACHED-STATE"
 
 
-def test_state_edit_invalidates_state_but_keeps_tokens(tmp_path: Path, monkeypatch) -> None:
+def test_changed_token_is_not_applied_although_cache_kept(tmp_path: Path, monkeypatch) -> None:
+    """留着条目不等于会被用上：basis 与新配置不符时读取侧必须拒绝应用。"""
     from providers import token_cache
 
-    monkeypatch.setattr(token_cache, "CACHE_PATH", tmp_path / "token_cache.json")
-    row = core.SiteRow(
-        name="s", base_url="https://s.invalid", access_token="SEED", browser_state="OLD"
-    )
-    saved = core.credential_snapshots([row])
+    cache = tmp_path / "token_cache.json"
+    monkeypatch.setattr(token_cache, "CACHE_PATH", cache)
     token_cache.save_tokens(
-        "s", row.base_url, "CACHED", browser_state="CACHED-STATE",
-        token_basis="tb", state_basis="sb",
+        "s", "https://s.invalid", "CACHED", "CACHED-RT", browser_state="CACHED-STATE",
+        token_basis=token_cache.credential_basis("OLD", "OLD-RT", group="token"),
+        state_basis=token_cache.credential_basis(browser_state="SEED-STATE", group="state"),
     )
 
-    row.browser_state = "NEW"
-    assert core.apply_credential_cache_changes([row], saved) == 1
-    cached = token_cache.load_tokens("s", row.base_url)
-    assert cached["access_token"] == "CACHED"
-    assert "browser_state" not in cached
+    changed = token_cache.resolve_cached_credentials(
+        "s", "https://s.invalid",
+        configured_access_token="NEW", configured_refresh_token="OLD-RT",
+        configured_browser_state="SEED-STATE", path=cache,
+    )
+    assert "access_token" not in changed and "refresh_token" not in changed
+    assert changed["browser_state"] == "CACHED-STATE", "只改 token 不该牵连登录态"
+
+    reverted = token_cache.resolve_cached_credentials(
+        "s", "https://s.invalid",
+        configured_access_token="OLD", configured_refresh_token="OLD-RT",
+        configured_browser_state="SEED-STATE", path=cache,
+    )
+    assert reverted["access_token"] == "CACHED", "改回原凭据后缓存应重新可用"

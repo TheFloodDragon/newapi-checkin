@@ -57,7 +57,9 @@ challenge 新版签到需要本机 **Node.js**（执行 WASM PoW，见 `checkin_
 
 - `api_variant`（仅 `newapi` + `api`）：接口变体偏好，`auto`（challenge 优先，默认）/ `legacy`（旧接口优先）。两种变体互为失败兜底。
 - `oauth_provider` + `oauth_account`（`auth_method=oauth` 或 `checkin_action=relogin`）：选择共享 OAuth 登录态，支持同一 provider 下多个账号。
-- `script` / `script_args` / `script_timeout`（仅 `checkin_action=browser_script`）：仓库内相对 Python 脚本路径、脚本参数 JSON 对象、脚本超时秒数。
+- `script` / `script_args` / `script_timeout`：仓库内相对 Python 脚本路径、脚本参数 JSON 对象、脚本超时秒数。两种签到方式都能挂脚本，但钩子不同：
+  - `checkin_action=browser_script`：**必填**，脚本的 `run(page, context, site, helpers)` 在 Camoufox 里执行；
+  - `checkin_action=api`：**可选**，脚本的 `do_checkin(client, log)` 走纯 HTTP，用于站点私改的签到流程（如 New API fork 的图形验证码），返回 `None` 则回落默认签到。`script_timeout` 对它无意义（超时由 HTTP 层管）。
 
 **有意义的组合**：
 
@@ -243,6 +245,30 @@ Windows 可双击 `run_all_checkin.bat`。
 
 针对**有签到接口、但被阿里云 WAF 挡住纯 HTTP** 的 New API 站点：用站点级 `browser_state` 启动 Camoufox 过 WAF、导出 `acw_tc` 等 WAF cookie 与 session cookie，立刻关闭浏览器，再把 cookie 交给 HTTP `api` 逻辑完成签到。比 `relogin` 快、比纯 `cookie` 更能过 WAF。WAF 持续风控时快速失败并返回 `need_verification`（提示配置住宅代理），不误报 `need_login`；刷新出的 storage_state 会回写 `browser_state` 供复用。
 
+### `api` + 脚本：站点私改的签到流程
+
+有些 New API fork 给签到加了**图形验证码**。这属于个别站点的私改（端点、字段名、图像形态各不相同，随时可能再出现第三种），所以不做进通用适配器，而是做成脚本 `scripts/newapi_captcha.py` —— 在管理界面把该站点的「脚本路径」填成它即可，签到方式保持 `api`：
+
+```json5
+{
+  "name": "SheApi",
+  "base_url": "https://www.sheapi.top",
+  "site_profile": "newapi",
+  "auth_method": "access_token",
+  "checkin_action": "api",
+  "script": "scripts/newapi_captcha.py",  // 需要图形验证码时才填
+  "user_id": "<New-Api-User>",
+  "access_token": "<access_token>",
+  "enabled": true
+}
+```
+
+脚本自己判断该站是否真的需要验证码（两套方言的开关分别在签到状态的 `captcha_enabled` 与 `/api/status` 的 `checkin_captcha_enabled`）；不需要就返回 `None`，通用层照原样走默认签到流程，所以填上它不会影响不需要验证码的日子。
+
+识别在 `captcha_ocr/`（按图像尺寸派发到两套识别器，纯离线、只依赖 numpy + pillow），逆向与验收记录见 `docs/captcha_algorithm.md`。取图不消耗签到机会，所以读数不够可信时脚本会换一张重试，而不是硬猜 —— 猜错会作废一次验证码。
+
+没配脚本却撞上验证码时，签到会失败并在消息里直接告诉你要去填哪个脚本路径。
+
 ### `browser_script`：仓库内自定义浏览器脚本
 
 适合没有稳定接口、但页面上有「签到/领取」按钮的站点。程序按 `auth_method` 恢复登录态、启动 Camoufox、**只允许加载仓库内相对路径 Python 文件**（禁止绝对路径、`..`、URL），调用脚本的 `run(page, context, site, helpers)` 并返回 `{status, message, detail}`。内置示例：`scripts/checkin/100xlabs.py`、`scripts/checkin/jisudeng.py`。脚本可直接用 Playwright 的 `page/context`，也可用 `helpers.goto()` / `helpers.click_text()` / `helpers.screenshot()` / `helpers.success()` 等便捷方法。
@@ -266,6 +292,16 @@ Windows 可双击 `run_all_checkin.bat`。
 
 `auth_method=browser` 时可额外选择 `oauth_fallback_provider` + `oauth_fallback_account`，也可保持“不使用”：程序始终优先使用站点级 `browser_state`，登录态缺失或脚本明确返回 `need_login` 时，最多用共享 OAuth 登录态自动完成一次站点登录并重试脚本；若未选择 OAuth，则直接报告站点登录态失效、签到失败。OAuth 登录期间会在目标站点自动关闭公告、协议、守则、须知等遮挡弹窗，但不会在 Linux.do / GitHub 授权页启用该规则。
 
+极速蹬还有一份与签到独立的**每日答题**（Quiz Quest，实测 5 道选择题、答对一题 $0.1，也可能改发优惠券）。签到成立后会自动做掉，结果写在 `detail.quiz`，答题失败只反映在那里、不会改写签到结论。它挂在纯 HTTP 首选路径与浏览器脚本两处，所以无论当天是否需要开浏览器都会执行。
+
+答题的题库、判定与两种传输**全部收在 `scripts/checkin/jisudeng.py`**：这套玩法只属于这个站点，散到通用层会让人找不到题库在哪。通用层只认两个钩子——`run(page, context, site, helpers)`（浏览器路径）与 `run_http_extras(client, log)`（纯 HTTP 路径，返回 `{detail 键: 摘要}`），本身不知道「答题」是什么，其它站点想加自己的日常任务照此实现即可。
+
+答题接口不返回正确答案、提交后也只给总分，因此题库离线维护在该脚本的 `ANSWERS`（按题面匹配、值存正确选项原文，避免站点调换选项顺序时答错）。遇到未收录的新题会按「最长选项」猜一次，题面与全部选项直接打进日志、并追加到 `.cache-checkin/play_quiz_unknown.json` 供补录。
+
+该站登录由服务端强制 Cloudflare Turnstile（纯 HTTP 账密登录必被拒），所以浏览器只用来「重新拿一次 token」：脚本跑完后运行器会把 `storage_state` 与 localStorage 里的 `auth_token`/`refresh_token` 一起存进 `.cache-checkin/token_cache.json`，之后的运行只要 token 或 refresh_token 还有效，签到与答题就全走纯 HTTP、不启动浏览器。这对所有 `browser_script` 站点都生效（此前续存写在脚本里，而脚本拿到的是脱敏站点视图，算出的凭据基线与真实配置不符，写出的缓存下次会被判为过期而忽略，等于从未续存）。
+
+运行期缓存只判定、不删除：改动账号凭据后，程序在缓存条目上打一个「配置已变」标记，值仍保留在 `.cache-checkin/token_cache.json` 里。带凭据基线（basis）的条目本来就按基线判定，把凭据改回原值即可自动重新命中。这样改错再改回、或仅仅重命名站点，都不会白丢一份仍然有效的登录态。
+
 ## 图形界面（GUI）
 
 ```bash
@@ -279,7 +315,7 @@ uv run python manage_accounts.py
 - 左侧站点列表（搜索 / 拖拽排序 / 启停），右侧编辑「站点配置 + 凭据」：选择站点类型、登录方式与签到方式（三维字段）；
 - `auth_method=oauth` 或 `checkin_action=relogin` 时出现 OAuth 提供商 + 账号控件，可**捕获 / 检测 OAuth 登录态**；捕获结果先加入当前内存配置并显示“未保存”，点击 `保存全部` 后写入顶层 `oauth_states`；relogin 站点不保存站点级 `browser_state`；
 - `auth_method=browser` 时出现站点级「浏览器登录态」输入区；自定义浏览器脚本还会显示「可选 OAuth」，直接列出顶层共享 `oauth_states` 中已有的账号；
-- `checkin_action=browser_script` 时出现脚本路径 / 参数 JSON / 超时控件（路径必须是仓库内相对路径）；
+- 「脚本路径 / 参数 JSON」在 `browser_script` 与 `api` 下都会出现（前者必填、后者可选，字段提示会跟着切换），「脚本超时」只在 `browser_script` 下显示；路径必须是仓库内相对 `.py`，保存时就会校验文件是否存在；
 - **测试签到 / 查询额度 / 立即签到**：按当前三维字段跑一次，当场看结果；
 - 底部「日志」面板实时展示脱敏后台日志；顶栏可切换深 / 浅主题（默认深色，偏好自动记忆）；
 - **代理**：在「认证凭据」区填 `proxy`；
