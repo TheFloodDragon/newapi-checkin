@@ -1143,7 +1143,7 @@ class App(QMainWindow):
         plan = core.build_form_plan(row, self.oauth_states) if row is not None else core.FormPlan()
         self.variant_wrap.setVisible(plan.show_variant)
         self.script_wrap.setVisible(plan.show_script)
-        self.script_args_wrap.setVisible(plan.show_script)
+        self.script_args_wrap.setVisible(plan.show_script_args)
         self.script_timeout_wrap.setVisible(plan.show_script_timeout)
         self._set_field_hint(self.script_wrap, plan.script_hint)
         self.script_edit.setPlaceholderText(plan.script_placeholder)

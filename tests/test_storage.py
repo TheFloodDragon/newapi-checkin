@@ -121,6 +121,31 @@ def test_site_config_factory_normalizes_legacy_fields() -> None:
     assert site.auto_refresh_cookie is False
 
 
+def test_save_accounts_preserves_api_script_without_browser_only_fields(tmp_path: Path) -> None:
+    """api 脚本保存时只保留路径；参数与超时属于 browser_script，不应混入。"""
+    path = tmp_path / "ACCOUNTS.json"
+    accounts_store.save_accounts(
+        [
+            {
+                "name": "captcha",
+                "base_url": "https://captcha.invalid",
+                "site_profile": "newapi",
+                "auth_method": "access_token",
+                "checkin_action": "api",
+                "script": "scripts/newapi_captcha.py",
+                "script_args": {"ignored": True},
+                "script_timeout": 99,
+                "enabled": True,
+            }
+        ],
+        path=path,
+    )
+    saved = json.loads(path.read_text(encoding="utf-8"))["accounts"][0]
+    assert saved["script"] == "scripts/newapi_captcha.py"
+    assert "script_args" not in saved
+    assert "script_timeout" not in saved
+
+
 # ── GitHub Secret 导出：接口凭据 vs 登录方式凭据 ──────────────────────────────
 def _sub2api_browser_account(**extra) -> dict:
     """sub2api + auth_method=browser 的典型账号（本仓库 6 个 sub2api 站点都是这样配的）。"""
@@ -134,6 +159,30 @@ def _sub2api_browser_account(**extra) -> dict:
     }
     account.update(extra)
     return account
+
+
+def test_export_keeps_api_script_without_browser_only_fields() -> None:
+    payload = accounts_store.build_github_secret_payload(
+        [
+            {
+                "name": "captcha",
+                "base_url": "https://captcha.invalid",
+                "site_profile": "newapi",
+                "auth_method": "access_token",
+                "checkin_action": "api",
+                "script": "scripts/newapi_captcha.py",
+                "script_args": {"ignored": True},
+                "script_timeout": 99,
+                "access_token": "at",
+                "user_id": "42",
+                "enabled": True,
+            }
+        ]
+    )
+    exported = payload["accounts"][0]
+    assert exported["script"] == "scripts/newapi_captcha.py"
+    assert "script_args" not in exported
+    assert "script_timeout" not in exported
 
 
 def test_export_keeps_access_token_regardless_of_auth_method() -> None:

@@ -132,10 +132,12 @@ def build_site_tasks() -> list[CheckinTask]:
         api_variant = str(site.get("api_variant") or "auto").strip().lower()
         if api_variant:
             command.extend(["--api-variant", api_variant])
+        # api 也可挂纯 HTTP 站点脚本（如 scripts/newapi_captcha.py）；此前只给
+        # browser_script 透传，导致本地 GUI 测试可用、批量运行与 CI 却静默丢失脚本。
+        script = str(site.get("script") or "").strip()
+        if checkin_action in {"api", "browser_script"} and script:
+            command.extend(["--script", script])
         if checkin_action == "browser_script":
-            script = str(site.get("script") or "").strip()
-            if script:
-                command.extend(["--script", script])
             command.extend(["--script-timeout", str(accounts_store.parse_script_timeout(site.get("script_timeout")))])
         cookie_file = site_config.cookie_file.strip()
         cookie = site_config.cookie.strip()

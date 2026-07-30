@@ -390,6 +390,9 @@ def task_params(
 class FormPlan:
     show_variant: bool = False
     show_script: bool = False
+    # script_args 目前只传给 browser_script 的 run()；api 钩子固定为
+    # do_checkin(client, log)，显示参数框会让用户误以为它会被消费。
+    show_script_args: bool = False
     # 脚本超时只对浏览器脚本有意义（它限的是 Camoufox 里 run() 的执行时间）。
     # api 方式下的脚本是纯 HTTP 的，超时由 HTTP 层自己管，显示这个框只会误导。
     show_script_timeout: bool = False
@@ -498,6 +501,7 @@ def build_form_plan(row: SiteRow, oauth_states: dict[str, Any]) -> FormPlan:
     plan = FormPlan(
         show_variant=row.type == "newapi" and action == "api",
         show_script=is_script or allow_api_script,
+        show_script_args=is_script,
         show_script_timeout=is_script,
         script_hint=SCRIPT_HINT_API if allow_api_script else SCRIPT_HINT_BROWSER,
         script_placeholder=SCRIPT_PLACEHOLDER_API if allow_api_script else SCRIPT_PLACEHOLDER_BROWSER,
@@ -709,13 +713,14 @@ def persist_accounts(rows: list[SiteRow]) -> list[dict[str, Any]]:
             "refresh_token": row.refresh_token,
             "cookie": row.cookie,
         }
+        if action in {"api", "browser_script"} and row.script.strip():
+            acct["script"] = row.script.strip()
         if action == "browser_script":
             text = row.script_args_text.strip() or "{}"
             try:
                 parsed = json.loads(text)
             except json.JSONDecodeError:
                 parsed = accounts_store.normalize_script_args(row.script_args)
-            acct["script"] = row.script.strip()
             acct["script_args"] = parsed if isinstance(parsed, dict) else {}
             acct["script_timeout"] = accounts_store.parse_script_timeout(row.script_timeout)
         if auth == "oauth" or action == "relogin":

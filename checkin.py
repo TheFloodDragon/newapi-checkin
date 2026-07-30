@@ -116,7 +116,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--site-profile", default="newapi", help="站点适配器：newapi / sub2api（默认 newapi）")
     parser.add_argument("--auth-method", default="", help="登录方式：access_token / cookie / browser / oauth（留空自动推断）")
     parser.add_argument("--checkin-action", default="api", choices=["api", "relogin", "visit", "browser_script"], help="签到方式：api=调接口，relogin=浏览器重登，visit=访问保活，browser_script=自定义浏览器脚本")
-    parser.add_argument("--script", default="", help="browser_script 的仓库内相对 Python 脚本路径")
+    parser.add_argument("--script", default="", help="站点脚本的仓库内相对 Python 路径（api 可选，browser_script 必填）")
     # script_args 可能含账号密码等凭据，优先从环境变量 CHECKIN_SCRIPT_ARGS 读取，
     # 避免出现在进程命令行（argv 对同机其它用户可见）。此选项仅供手工调试使用。
     parser.add_argument("--script-args", default="", help="browser_script 的脚本参数 JSON 字符串（含凭据时请改用 CHECKIN_SCRIPT_ARGS 环境变量）")

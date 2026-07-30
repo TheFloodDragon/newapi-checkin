@@ -111,6 +111,31 @@ def test_site_task_keeps_secrets_out_of_argv(monkeypatch) -> None:
     assert task.worker_protocol
 
 
+def test_api_script_path_reaches_worker(monkeypatch) -> None:
+    """api 的纯 HTTP 脚本必须透传给 worker，否则 GUI 可用、批量与 CI 静默失效。"""
+    monkeypatch.setattr(
+        runner.accounts_store,
+        "load_unified_accounts",
+        lambda **_kwargs: [
+            {
+                "name": "captcha-site",
+                "base_url": "https://captcha.invalid",
+                "site_profile": "newapi",
+                "auth_method": "access_token",
+                "checkin_action": "api",
+                "script": "scripts/newapi_captcha.py",
+                "access_token": "token",
+                "user_id": "42",
+            }
+        ],
+    )
+    task = runner.build_site_tasks()[0]
+    argv = " ".join(task.command)
+    assert "--script scripts/newapi_captcha.py" in argv
+    assert "--script-timeout" not in argv
+    assert "CHECKIN_SCRIPT_ARGS" not in (task.env or {})
+
+
 def test_script_args_credentials_never_reach_argv(monkeypatch) -> None:
     """browser_script 的 script_args 可能含站点账号密码，必须走环境变量。
 

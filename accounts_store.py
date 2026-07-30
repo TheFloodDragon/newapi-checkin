@@ -936,7 +936,8 @@ def _account_to_persist(row: dict[str, Any]) -> dict[str, Any]:
                     out["api_variant"] = variant
             continue
         if field == "script":
-            if row.get("checkin_action") == "browser_script":
+            # browser_script 必填；api 可选，用于 do_checkin(client, log) 纯 HTTP 钩子。
+            if row.get("checkin_action") in {"api", "browser_script"}:
                 script = str(row.get("script") or "").strip()
                 if script:
                     out["script"] = script
@@ -1132,10 +1133,12 @@ def build_github_secret_payload(
             if api_variant and api_variant != "auto":
                 out["api_variant"] = api_variant
 
-        if checkin_action == "browser_script":
+        # 两种 action 都能挂脚本：api 只需路径，browser_script 还需参数与超时。
+        if checkin_action in {"api", "browser_script"}:
             script = str(row.get("script") or "").strip()
             if script:
                 out["script"] = script
+        if checkin_action == "browser_script":
             script_args = normalize_script_args(row.get("script_args"))
             if script_args:
                 out["script_args"] = script_args

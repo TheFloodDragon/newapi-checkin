@@ -189,6 +189,7 @@ def test_form_plan_shows_script_for_api_with_its_own_hint() -> None:
     """同一个「脚本路径」字段在两种方式下含义不同，提示必须跟着变。"""
     api_plan = core.build_form_plan(core.SiteRow(name="s", base_url="https://a.com"), {})
     assert api_plan.show_script
+    assert not api_plan.show_script_args, "api 钩子不接收 script_args"
     assert not api_plan.show_script_timeout, "纯 HTTP 脚本没有浏览器超时的概念"
     assert api_plan.script_hint == core.SCRIPT_HINT_API
 
@@ -197,7 +198,7 @@ def test_form_plan_shows_script_for_api_with_its_own_hint() -> None:
                      checkin_action="browser_script"),
         {},
     )
-    assert bs_plan.show_script and bs_plan.show_script_timeout
+    assert bs_plan.show_script and bs_plan.show_script_args and bs_plan.show_script_timeout
     assert bs_plan.script_hint == core.SCRIPT_HINT_BROWSER
 
 
@@ -208,16 +209,20 @@ def test_persist_accounts_shapes() -> None:
             checkin_action="browser_script", script="scripts/x.py", script_args_text='{"a": 1}',
             browser_state="ST", verify_ssl=False,
         ),
-        core.SiteRow(name="api-site", base_url="https://b.com", checkin_action="relogin", auth_method="cookie"),
+        core.SiteRow(name="api-script", base_url="https://b.com", checkin_action="api",
+                     script="scripts/newapi_captcha.py", script_args_text='{"ignored": true}'),
+        core.SiteRow(name="relogin-site", base_url="https://c.com", checkin_action="relogin", auth_method="cookie"),
     ]
     accts = core.persist_accounts(rows)
-    first, second = accts
+    first, api_script, relogin = accts
     assert first["script"] == "scripts/x.py" and first["script_args"] == {"a": 1}
     assert first["browser_state"] == "ST" and first["verify_ssl"] is False
+    assert api_script["script"] == "scripts/newapi_captcha.py"
+    assert "script_args" not in api_script and "script_timeout" not in api_script
     # relogin：auth 矫正为 oauth、不落 browser_state、带 oauth 字段、无 api_variant
-    assert second["auth_method"] == "oauth"
-    assert "browser_state" not in second and "api_variant" not in second
-    assert second["oauth_provider"] == "linuxdo"
+    assert relogin["auth_method"] == "oauth"
+    assert "browser_state" not in relogin and "api_variant" not in relogin
+    assert relogin["oauth_provider"] == "linuxdo"
 
 
 def test_config_snapshot_stable_and_sensitive_to_changes() -> None:
