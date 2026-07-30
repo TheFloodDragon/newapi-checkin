@@ -123,6 +123,43 @@ def _inject_current_quota(client: ProfileClient, detail: dict[str, Any]) -> None
         detail["current_quota"] = user.quota_raw
 
 
+def _script_log(site: SiteConfig, message: str) -> None:
+    """站点脚本的诊断输出（stderr；worker 的 stdout 是机器协议通道）。"""
+    import sys
+
+    from mask_utils import mask_secrets
+
+    print(f"[api:{site.name}] {mask_secrets(str(message))}", file=sys.stderr, flush=True)
+
+
+def _script_checkin(site: SiteConfig, client: ProfileClient, turnstile: str) -> CheckinReward | None:
+    """把签到交给站点脚本；脚本不接管（或未配置脚本）时返回 None。
+
+    这是「站点私改玩法」的唯一入口：图形验证码这类只服务于个别 fork 的流程都写成
+    脚本（如 scripts/newapi_captcha.py），由用户在管理界面填脚本路径启用，
+    通用适配器不必为它们背分支。
+
+    脚本约定：``do_checkin(client, log=None) -> CheckinReward | None``
+    —— 返回 None 表示「本站不需要我接管」，抛 ApiError 由下游按 classify 归类。
+    加载失败只记日志并回落默认流程：配置写错不该让签到直接失败。
+    """
+    script_path = str(getattr(site, "script", "") or "").strip()
+    if not script_path:
+        return None
+    try:
+        from browser import script_loader
+
+        module = script_loader.load_site_script(script_path)
+    except Exception as exc:  # noqa: BLE001
+        _script_log(site, f"加载站点脚本失败，改用默认签到流程：{type(exc).__name__}: {exc}")
+        return None
+    runner = getattr(module, "do_checkin", None)
+    if not callable(runner):
+        return None
+    reward = runner(client, log=lambda message: _script_log(site, message))
+    return reward if isinstance(reward, CheckinReward) else None
+
+
 def _checkin_once(site: SiteConfig, client: ProfileClient, turnstile: str) -> CheckinResult:
     base_url = client.base_url
     # 1) 读签到状态
@@ -172,7 +209,10 @@ def _checkin_once(site: SiteConfig, client: ProfileClient, turnstile: str) -> Ch
     # 余额时直接复用，省一次请求。
     quota_before = status.quota_usd if status.quota_usd is not None else _read_quota(client)
     try:
-        reward = client.do_checkin(turnstile)
+        # 站点脚本优先：它可能实现了该 fork 私改的签到流程（如图形验证码）。
+        reward = _script_checkin(site, client, turnstile)
+        if reward is None:
+            reward = client.do_checkin(turnstile)
     except ApiError as exc:
         if exc.transient:
             return CheckinResult(

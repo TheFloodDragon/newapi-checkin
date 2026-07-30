@@ -51,6 +51,9 @@ VERIFICATION_PATTERNS = [
     "challenge-platform",
     "人机",
     "captcha",
+    # 「验证码」比宽泛的「验证」具体得多，不会误伤「token 验证失败」这类登录报错，
+    # 而图形验证码本身就属于人机验证 —— 缺它被拒时应归 need_verification。
+    "验证码",
 ]
 
 # 网络层重试：对瞬时性错误（429 / 5xx / 连接超时）做指数退避重试。

@@ -6,6 +6,9 @@ predict          识别图片
 bench            在真实样本上跑准确率与延迟（验收用）
 build-templates  重建模板库（改了窗口/角度参数后必须执行）
 stats            查看真实样本库构成
+
+base64-build     重建 base64Captcha 系模板库（sheapi 的签到验证码）
+base64-bench     在 tests/data 的真实样本上评测 base64Captcha 识别器
 """
 
 from __future__ import annotations
@@ -112,6 +115,87 @@ def _cmd_build_templates(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_base64_build(args: argparse.Namespace) -> int:
+    """重建 base64Captcha 系模板库。
+
+    字体不随仓库分发（第三方字体），需先下载到 captcha_ocr/fonts/。
+    """
+    from . import base64_captcha as bc
+
+    try:
+        path = bc.build_templates(
+            font_dir=args.fonts or bc.FONT_DIR,
+            charset=args.charset,
+            path=args.output or bc.TEMPLATES_PATH,
+        )
+    except FileNotFoundError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    table = bc.Templates.load(path)
+    print(f"模板库已写入 {path}（{Path(path).stat().st_size / 1024:.0f} KB，"
+          f"{len(table)} 项 = {len(bc.CHARSETS[args.charset])} 字符 × "
+          f"{len(bc.FONT_NAMES)} 字体 × {len(bc.font_sizes(table.height))} 字号）")
+    return 0
+
+
+def _cmd_base64_bench(args: argparse.Namespace) -> int:
+    """真实样本基准。标签里的 `?` 表示人工无法确认，该位与该图都跳过。"""
+    import base64
+    import io
+    import json
+
+    import numpy as np
+
+    from . import base64_captcha as bc
+
+    path = args.samples or Path(__file__).resolve().parents[1] / "tests" / "data" / "base64_captcha_samples.json"
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except OSError as exc:
+        print(f"读取样本失败：{exc}", file=sys.stderr)
+        return 1
+    try:
+        from PIL import Image
+    except ImportError:
+        print("解码 PNG 需要 pillow：uv sync --extra dev", file=sys.stderr)
+        return 1
+
+    ok_char = tot_char = ok_img = tot_img = exact_ok = exact_tot = 0
+    start = time.perf_counter()
+    for sample in payload["samples"]:
+        label = str(sample["label"])
+        with Image.open(io.BytesIO(base64.b64decode(sample["png_base64"]))) as image:
+            array = np.asarray(image.convert("RGB"))
+        result = bc.solve_array(array, length=int(payload.get("char_count") or bc.DEFAULT_LENGTH))
+        text = result.text.ljust(len(label))
+        for want, got in zip(label, text):
+            if want == "?":
+                continue
+            tot_char += 1
+            ok_char += int(want == got)
+        if "?" in label:
+            continue
+        tot_img += 1
+        correct = text == label
+        ok_img += int(correct)
+        if result.exact:
+            exact_tot += 1
+            exact_ok += int(correct)
+        if args.verbose:
+            flag = "OK " if correct else "ERR"
+            marks = " ".join(f"{c or '?'}:{s:.2f}/{m:+.2f}" for c, s, m in result.detail)
+            print(f"{flag} 真值={label} 预测={result.text} exact={int(result.exact)} {marks}")
+    elapsed = time.perf_counter() - start
+
+    print(f"单字符 {ok_char}/{tot_char} = {ok_char / max(1, tot_char):.2%}")
+    print(f"整图   {ok_img}/{tot_img} = {ok_img / max(1, tot_img):.2%}")
+    if exact_tot:
+        print(f"exact 通过率 {exact_tot}/{tot_img} = {exact_tot / tot_img:.2%}；"
+              f"通过者正确率 {exact_ok}/{exact_tot} = {exact_ok / exact_tot:.2%}")
+    print(f"延迟 {elapsed / len(payload['samples']) * 1000:.0f} ms/张")
+    return 0
+
+
 def _cmd_stats(args: argparse.Namespace) -> int:
     from . import collect
 
@@ -146,6 +230,19 @@ def main(argv: list[str] | None = None) -> int:
     p_stats = sub.add_parser("stats", help="真实样本库构成")
     p_stats.add_argument("--samples", type=Path, help="样本 JSON 路径")
     p_stats.set_defaults(func=_cmd_stats)
+
+    p_b64_build = sub.add_parser("base64-build", help="重建 base64Captcha 系模板库")
+    p_b64_build.add_argument("--fonts", type=Path, help="base64Captcha TTF 目录（默认 captcha_ocr/fonts）")
+    p_b64_build.add_argument("-c", "--charset", default="digits",
+                             choices=("digits", "letters", "mixed"),
+                             help="站点 GraphicCaptchaCharset 档位（默认 digits）")
+    p_b64_build.add_argument("-o", "--output", type=Path, help="输出 .npz 路径")
+    p_b64_build.set_defaults(func=_cmd_base64_build)
+
+    p_b64_bench = sub.add_parser("base64-bench", help="base64Captcha 识别器准确率基准")
+    p_b64_bench.add_argument("--samples", type=Path, help="样本 JSON 路径（默认 tests/data）")
+    p_b64_bench.add_argument("-v", "--verbose", action="store_true", help="逐张输出得分")
+    p_b64_bench.set_defaults(func=_cmd_base64_bench)
 
     args = parser.parse_args(argv)
     return args.func(args)

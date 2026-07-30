@@ -110,7 +110,7 @@ console.log('middle→baseline 偏移 =', mid.bottom - alpha.bottom);  // 11
 # New API 签到图形验证码（jianzhile 系 fork）
 
 与上面 randomtool.cn 那套**完全无关**，是另一个生成器。识别实现见
-`captcha_ocr/newapi_bitmap.py`，接线见 `providers/profiles/newapi.py`。
+`captcha_ocr/newapi_bitmap.py`，接线见 `scripts/newapi_captcha.py`。
 
 ## 一、接口流程（纯 HTTP，无需浏览器）
 
@@ -187,3 +187,127 @@ POST /api/user/checkin                 → body {captcha_id, captcha_answer}
 
 58% 单字符 ≈ 7% 整图，不可用。根因是字体不同（Arial 轮廓字体 vs 6×9 点阵），
 不是参数没调好。字模表必须来自目标站点自己的字体。
+
+---
+
+# New API 签到图形验证码（base64Captcha 系，如 sheapi.top）
+
+第三套，与上面两套都无关。生成端是 Go 的
+[`github.com/mojocn/base64Captcha`](https://github.com/mojocn/base64Captcha) `DriverString`
+（依据见下文「如何确认生成端」）。识别实现 `captcha_ocr/base64_captcha.py`，
+模板库 `captcha_ocr/base64_templates.npz`（90 KB，用 `python -m captcha_ocr base64-build` 重建）。
+
+## 一、接口流程（纯 HTTP）
+
+```
+GET  /api/status                 → checkin_captcha_enabled 标记签到是否要验证码
+GET  /api/captcha?scene=checkin  → {captcha_id, image(dataURL), expires_in}
+POST /api/user/checkin           → body {captcha_id, captcha_code}
+```
+
+与 jianzhile 那套的差异（都是 New API fork，但三处全不同，不能共用一套常量）：
+
+| | jianzhile 系 | 本套 |
+|---|---|---|
+| 取图 | `POST /api/user/checkin/captcha` | `GET /api/captcha?scene=checkin` |
+| 图片字段 | `captcha_image` | `image` |
+| 提交字段 | `captcha_answer` | `captcha_code` |
+
+`scene` 实测白名单：`checkin` / `redemption` / `email_verification` / `login` /
+`register`，其它值回 `验证码场景无效`。该端点**无需登录**即可无限取图，因此可以
+离线批量采样验收准确率，不必消耗签到机会。
+
+失败回执（HTTP 均 200，靠 `success=false` + `message` 区分）：
+
+| 情况 | message |
+|---|---|
+| 未带验证码字段 | `图形验证码不能为空` |
+| 答案错误或已过期 | `图形验证码错误或已过期` |
+
+`captcha_id` 单次有效，重试必须重新取图。
+
+## 二、图像结构
+
+| 项 | 实测值 |
+|---|---|
+| 画布 | 120×40，背景恒为 `#fafcff` |
+| 字符数 | 4（`GraphicCaptchaLength`，可配 4/5） |
+| 字符集 | 数字，且**不含 0/1**（见下） |
+| 字号 | `40*(rand(7)+7)/16` → 仅 17/20/22/25/27/30/32 共 7 档 |
+| 字体 | base64Captcha 内置 9 个 TTF 随机取，逐字符独立 |
+| 变形 | **无旋转、无缩放**，仅字号与 y 抖动 |
+| 干扰 | 浅色「幽灵字符」（`RandLightColor()`，各通道 ∈[200,255)） |
+| 抗锯齿 | 有（与 jianzhile 那套的无锯齿点阵相反） |
+
+字符只有「字符 × 字体 × 字号」三个自由度且全部可穷举，模板空间仅 560 项，
+识别退化为查表 —— 这是本套能零训练做到高准确率的根本原因。
+
+### 字符集为何判定不含 0/1
+
+站点 `/api/status` 只暴露 `GraphicCaptchaCharset=digits`，没有更细的信息。
+但 117 个人工标注字符里 `0` 与 `1` **一次都没出现**：若字符集是完整 10 个数字，
+期望各出现约 12 次，两者同时全缺的概率约 1e-11。base64Captcha 自己的
+`TxtNumbers` 也剔除了 `5`，可见该系有排除易混淆字符的惯例。
+
+这不是纸面推断：把 0/1 放进字符集时整图正确率 77.8%、6 个错误里 3 个是误判成
+`1`；剔除后升到 88.9%，且 exact 通过者全对。**多余的候选字符只会制造误判。**
+
+## 三、分割：按颜色方向聚类，而不是取纯色
+
+不能照搬 jianzhile 那套的精确取色：本套有抗锯齿，实测 184~308 个深色像素里有
+124~227 种颜色，取纯色只剩十几个点，字形碎掉。
+
+但抗锯齿混合是线性的：`P = a*C + (1-a)*U`（U 为背景或浅色噪点），因此
+`BG - P` 与 `BG - C` **同向，方向与混合比例 a 无关**。所以按「颜色方向」聚类即可
+分割，且不需要预先知道字符色 C。浅色噪点满足 |BG-P| ≤ 91，用 |BG-P| > 100 整体剥离。
+
+## 四、打分：软 IoU + 最小二乘估色
+
+二值化再算 IoU 会丢掉抗锯齿信息（实测整图仅 59%）。改为每个摆位用最小二乘反解
+颜色深度 `depth = Σ(proj·T)/Σ(T²)`，把观测折算成覆盖率 `A = clip(proj/depth, 0, 1)`，
+再算软 IoU `Σmin(A,T)/Σmax(A,T)`。
+
+四种打分在同一套 30 张标注样本上的实测对比：
+
+| 方案 | 单字符 | 整图 |
+|---|---|---|
+| 硬 IoU（二值化） | 90.6% | 59.3% |
+| 软硬各半 | 94.9% | 77.8% |
+| 召回 − 1.5×多余墨 | 91.5% | 63.0% |
+| **软 IoU（采用）** | **97.4%** | **88.9%** |
+
+## 五、验证结果
+
+- 30 张真实样本人工标注（117 个可辨认字符）：单字符 97.4%，整图 88.9%
+- `exact` 判据（得分与次优差距均达阈值）：通过率 66.7%，**通过者 18/18 全对**
+- 识别延迟约 380 ms/张（模板空间 560 项 × 摆位搜索；纯 numpy）
+- sheapi.top 真实签到：一次通过，`quota_awarded=138410`
+- 单独用兑换码接口连续实测 `exact` 提交 4 次，验证码校验 4/4 通过
+
+`exact=False` 时调用方应换一张重试而非硬提交 —— 取图不限次、不消耗签到机会，
+所以「换图」的代价远低于「猜错」。
+
+## 六、如何确认生成端
+
+不是从版本号推的（站点 `/api/status` 的 `version` 为空串），而是逐条比对行为：
+
+1. 9 个内置字体、7 档字号、逐字符换色换字体 —— 与 `drawText` 的实现一一对应；
+2. 浅色幽灵字符用的是 `,.[]<>` 加数字字母 —— 这来自 `drawNoise` 里硬编码的
+   `source` 字符串，别的库不会这样；
+3. PNG 为 truecolor 无 alpha，与 `image.NewNRGBA` + Go `png.Encode` 的产物一致；
+4. 背景恒为 `#fafcff`：`BgColor` 传 nil 时 base64Captcha 会走 `RandLightColor()`
+   每次随机，恒定说明该 fork 显式传了颜色。
+
+`GraphicCaptcha*` 这批 option key 在公开的 New API 上游（QuantumNous/new-api）
+里不存在，是站点自有 fork 的私改，源码不可得 —— 所以模板必须靠本地 TTF 复刻渲染。
+
+## 七、重建模板库
+
+改了字符集/字号/字体后必须重建，否则识别静默降准确率：
+
+```bash
+python -m captcha_ocr build-base64-templates   # 需要 pillow 与 9 个 TTF
+python -m captcha_ocr bench-base64             # 在标注样本上验收
+```
+
+字体文件不入库（各自有许可），构建脚本会从 base64Captcha 仓库拉取。

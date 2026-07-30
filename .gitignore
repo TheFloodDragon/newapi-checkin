@@ -16,6 +16,10 @@ results/
 # 验证码真实样本（仅用于本地验收准确率；1.5MB 二进制掩码，不入库）
 # 模板库 captcha_ocr/templates.npz 是构建产物、体积仅 34KB，照常跟踪。
 captcha_ocr/data/real_samples.json
+# base64Captcha 的 9 个第三方 TTF（660KB，许可未逐一确认，不随本仓库分发）。
+# 只有重建 captcha_ocr/base64_templates.npz 时才需要，运行期只读已打包的 npz；
+# 下载地址与缺失时的提示见 captcha_ocr/base64_captcha.py 的 FONTS_URL。
+captcha_ocr/fonts/
 login_grant_state.json
 checkin_report.md
 *.lock
