@@ -290,6 +290,70 @@ def test_oauth_result_without_success_toast_remains_already_done() -> None:
     assert result["status"] == "already_done"
 
 
+def test_cloudflare_midway_does_not_veto_a_landed_oauth() -> None:
+    """实测 AgentRouter：授权页先弹 CF 挑战、ClickSolver 报「未能通过」，
+    但随后授权成功、跳回站点并弹出「签到成功，新增额度已到账」。
+    cloudflare 只说明「过程中弹过验证」，人都跳回来了不能再否决结论。
+    """
+    link = {
+        "landed_back": True,
+        "cloudflare": True,
+        "site_success_message": "签到成功，新增额度已到账",
+    }
+    result = session._oauth_checkin_result(None, 199_805_975, link)
+
+    assert result["status"] == "success"
+    assert "重新捕获登录态" not in result["message"]
+
+
+def test_need_human_and_waf_still_veto_oauth() -> None:
+    """真正没完成的两种情形必须继续否决：停在第三方登录页、WAF 持续拦截。"""
+    assert not session._oauth_landed({"landed_back": True, "need_human": True})
+    assert not session._oauth_landed({"landed_back": True, "waf_blocked": True})
+    assert not session._oauth_landed({"landed_back": False})
+    assert session._oauth_landed({"landed_back": True, "cloudflare": True})
+
+
+def test_site_error_noise_is_dropped() -> None:
+    """公告接口失败、JSHandle@object、CF beacon 等与签到成败无关，
+    留着只会把真正的失败原因挤出「站点原始错误」（实测挤掉了一次成功结论）。
+    """
+    collector: dict = {"items": [], "tasks": []}
+    session._add_site_error(collector, "console.error", "获取公告失败: Error")
+    session._add_site_error(collector, "console.error", "JSHandle@object")
+    session._add_site_error(collector, "console.error",
+                            "Cross-Origin Request Blocked: ... static.cloudflareinsights.com/beacon.min.js ...")
+    session._add_site_error(collector, "console.warning",
+                            'Storage access automatically granted for origin “https://connect.linux.do”')
+    assert collector["items"] == []
+
+    session._add_site_error(collector, "response", "HTTP 403 https://s.invalid/api/user/checkin body=账号已封禁")
+    assert len(collector["items"]) == 1
+
+
+def test_landed_oauth_drops_pre_login_errors() -> None:
+    """OAuth 已跳回站点时，登录前必然出现的 401 不该再被报成「站点原始错误」。"""
+    link: dict = {"landed_back": True, "site_error": "旧的 401", "site_errors": ["旧的 401"]}
+    session._attach_oauth_completion_messages(
+        link,
+        [
+            "response: HTTP 401 https://s.invalid/api/user/self body=未登录",
+            "dom: 签到成功，新增额度已到账",
+        ],
+    )
+    assert "site_error" not in link and "site_errors" not in link
+    assert link["site_success_message"] == "签到成功，新增额度已到账"
+
+
+def test_unfinished_oauth_keeps_raw_errors_for_diagnosis() -> None:
+    """没跳回站点时相反：必须保留原始错误，否则失败无从排查。"""
+    link: dict = {"landed_back": False}
+    session._attach_oauth_completion_messages(
+        link, ["response: HTTP 500 https://s.invalid/api/oauth/state body=boom"]
+    )
+    assert "HTTP 500" in link["site_error"]
+
+
 # ── refresh_token 快照兜底 ───────────────────────────────────────────────────
 # 背景（实测时序）：access_token 过期时 sub2api 前端收到 401 会清空 localStorage
 # 再跳登录页，而 add_init_script 每次导航又重新注入，两者约每 2 秒来回竞争。

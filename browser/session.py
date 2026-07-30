@@ -635,11 +635,29 @@ def _short_url(url: str) -> str:
     return str(url or "").split("#", 1)[0].split("?", 1)[0]
 
 
+# 与签到成败无关的前端噪声。这些条目会被拼进「站点原始错误」直接展示给用户，
+# 留着只会掩盖真正的失败原因（实测 AgentRouter 的一次成功签到被这几条淹没）。
+SITE_ERROR_NOISE = [
+    "获取公告失败",          # 公告接口挂了不影响签到
+    "jshandle@",             # console.error 打的是对象，取不到内容，纯噪声
+    "cloudflareinsights",    # CF 统计 beacon 被 CORS 拦
+    "beacon.min.js",
+    "integrity attribute",   # 第三方脚本 SRI 校验告警
+    "storage access automatically granted",
+    "e.response is undefined",
+    "google-analytics",
+    "googletagmanager",
+]
+
+
 def _add_site_error(collector: dict[str, Any] | None, source: str, message: Any) -> None:
     if collector is None:
         return
     text = _redact_site_error(message)
     if not text:
+        return
+    lowered = text.lower()
+    if any(pattern in lowered for pattern in SITE_ERROR_NOISE):
         return
     item = f"{source}: {text}" if source else text
     items = collector.setdefault("items", [])
@@ -854,6 +872,18 @@ def _message_with_site_error(message: str, link: dict[str, Any]) -> str:
     return f"{message} 站点原始错误：{site_error}"
 
 
+def _oauth_landed(link: dict[str, Any]) -> bool:
+    """OAuth 是否已顺畅完成（授权后带 code 跳回站点）。
+
+    刻意**不看** cloudflare：它只表示「过程中弹过人机验证」，不代表最终没过。
+    实测 AgentRouter 的 Linux.do 授权页会先弹 CF 挑战、ClickSolver 报「未能通过」，
+    但随后授权按钮点击成功、顺利跳回站点并弹出「签到成功，新增额度已到账」——
+    人已经跳回来了还被这面旗子否决，就会把成功的签到误报成 need_login
+    （实测该站一次真实成功被报为「OAuth 链路未顺畅完成，请重新捕获登录态」）。
+    """
+    return bool(link.get("landed_back")) and not link.get("need_human") and not link.get("waf_blocked")
+
+
 def _oauth_checkin_result(quota_before: Any, quota_after: Any, link: dict[str, Any]) -> dict[str, Any]:
     """综合额度变化、OAuth 回跳状态和站点弹窗生成签到结果。"""
     result: dict[str, Any] = {
@@ -871,12 +901,7 @@ def _oauth_checkin_result(quota_before: Any, quota_after: Any, link: dict[str, A
         return result
 
     success_message = str(link.get("site_success_message") or "").strip()
-    oauth_completed = (
-        link.get("landed_back")
-        and not link.get("cloudflare")
-        and not link.get("need_human")
-        and not link.get("waf_blocked")
-    )
+    oauth_completed = _oauth_landed(link)
     if oauth_completed and success_message:
         result["status"] = "success"
         result["message"] = f"签到成功（站点弹窗：{success_message}）。"
@@ -1205,6 +1230,29 @@ async def _click_site_oauth_entry(
     return None
 
 
+def _attach_oauth_completion_messages(
+    result: dict[str, Any],
+    messages: list[str],
+    log: LogFn = _noop,
+) -> None:
+    """OAuth 授权完成后的消息处理：成功回跳时只保留成功提示。
+
+    登录前的 `/api/user/self` 401、SPA 初始化阶段的请求错误都可能留在同一个
+    collector 里。若已经跳回站点，再把这些历史错误打成「站点原始错误」既误导
+    用户，也会把一次真实成功说成登录失效。成功回跳时只抽取成功 Toast；只有
+    OAuth 没完成时才保留全部原始错误用于诊断。
+    """
+    if result.get("landed_back"):
+        success = _site_success_message(messages)
+        if success:
+            result.setdefault("site_success_message", success)
+            log(f"站点成功提示：{success}")
+        result.pop("site_error", None)
+        result.pop("site_errors", None)
+        return
+    _attach_site_errors(result, messages, log)
+
+
 async def _finish_oauth_authorization(
     page,
     base_url: str,
@@ -1282,7 +1330,7 @@ async def _finish_oauth_authorization(
             else:
                 log(f"OAuth 未跳回站点，停在：{cur}")
 
-    _attach_site_errors(result, await _site_error_messages(page, error_collector), log)
+    _attach_oauth_completion_messages(result, await _site_error_messages(page, error_collector), log)
     return result
 
 
@@ -2079,14 +2127,8 @@ async def verify_state(
         await _safe_close_browser(browser)
 
 
-def storage_refresh_token(storage_state: dict[str, Any] | None) -> str:
-    """从 storage_state 的 localStorage 里取出 refresh_token。
-
-    Sub2API 系站点把 access_token（短期 JWT）与 refresh_token（长期）都放在
-    localStorage。把 refresh_token 提出来存进 ACCOUNTS.json，纯 HTTP 路径就能
-    自行调 /api/v1/auth/refresh 续期，不必为「JWT 过期」这种常见情况开浏览器。
-    找不到返回空串。
-    """
+def storage_item(storage_state: dict[str, Any] | None, name: str) -> str:
+    """从 storage_state 的 localStorage 里取某个键的值；找不到返回空串。"""
     if not isinstance(storage_state, dict):
         return ""
     for origin_entry in storage_state.get("origins") or []:
@@ -2095,11 +2137,27 @@ def storage_refresh_token(storage_state: dict[str, Any] | None) -> str:
         for item in origin_entry.get("localStorage") or []:
             if not isinstance(item, dict):
                 continue
-            if str(item.get("name") or "").strip() == "refresh_token":
+            if str(item.get("name") or "").strip() == name:
                 value = str(item.get("value") or "").strip()
                 if value:
                     return value
     return ""
+
+
+def storage_refresh_token(storage_state: dict[str, Any] | None) -> str:
+    """从 storage_state 的 localStorage 里取出 refresh_token。
+
+    Sub2API 系站点把 access_token（短期 JWT）与 refresh_token（长期）都放在
+    localStorage。把 refresh_token 提出来存进 ACCOUNTS.json，纯 HTTP 路径就能
+    自行调 /api/v1/auth/refresh 续期，不必为「JWT 过期」这种常见情况开浏览器。
+    找不到返回空串。
+    """
+    return storage_item(storage_state, "refresh_token")
+
+
+def storage_access_token(storage_state: dict[str, Any] | None) -> str:
+    """从 storage_state 里取出 access_token（Sub2API 系前端存作 auth_token）。"""
+    return storage_item(storage_state, "auth_token") or storage_item(storage_state, "access_token")
 
 
 def _site_cookie_string(cookies: list[dict[str, Any]], base_url: str) -> str:
@@ -2356,8 +2414,12 @@ async def run_oauth_checkin(
 
         # OAuth 回跳后优先捕获瞬时 Toast/弹窗。AgentRouter 的每日奖励提示可能早于额度接口更新，
         # 也可能在固定等待结束前消失，因此不能只依赖 OAuth 前后额度差。
-        oauth_ok = link.get("landed_back") and not link.get("cloudflare") and not link.get("need_human")
+        oauth_ok = _oauth_landed(link)
         if oauth_ok:
+            # 登录前读额度必然 401（当时确实未登录）。_trigger_oauth 已在成功回跳时
+            # 清掉 link 上的历史错误，这里同步清空采集器，只留登录之后真正的错误。
+            if error_collector is not None:
+                error_collector["items"] = []
             success_message = await _wait_for_site_success_message(page, error_collector, link, timeout_ms=3000)
             if success_message:
                 log(f"已捕获 OAuth 签到成功弹窗：{success_message}")
@@ -2419,7 +2481,9 @@ async def run_oauth_checkin(
     finally:
         if page:
             try:
-                _attach_site_errors(link, await _site_error_messages(page, error_collector), log)
+                _attach_oauth_completion_messages(
+                    link, await _site_error_messages(page, error_collector), log
+                )
             except Exception:
                 pass
         await _safe_close_page(page)
