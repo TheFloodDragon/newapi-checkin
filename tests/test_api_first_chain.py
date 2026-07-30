@@ -262,6 +262,48 @@ def test_describe_failure_marks_transient_errors() -> None:
     assert "可重试" not in _describe_failure(ApiError(403, None, "Forbidden"))
 
 
+def test_describe_failure_includes_raw_response_body() -> None:
+    """真实原因常不在 reason/code 里，而在别的字段（detail/errors/data.message），
+    甚至是一段 HTML 挑战页。日志必须带上原样返回，否则只能另写脚本手打接口。
+    """
+    from providers.actions.browser_script import _describe_failure
+    from providers.base import ApiError
+
+    text = _describe_failure(ApiError(
+        403,
+        {"success": False, "detail": {"blocked_by": "risk_control", "hint": "请联系管理员"}},
+        "操作失败",
+    ))
+    assert "risk_control" in text
+    assert "请联系管理员" in text
+
+
+def test_raw_body_is_masked_and_truncated() -> None:
+    """原始返回可能含凭据、也可能极长，必须脱敏并截断后再进日志。"""
+    from providers.actions.browser_script import _brief_payload
+
+    masked = _brief_payload({"access_token": "sk-abcdefghijklmnopqrstuvwxyz", "ok": False})
+    assert "abcdefghijklmnopqrstuvwxyz" not in masked
+
+    long_text = _brief_payload({"html": "x" * 2000})
+    assert len(long_text) < 400
+    assert long_text.endswith(")")
+
+
+def test_raw_status_and_checkin_bodies_are_logged(capsys) -> None:
+    """状态接口与签到接口的原始返回都要落日志，便于核对站点真实回执。"""
+    reward = CheckinReward(quota_awarded=0.5, raw={"code": 0, "data": {"awarded": 0.5, "note": "daily"}})
+    status = StatusInfo(checked_in_today=False, raw={"code": 0, "data": {"checkin_enabled": True}})
+    profile = FakeProfile({"old": FakeClient(status=status, reward=reward)})
+
+    result = browser_script._try_api_checkin(_site(), profile)
+
+    assert result is not None and result.status == "success"
+    logs = capsys.readouterr().err
+    assert "状态接口原始返回" in logs and "checkin_enabled" in logs
+    assert "签到接口原始返回" in logs and "daily" in logs
+
+
 def test_missing_token_distinguishes_empty_from_corrupt() -> None:
     """「填了但值损坏」与「压根没填」必须能从日志区分开。
 

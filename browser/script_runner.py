@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import inspect
 import os
 import sys
@@ -18,7 +17,7 @@ from urllib.parse import urlparse
 
 from accounts_store import RESULTS_DIR_NAME
 
-from . import bypass, popups, session, state
+from . import bypass, popups, script_loader, session, state
 from .script_helpers import ScriptHelpers
 
 CHECKIN_DIR = Path(__file__).resolve().parents[1]
@@ -106,44 +105,22 @@ def run_sync(*args: Any, **kwargs: Any) -> BrowserScriptResult:
 
 
 def resolve_script_path(script_path: str) -> Path:
-    """校验并解析仓库内相对脚本路径。"""
-    raw = (script_path or "").strip().replace("\\", "/")
-    if not raw:
-        raise BrowserScriptError("未配置 browser_script 脚本路径")
-    parsed = urlparse(raw)
-    if parsed.scheme or raw.startswith("//"):
-        raise BrowserScriptError("脚本路径必须是仓库内相对路径，不能是 URL 或绝对路径")
-    path = Path(raw)
-    if path.is_absolute() or ".." in path.parts:
-        raise BrowserScriptError("脚本路径必须是仓库内相对路径，不能使用绝对路径或 ..")
-    resolved = (REPO_ROOT / path).resolve()
+    """校验并解析仓库内相对脚本路径。
+
+    实现在 script_loader（不依赖 playwright），这样纯 HTTP 路径也能加载站点脚本里
+    与传输无关的部分（如极速蹬的答题题库），不必为此拉起浏览器依赖。
+    """
     try:
-        resolved.relative_to(REPO_ROOT.resolve())
-    except ValueError as exc:
-        raise BrowserScriptError("脚本路径超出仓库目录") from exc
-    if not resolved.exists() or not resolved.is_file():
-        raise BrowserScriptError(f"脚本文件不存在：{raw}")
-    if resolved.suffix.lower() != ".py":
-        raise BrowserScriptError("browser_script 只支持 Python 脚本文件（.py）")
-    return resolved
+        return script_loader.resolve_script_path(script_path)
+    except script_loader.ScriptLoadError as exc:
+        raise BrowserScriptError(str(exc)) from exc
 
 
 def _load_module(script_file: Path) -> ModuleType:
-    module_name = f"checkin_browser_script_{abs(hash(str(script_file)))}"
-    # 强制清除同名缓存：脚本文件在两次运行之间可能被修改，若命中 sys.modules
-    # 旧缓存会执行过期代码。每次都重新加载确保拿到磁盘上的最新脚本。
-    sys.modules.pop(module_name, None)
-    spec = importlib.util.spec_from_file_location(module_name, script_file)
-    if spec is None or spec.loader is None:
-        raise BrowserScriptError(f"无法加载脚本：{script_file}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
     try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        # 加载失败时清除半初始化模块，避免污染后续加载。
-        sys.modules.pop(module_name, None)
-        raise
+        module = script_loader.load_script_module(script_file)
+    except script_loader.ScriptLoadError as exc:
+        raise BrowserScriptError(str(exc)) from exc
     run_func = getattr(module, "run", None)
     if not callable(run_func):
         raise BrowserScriptError("脚本必须定义 async def run(page, context, site, helpers)")
@@ -192,6 +169,44 @@ def _normalize_result(raw: Any, *, script_file: Path) -> BrowserScriptResult:
     return BrowserScriptResult(status, message, detail)
 
 
+async def _persist_session(site: Any, context: Any, log: Any) -> None:
+    """脚本结束时把登录态与 token 写进运行期缓存（用真实 SiteConfig 算 basis）。
+
+    为什么不能在脚本里做：脚本拿到的是脱敏的 ScriptSiteView，没有 access_token /
+    browser_state 字段，token_cache 只能按「空凭据」算 basis，写出的缓存与配置
+    basis 不一致，下次运行会被 resolve_cached_credentials 判为过期缓存直接忽略
+    —— 等于登录态从未续存（实测极速蹬缓存里的 state_basis 一直是空串的摘要）。
+
+    同时把 localStorage 里的 auth_token / refresh_token 单独存下来：Sub2API 系站点
+    启用 Turnstile 后纯 HTTP 无法登录（服务端校验，实测 TURNSTILE_VERIFICATION_FAILED），
+    只有这两个值能让下次运行走纯 HTTP、完全不启动浏览器。
+
+    任何失败都静默忽略：缓存写不进去只是下次要多开一次浏览器，不该影响本次结果。
+    """
+    if context is None:
+        return
+    try:
+        storage_state = await context.storage_state()
+    except Exception:
+        return
+    try:
+        encoded = state.encode_state(storage_state)
+    except Exception:
+        encoded = ""
+    access = session.storage_access_token(storage_state)
+    refresh = session.storage_refresh_token(storage_state)
+    if not encoded and not access and not refresh:
+        return
+    try:
+        from providers import token_cache
+
+        token_cache.save_site_tokens(site, access, refresh, browser_state=encoded)
+    except Exception:
+        return
+    hints = [name for name, value in (("state", encoded), ("token", access), ("refresh_token", refresh)) if value]
+    log("已续存登录态到运行期缓存：" + "、".join(hints))
+
+
 async def run_browser_script(
     *,
     site: Any,
@@ -232,6 +247,7 @@ async def run_browser_script(
 
     browser = None
     page = None
+    context = None
     try:
         log(f"启动浏览器执行脚本 {site_view.script}（超时 {timeout}s）")
         browser, context = await bypass.launch_camoufox(
@@ -322,5 +338,6 @@ async def run_browser_script(
             detail["screenshot"] = screenshot
         return BrowserScriptResult("error", f"浏览器脚本异常：{exc}", detail)
     finally:
+        await _persist_session(site, context, log)
         await session._safe_close_page(page)
         await session._safe_close_browser(browser)

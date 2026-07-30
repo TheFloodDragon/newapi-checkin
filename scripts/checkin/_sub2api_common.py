@@ -417,6 +417,13 @@ async def persist_state(context: Any, site: Any) -> None:
 
     每次登录闸门通过后都续存最新登录态；下次运行优先复用缓存，无需改写用户的
     ACCOUNTS.json。任何异常都静默忽略（缓存失败不影响本次签到结果）。
+
+    注意：脚本拿到的 site 是脱敏的 ScriptSiteView，没有 access_token /
+    browser_state 字段，token_cache 只能按「空凭据」算 basis，写出的条目 basis
+    与真实配置不符、下次会被判为过期缓存忽略。真正生效的续存在运行器里
+    （browser/script_runner.py::_persist_session，用真实 SiteConfig 且会一并存
+    localStorage 里的 token），它在脚本结束后执行、会覆盖这里写的 basis。
+    这里保留一次中途写入，是为了脚本异常退出时至少留下一份登录态快照。
     """
     if context is None:
         return

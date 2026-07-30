@@ -109,6 +109,24 @@ def load_tokens(name: str, base_url: str, path: Path | None = None) -> dict[str,
     return out
 
 
+def _group_of(field: str) -> str:
+    return "token" if field in TOKEN_FIELDS else "state"
+
+
+def _invalidated_after_write(entry: dict[str, Any], group: str) -> bool:
+    """该分组是否在最近一次写入之后被标记为「配置已变」。
+
+    用于替代过去「配置一变就删缓存字段」的做法：删除不可逆，用户改错又改回来、
+    或只是改名/重排，本来仍然有效的运行期 token 与登录态就永久丢了。现在只在
+    条目上打一个标记，写入新值时再清掉它（见 save_tokens），因此「标记存在」
+    就等价于「配置在最近一次写入之后变过」。
+
+    只对**没有 basis** 的分组有意义：有 basis 时 basis 本身就是更精确的判据
+    （且改回原凭据后能自动重新命中）。
+    """
+    return bool(str(entry.get(f"{group}_invalidated_at") or "").strip())
+
+
 def resolve_cached_credentials(
     name: str,
     base_url: str,
@@ -126,7 +144,11 @@ def resolve_cached_credentials(
     - cache_policy=ignore：完全不读缓存（父进程已解析后的 worker）。
     - 显式字段永不被缓存覆盖，包括显式空字符串。
     - 新版有 basis 的分组：basis 与当前配置种子一致才应用。
-    - 旧版无 basis 的条目：仅在对应配置字段为空时兜底，避免覆盖新 Secret。
+    - 旧版无 basis 的条目：仅在对应配置字段为空、且该分组未被标记为「配置已变」
+      （见 mark_credentials_changed）时兜底，避免覆盖新 Secret。
+
+    条目永不在这里被删除：配置变化后由上面两条判据决定「不使用」，值继续留在
+    .cache-checkin/token_cache.json 里，改回原凭据即可重新命中。
     """
     if str(cache_policy or "compatible").strip().lower() == "ignore":
         return {}
@@ -141,6 +163,9 @@ def resolve_cached_credentials(
         "browser_state": str(configured_browser_state or "").strip(),
     }
     resolved: dict[str, str] = {}
+    # 无 basis 的旧条目额外看「配置已变」标记：标记晚于写入时间就不再兜底。
+    token_legacy_usable = not _invalidated_after_write(entry, "token")
+    state_legacy_usable = not _invalidated_after_write(entry, "state")
 
     current_token_basis = credential_basis(
         configured["access_token"], configured["refresh_token"], group="token"
@@ -154,8 +179,8 @@ def resolve_cached_credentials(
         if cached_token_basis:
             if token_basis_matches:
                 resolved[field] = value
-        elif not configured[field]:
-            # 旧缓存无 basis：配置为空时兼容使用；配置已有值时配置优先。
+        elif not configured[field] and token_legacy_usable:
+            # 旧缓存无 basis：配置为空且未被标记为「配置已变」时兼容使用。
             resolved[field] = value
 
     current_state_basis = credential_basis(browser_state=configured["browser_state"], group="state")
@@ -165,7 +190,7 @@ def resolve_cached_credentials(
         if cached_state_basis:
             if cached_state_basis == current_state_basis:
                 resolved["browser_state"] = state_value
-        elif not configured["browser_state"]:
+        elif not configured["browser_state"] and state_legacy_usable:
             resolved["browser_state"] = state_value
 
     return resolved
@@ -216,6 +241,13 @@ def save_tokens(
                 entry["token_basis"] = str(token_basis)
             if state_text and state_basis:
                 entry["state_basis"] = str(state_basis)
+            # 新写入即「重新有效」：清掉该分组的「配置已变」标记。
+            # 用清标记而不是比较时间戳：时间戳只有秒精度，同秒内的写入与标记
+            # 无法定序，会随机把刚存好的凭据判成过期。
+            if access or refresh:
+                entry.pop("token_invalidated_at", None)
+            if state_text:
+                entry.pop("state_invalidated_at", None)
             entry["updated_at"] = _utc_iso()
             tokens[key] = entry
             _write_tokens(target, tokens)
@@ -336,6 +368,42 @@ def invalidate_fields(
     return True
 
 
+def mark_credentials_changed(
+    name: str,
+    base_url: str,
+    fields: Iterable[str],
+    path: Path | None = None,
+) -> bool:
+    """标记某些凭据分组「配置已变」，但**不删除**任何缓存值。
+
+    替代过去的 invalidate_fields/clear_tokens：删除不可逆，用户改错又改回来、
+    或只是改名/重排，本来仍然有效的运行期 token 与登录态就永久丢了。这里只写
+    `token_invalidated_at` / `state_invalidated_at`，读取侧按它与 updated_at
+    的先后决定要不要用（有 basis 的分组照旧由 basis 判定，标记不影响它们）。
+    """
+    requested = {str(field) for field in fields if str(field) in ALL_CREDENTIAL_FIELDS}
+    if not requested:
+        return False
+    groups = {_group_of(field) for field in requested}
+    target = path or CACHE_PATH
+    key = _cache_key(name, base_url)
+    try:
+        with accounts_store.file_lock(target):
+            tokens = _read_all(target)
+            raw = tokens.get(key)
+            if not isinstance(raw, dict):
+                return False
+            entry = dict(raw)
+            stamp = _utc_iso()
+            for group in groups:
+                entry[f"{group}_invalidated_at"] = stamp
+            tokens[key] = entry
+            _write_tokens(target, tokens)
+    except Exception:
+        return False
+    return True
+
+
 def reconcile_with_config(
     name: str,
     base_url: str,
@@ -344,7 +412,12 @@ def reconcile_with_config(
     path: Path | None = None,
     browser_state: str | None = None,
 ) -> bool:
-    """兼容旧 GUI 对账：只失效真正冲突的字段组，不再删除整个账号缓存。"""
+    """兼容旧 GUI 对账：只标记冲突的字段组「配置已变」，不删除任何缓存值。
+
+    删除已改为标记（见 mark_credentials_changed）：删除不可逆，用户改错又改回来
+    就白丢一份可用的运行期凭据。invalidate_fields / clear_tokens 保留为显式清理
+    入口，但生产链路不再调用它们。
+    """
     cached = load_tokens(name, base_url, path)
     if not cached:
         return False
@@ -359,7 +432,7 @@ def reconcile_with_config(
         state_text = str(browser_state or "").strip()
         if cached.get("browser_state", "") != state_text:
             fields.add("browser_state")
-    return invalidate_fields(name, base_url, fields, path)
+    return mark_credentials_changed(name, base_url, fields, path)
 
 
 def clear_tokens(name: str, base_url: str, path: Path | None = None) -> bool:

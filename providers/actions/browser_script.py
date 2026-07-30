@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from typing import Any
@@ -70,8 +71,30 @@ def _api_log(site: SiteConfig, message: str) -> None:
     print(f"[api_first:{site.name}] {mask_secrets(str(message))}", file=sys.stderr, flush=True)
 
 
+def _brief_payload(payload: Any, limit: int = 300) -> str:
+    """把接口原始返回压成一行日志（脱敏 + 截断）。
+
+    只报 reason/code 不够用：站点常把真实原因写在别的字段里（如 detail、errors、
+    data.message），甚至直接回一段 HTML/JS 挑战页。排查时必须能看到原样返回，
+    否则只能另写脚本手打接口。凭据由 mask_secrets 兜底遮蔽。
+    """
+    if payload is None or payload == "":
+        return ""
+    from mask_utils import mask_secrets, sanitize_data
+
+    try:
+        if isinstance(payload, (dict, list)):
+            text = json.dumps(sanitize_data(payload), ensure_ascii=False, separators=(",", ":"))
+        else:
+            text = str(payload)
+    except Exception:
+        text = str(payload)
+    text = mask_secrets(" ".join(text.split()))
+    return text if len(text) <= limit else text[:limit] + f"…(+{len(text) - limit})"
+
+
 def _describe_failure(exc: ApiError) -> str:
-    """把 ApiError 展开成「HTTP 状态 + 服务端判据 + 端点」的单行描述。
+    """把 ApiError 展开成「HTTP 状态 + 服务端判据 + 原始返回」的单行描述。
 
     以前只打 exc.message，站点回的 401 与 403、以及 reason（如
     REFRESH_TOKEN_INVALID / TOKEN_EXPIRED）都看不到，同一句「未能完成」既可能
@@ -93,6 +116,9 @@ def _describe_failure(exc: ApiError) -> str:
             if value and value not in message:
                 parts.append(f"{key}={value}")
                 break
+    body = _brief_payload(payload)
+    if body and body not in message:
+        parts.append(f"body={body}")
     if getattr(exc, "transient", False):
         parts.append("（临时性错误，可重试）")
     return " | ".join(parts) or "未提供失败详情"
@@ -233,6 +259,62 @@ def _already_done_result(
     )
 
 
+def _merge_extra_message(base: str, extra: str) -> str:
+    """把附加任务结论拼到签到消息后面（签到消息常自带句号，避免出现「。；」）。"""
+    head = str(base or "").rstrip().rstrip("。.")
+    tail = str(extra or "").strip()
+    if not tail:
+        return str(base or "")
+    return f"{head}；{tail}" if head else tail
+
+
+def _run_http_extras(site: SiteConfig, client: Any, result: CheckinResult | None) -> CheckinResult | None:
+    """签到已成立时，用同一个 HTTP 客户端执行站点脚本声明的附加日常任务。
+
+    为什么放在纯 HTTP 首选路径里而不是只放在浏览器脚本里：脚本只有在纯 API 失败时
+    才会执行，若附加任务（如极速蹬的每日答题）只写在脚本的 run() 里，一旦某天 token
+    仍有效、纯 API 直接签到成功，附加任务就被整天跳过。
+
+    通用层不关心任务内容，只按约定调用站点脚本里的 ``run_http_extras(client, log)``，
+    拿回 {detail 键: 摘要}；摘要含 outcome/message。脚本没定义该钩子就原样跳过。
+    附加任务的任何失败都只写进 detail，绝不改写签到结论。
+    """
+    if result is None or result.status not in {"success", "already_done"}:
+        return result
+    script_path = str(getattr(site, "script", "") or "").strip()
+    if not script_path:
+        return result
+    try:
+        from browser import script_loader
+
+        module = script_loader.load_site_script(script_path)
+    except Exception as exc:  # noqa: BLE001
+        _api_log(site, f"加载站点脚本以执行附加任务失败：{type(exc).__name__}: {exc}")
+        return result
+    runner = getattr(module, "run_http_extras", None)
+    if not callable(runner):
+        return result
+
+    try:
+        extras = runner(client, log=lambda message: _api_log(site, message))
+    except Exception as exc:  # noqa: BLE001 - 附加任务异常绝不能影响签到结论
+        extras = {"extras": {"outcome": "error", "message": f"附加任务异常：{type(exc).__name__}: {exc}"}}
+    if not isinstance(extras, dict) or not extras:
+        return result
+
+    if not isinstance(result.detail, dict):
+        result.detail = {} if result.detail is None else {"checkin_detail": result.detail}
+    for key, summary in extras.items():
+        if not isinstance(summary, dict):
+            continue
+        message = str(summary.get("message") or "")
+        _api_log(site, f"{key}：{message}")
+        result.detail[str(key)] = summary
+        if summary.get("outcome") in {"submitted", "already_done"}:
+            result.message = _merge_extra_message(result.message, message)
+    return result
+
+
 def _try_api_checkin(site: SiteConfig, profile: SiteProfile) -> CheckinResult | None:
     """浏览器脚本之前的首选方案：纯 HTTP 调站点签到接口（不启动浏览器）。
 
@@ -255,12 +337,16 @@ def _try_api_checkin(site: SiteConfig, profile: SiteProfile) -> CheckinResult | 
     from ..base import AuthInfo
 
     def _attempt(client: Any, stage: str) -> CheckinResult | None:
+        """跑一次「读状态 → 签到」，成立时补做附加日常任务；无明确结论返回 None。"""
+        return _run_http_extras(site, client, _checkin_attempt(client, stage))
+
+    def _checkin_attempt(client: Any, stage: str) -> CheckinResult | None:
         """用给定客户端跑一次「读状态 → 签到」；无明确结论返回 None。"""
         try:
             status = client.fetch_status()
         except ApiError as exc:
             kind = profile.classify(exc) if hasattr(profile, "classify") else "error"
-            _api_log(site, f"[{stage}] 读取签到状态失败：{exc.message}（判定 {kind}）")
+            _api_log(site, f"[{stage}] 读取签到状态失败：{_describe_failure(exc)}（判定 {kind}）")
             if kind == "need_login":
                 raise
             status = None
@@ -272,11 +358,17 @@ def _try_api_checkin(site: SiteConfig, profile: SiteProfile) -> CheckinResult | 
                 f"[{stage}] 状态读取成功：今日已签={checked} 余额="
                 + (f"${quota:.2f}" if isinstance(quota, (int, float)) else "未知"),
             )
+            raw_status = _brief_payload(getattr(status, "raw", None))
+            if raw_status:
+                _api_log(site, f"[{stage}] 状态接口原始返回：{raw_status}")
             if checked:
                 return _already_done_result(site, client, stage, status=status)
 
         _api_log(site, f"[{stage}] 调用签到接口...")
         reward = client.do_checkin("")
+        raw_reward = _brief_payload(getattr(reward, "raw", None))
+        if raw_reward:
+            _api_log(site, f"[{stage}] 签到接口原始返回：{raw_reward}")
         detail = _api_result_detail(client, stage, status=status, reward=reward)
         if getattr(reward, "already_done", False):
             _api_log(site, f"[{stage}] 接口返回今日已签到")
@@ -331,7 +423,7 @@ def _try_api_checkin(site: SiteConfig, profile: SiteProfile) -> CheckinResult | 
             kind = profile.classify(exc) if hasattr(profile, "classify") else "error"
             if kind == "already_done":
                 _api_log(site, "接口返回今日已签到")
-                return _already_done_result(site, client, "token")
+                return _run_http_extras(site, client, _already_done_result(site, client, "token"))
             _api_log(site, f"token 阶段未能完成（{kind}）：{_describe_failure(exc)}")
         except Exception as exc:
             _api_log(site, f"token 阶段异常：{type(exc).__name__}: {exc}")
@@ -363,8 +455,8 @@ def _try_api_checkin(site: SiteConfig, profile: SiteProfile) -> CheckinResult | 
             except ApiError as exc:
                 kind = profile.classify(exc) if hasattr(profile, "classify") else "error"
                 if kind == "already_done":
-                    return _already_done_result(site, password_client, "password")
-                _api_log(site, f"账密阶段未能完成（{kind}）：{exc.message}")
+                    return _run_http_extras(site, password_client, _already_done_result(site, password_client, "password"))
+                _api_log(site, f"账密阶段未能完成（{kind}）：{_describe_failure(exc)}")
             except Exception as exc:
                 _api_log(site, f"账密阶段异常：{exc}")
     elif not (email and password):

@@ -116,15 +116,19 @@ def test_empty_tokens_are_not_saved(tmp_path: Path, monkeypatch) -> None:
 
 
 # ── 手填凭据必须赢过旧缓存（「填了有效 token 仍显示没有」的根因）─────────────
-def test_reconcile_clears_cache_conflicting_with_manual_token(tmp_path: Path, monkeypatch) -> None:
-    """用户手填新 token 时，旧缓存条目必须被清掉，否则读取时缓存优先会盖掉新值。"""
+def test_reconcile_marks_cache_conflicting_with_manual_token(tmp_path: Path, monkeypatch) -> None:
+    """用户手填新 token 时，旧缓存不得再被应用；但值只标记不删除。
+
+    删除不可逆：用户改错又改回来、或只是改名，本来仍有效的运行期凭据就永久丢了。
+    """
     _cache_to(tmp_path, monkeypatch)
     token_cache.save_tokens("s", "https://s.invalid", "STALE-AT", "STALE-RT")
 
     assert token_cache.reconcile_with_config("s", "https://s.invalid", "a.b.c", "rt_new") is True
-    assert token_cache.load_tokens("s", "https://s.invalid") == {}
+    assert token_cache.load_tokens("s", "https://s.invalid")["access_token"] == "STALE-AT"
+    assert token_cache.resolve_cached_credentials("s", "https://s.invalid") == {}
 
-    # 清掉缓存后，site_config 必须采用配置里手填的值
+    # 标记后，site_config 必须采用配置里手填的值
     site = accounts_store.site_config_from_mapping(
         {
             "name": "s",
@@ -263,6 +267,57 @@ def test_legacy_cache_only_fills_empty_config(tmp_path: Path, monkeypatch) -> No
     assert configured.access_token == "CONFIG-AT"
     # refresh 配置为空，因此旧缓存仍可只补这个字段。
     assert configured.refresh_token == "LEGACY-RT"
+
+
+def test_legacy_cache_marked_as_changed_is_not_used_but_kept(tmp_path: Path, monkeypatch) -> None:
+    """无 basis 的旧条目被标记「配置已变」后不再兜底，但值必须留在文件里。
+
+    背景：以前配置一变就直接删缓存条目。删除不可逆——用户改错又改回来、或只是
+    改名，本来仍有效的运行期 token 与登录态就永久丢了。现在改成「只标记不删除」。
+    """
+    cache = tmp_path / "token_cache.json"
+    token_cache.save_tokens("s", "https://s.invalid", "LEGACY-AT", path=cache)
+    assert token_cache.resolve_cached_credentials(
+        "s", "https://s.invalid", path=cache
+    )["access_token"] == "LEGACY-AT"
+
+    assert token_cache.mark_credentials_changed("s", "https://s.invalid", {"access_token"}, cache)
+    assert token_cache.resolve_cached_credentials("s", "https://s.invalid", path=cache) == {}
+    assert token_cache.load_tokens("s", "https://s.invalid", path=cache)["access_token"] == "LEGACY-AT", (
+        "值必须保留：只是不再使用，而不是删除"
+    )
+
+    # 再次写入（例如浏览器重登后续存）即恢复可用
+    token_cache.save_tokens("s", "https://s.invalid", "LEGACY-AT", path=cache)
+    assert token_cache.resolve_cached_credentials(
+        "s", "https://s.invalid", path=cache
+    )["access_token"] == "LEGACY-AT"
+
+
+def test_mark_changed_only_affects_requested_group(tmp_path: Path, monkeypatch) -> None:
+    cache = tmp_path / "token_cache.json"
+    token_cache.save_tokens("s", "https://s.invalid", "AT", browser_state="ST", path=cache)
+    token_cache.mark_credentials_changed("s", "https://s.invalid", {"access_token"}, cache)
+
+    resolved = token_cache.resolve_cached_credentials("s", "https://s.invalid", path=cache)
+    assert "access_token" not in resolved
+    assert resolved["browser_state"] == "ST", "只改 token 不该牵连登录态"
+
+
+def test_basis_entries_ignore_the_changed_mark(tmp_path: Path, monkeypatch) -> None:
+    """有 basis 的条目只看 basis：否则每次保存配置都会白丢一次运行期凭据。"""
+    cache = tmp_path / "token_cache.json"
+    token_cache.save_tokens(
+        "s", "https://s.invalid", "CACHED",
+        token_basis=token_cache.credential_basis("CFG", "", group="token"),
+        path=cache,
+    )
+    token_cache.mark_credentials_changed("s", "https://s.invalid", {"access_token"}, cache)
+
+    resolved = token_cache.resolve_cached_credentials(
+        "s", "https://s.invalid", configured_access_token="CFG", path=cache
+    )
+    assert resolved["access_token"] == "CACHED"
 
 
 def test_explicit_fields_win_over_compatible_cache_including_empty(tmp_path: Path, monkeypatch) -> None:
