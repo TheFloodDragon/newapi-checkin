@@ -111,6 +111,9 @@ _LOCK_STATE = _LockState()
 from config import FileLockConfig as _FileLockConfig  # noqa: E402
 from config import Timeouts  # noqa: E402
 
+# time_utils 只依赖标准库，不会与本模块形成循环导入。
+import time_utils  # noqa: E402
+
 # Windows msvcrt.locking 需要指定锁定字节数；我们只用文件存在性做互斥，锁 1 字节即可。
 _MSVCRT_LOCK_BYTES = _FileLockConfig.LOCK_SIZE
 
@@ -764,16 +767,38 @@ def oauth_state_text(provider: str, account: str = DEFAULT_OAUTH_ACCOUNT, path: 
     return str(oauth_account_state(provider, account, path).get("state") or "")
 
 
+SCHEMA_VERSION = 2
+# 顶层保留字段：既不是账号条目，也不参与「未知元数据」透传。
+_RESERVED_TOP_LEVEL_KEYS = frozenset({"accounts", "oauth_states", "schema_version"})
+
+
 def _document_metadata(path: Path) -> dict[str, Any]:
-    """保留 ACCOUNTS.json 顶层未知元数据，避免局部更新时丢失。"""
+    """保留 ACCOUNTS.json 顶层未知元数据，避免局部更新时丢失。
+
+    关键区分：只有原文档**显式含 accounts 键**时，其余顶层键才是真正的元数据。
+    旧格式允许把账号直接挂在顶层（{"站点名": {...}}），此时把顶层键当元数据保留，
+    会在写回后同时留下旧账号键与新 accounts 数组——旧 access_token/cookie
+    以「运行时不再读取」的隐藏副本形式长期留在文件里，用户删改凭据也清不掉
+    （已实测）。这类文档的顶层键必须随迁移一起丢弃。
+    """
     full = _read_full(path)
     if not isinstance(full, dict):
         return {}
-    return {key: value for key, value in full.items() if key not in {"accounts", "oauth_states"}}
+    if "accounts" not in full:
+        # 顶层即账号映射（或空文档）：没有可透传的元数据。
+        return {}
+    return {key: value for key, value in full.items() if key not in _RESERVED_TOP_LEVEL_KEYS}
+
+
+def _document_payload(path: Path) -> dict[str, Any]:
+    """构造写回用的文档骨架：schema_version + 透传元数据。"""
+    payload: dict[str, Any] = {"schema_version": SCHEMA_VERSION}
+    payload.update(_document_metadata(path))
+    return payload
 
 
 def _write_accounts_with_oauth(path: Path, accounts: list[dict[str, Any]], oauth_states: dict[str, dict[str, Any]]) -> None:
-    payload: dict[str, Any] = _document_metadata(path)
+    payload: dict[str, Any] = _document_payload(path)
     payload["accounts"] = accounts
     oauth = normalize_oauth_states(oauth_states)
     if oauth:
@@ -907,7 +932,13 @@ _PERSIST_OPTIONAL = (
     "browser_profile",
     "login_selector",
     "proxy",
-    "auto_refresh_cookie",
+)
+# 布尔可选字段必须单独处理：_PERSIST_OPTIONAL 走 str(value or "").strip()，
+# False 会被折成空串而整条丢弃，下次加载又恢复默认 True——用户明确关掉的
+# Cookie 自动回写，一次保存就被悄悄打开（已实测）。
+_PERSIST_OPTIONAL_BOOL = (
+    ("verify_ssl", True),
+    ("auto_refresh_cookie", True),
 )
 _KNOWN_ACCOUNT_FIELDS = set(CONFIG_FIELDS) | set(CRED_FIELDS) | {
     "url",
@@ -986,9 +1017,11 @@ def _account_to_persist(row: dict[str, Any]) -> dict[str, Any]:
         value = str(row.get(field) or "").strip()
         if value:
             out[field] = value
-    # verify_ssl 默认 True，仅在显式关闭校验时落盘（避免给每个站点都写冗余字段）
-    if not parse_enabled(row.get("verify_ssl"), True):
-        out["verify_ssl"] = False
+    # 布尔可选字段：默认值不落盘（避免给每个站点都写冗余字段），
+    # 但显式关闭必须写入，否则用户的选择在下次加载时被默认值覆盖。
+    for field, default in _PERSIST_OPTIONAL_BOOL:
+        if not parse_enabled(row.get(field), default):
+            out[field] = False
     return out
 
 
@@ -1052,6 +1085,25 @@ def _collect_oauth_states(merged: list[dict[str, Any]], existing: dict[str, dict
     return oauth
 
 
+def _backup_before_migration(target: Path) -> Path | None:
+    """迁移前留一份只读于当前用户的备份。
+
+    迁移会重写整份配置（并按设计丢弃旧顶层账号键）。凭据一旦写错就找不回来，
+    所以先落一个带业务时间戳的副本；.gitignore 已覆盖 ACCOUNTS.json.bak*。
+    备份失败不阻断迁移：迁移本身仍是必要的，只是少一层兜底。
+    """
+    try:
+        stamp = time_utils.utc_now().astimezone(time_utils.business_timezone()).strftime("%Y%m%d_%H%M%S")
+        backup = target.parent / f"{target.name}.bak.{stamp}"
+        backup.write_text(target.read_text(encoding="utf-8-sig"), encoding="utf-8")
+        with contextlib.suppress(OSError, NotImplementedError):
+            os.chmod(backup, 0o600)
+        return backup
+    except OSError as exc:
+        print(f"[WARN] 迁移前备份 {target.name} 失败：{exc}")
+        return None
+
+
 def _maybe_migrate_accounts_file(path: Path | None, merged: list[dict[str, Any]]) -> None:
     """若 ACCOUNTS.json 需迁移，写回新格式（保留共享 oauth_states，relogin 不写 browser_state）。"""
     target = path or ACCOUNTS_PATH
@@ -1063,15 +1115,17 @@ def _maybe_migrate_accounts_file(path: Path | None, merged: list[dict[str, Any]]
         with _file_lock(target):
             if not _is_legacy_file(target):
                 return
+            backup = _backup_before_migration(target)
             existing_oauth = load_oauth_states(target)
             oauth_states = _collect_oauth_states(merged, existing_oauth)
             account_list = [_account_to_persist(row) for row in merged]
-            payload: dict[str, Any] = _document_metadata(target)
+            payload: dict[str, Any] = _document_payload(target)
             payload["accounts"] = account_list
             if oauth_states:
                 payload["oauth_states"] = oauth_states
             _atomic_write_text(target, json.dumps(payload, ensure_ascii=False, indent=2))
-        print(f"[INFO] 已将 {target.name} 迁移为新格式（三维字段 + 共享 oauth_states）")
+        suffix = f"，已备份为 {backup.name}" if backup is not None else ""
+        print(f"[INFO] 已将 {target.name} 迁移为新格式（三维字段 + 共享 oauth_states）{suffix}")
     except Exception as exc:
         print(f"[WARN] 自动迁移 {target.name} 失败：{exc}")
 
@@ -1253,7 +1307,7 @@ def save_accounts(
             oauth_states = normalize_oauth_states(oauth_states)
 
         persisted = [_account_to_persist(_normalize_account_entry(entry)) for entry in account_list if isinstance(entry, dict)]
-        payload: dict[str, Any] = _document_metadata(path)
+        payload: dict[str, Any] = _document_payload(path)
         payload["accounts"] = persisted
         if oauth_states:
             payload["oauth_states"] = oauth_states
