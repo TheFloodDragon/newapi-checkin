@@ -24,6 +24,7 @@ from .base import (
     SiteConfig,
     normalize_access_token,
     normalize_cookie,
+    strip_session_cookie,
 )
 
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
@@ -87,6 +88,39 @@ def load_auth(site: SiteConfig) -> AuthInfo:
         auth.new_api_user = auth.new_api_user or file_auth.new_api_user
         auth.access_token = auth.access_token or file_auth.access_token
     return auth
+
+
+def auth_for_method(site: SiteConfig) -> AuthInfo:
+    """按 auth_method 投影凭据，只保留该登录方式真正该用的那一份。
+
+    为什么需要：load_auth() 会把 SiteConfig 与 cookie_file 里的 cookie 和
+    access_token 一起返回，而 newapi 客户端见到 token 就发 Bearer 并剥掉 session
+    cookie。于是用户在 GUI 明确选了 Cookie 登录，实际生效的却是 token（已实测请求头
+    带 Authorization 且 session 被剥离）。两套凭据可能属于不同账号，混用等于签到到
+    另一个身份上，认证报错也无法定位是哪一份失效。
+
+    投影只在 access_token / cookie 两种纯 HTTP 方式生效：browser / oauth 的凭据由
+    action 层在运行期刷新后注入，不走这里。user_id 两种方式都保留——它是
+    New-Api-User 头，不属于任何一种凭据的私有字段。
+
+    access_token 模式不整串清空 cookie：cf_clearance / acw_tc 这类 WAF 辅助 cookie
+    不是身份凭据，丢掉会让受 Cloudflare / 阿里云保护的站点从「能过 WAF」退化成拿不到
+    JSON。沿用 strip_session_cookie 的既有边界，只剥离会构成第二身份的 session。
+
+    注意：Sub2API 的 access_token / refresh_token 按设计属于「接口凭据」（见 README），
+    其客户端在 auth 未给出时仍会回落 site 上的值，本函数不改变那条约定。
+    """
+    auth_method = (site.auth_method or "cookie").strip().lower()
+    raw = load_auth(site)
+    if auth_method == "cookie":
+        return AuthInfo(cookie=raw.cookie, new_api_user=raw.new_api_user)
+    if auth_method == "access_token":
+        return AuthInfo(
+            access_token=raw.access_token,
+            cookie=strip_session_cookie(raw.cookie),
+            new_api_user=raw.new_api_user,
+        )
+    return raw
 
 
 def has_http_credentials(auth: AuthInfo) -> bool:

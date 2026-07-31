@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import accounts_store
 
-from ..auth import has_http_credentials, load_auth
+from ..auth import auth_for_method, has_http_credentials
 from ..base import (
     AuthInfo,
     BrowserAuthError,
@@ -104,17 +104,24 @@ def build_http_client(site: SiteConfig, profile: SiteProfile) -> ProfileClient:
             detail = {"cache_expired": True, "auth_method": auth_method}
         raise BrowserAuthError("need_login", message, detail=detail)
     if auth_method in {"access_token", "cookie"}:
-        return profile.build_client(site, load_auth(site))
+        # 必须用投影后的凭据：load_auth() 会同时返回 cookie 与 access_token，
+        # newapi 客户端只要看见 token 就发 Bearer 并剥掉 session cookie。于是用户
+        # 选了 Cookie 登录，实际走的是 Token —— 可能是另一个账号的身份，且认证
+        # 问题极难定位（已实测）。Sub2API 的 token 是接口凭据，见 auth_for_method。
+        return profile.build_client(site, auth_for_method(site))
     return profile.build_client(site, AuthInfo())
 
 
 def credentials_ready(site: SiteConfig, profile: SiteProfile) -> bool:
     """是否具备执行 HTTP 动作的凭据；严格遵守当前 auth_method。"""
     auth_method = (site.auth_method or "cookie").strip().lower()
-    if auth_method == "access_token":
-        return bool(normalize_access_token(load_auth(site).access_token))
-    if auth_method == "cookie":
-        return bool(load_auth(site).cookie)
     if auth_method in {"browser", "oauth"}:
         return profile.supports_browser_refresh() and has_refresh_state(site)
-    return has_http_credentials(load_auth(site))
+    # 与 build_http_client 共用同一份投影：否则「判定就绪」与「实际发送」会各
+    # 按一套规则演化，出现 ready=True 但客户端拿不到该凭据（或反之）的偏差。
+    auth = auth_for_method(site)
+    if auth_method == "access_token":
+        return bool(normalize_access_token(auth.access_token))
+    if auth_method == "cookie":
+        return bool(auth.cookie)
+    return has_http_credentials(auth)
