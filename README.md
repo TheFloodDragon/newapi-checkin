@@ -392,8 +392,10 @@ def run_http_extras(client, log=None):
 
 `jisudeng.py` 内置离线题库 `ANSWERS`。签到成功或今日已签后，会尝试完成每日 Quiz：
 
-- 已收录题目按题面匹配正确选项文本；
-- 未收录题目记录题面和选项，并写入 `.cache-checkin/play_quiz_unknown.json`；
+- 已收录题目按题面相似度匹配，再按相似度在选项里定位正确选项文本；
+- 站点会在题面末尾追加「（第N题）」序号且同一题序号会变，比较前会剥掉；
+- 相似度低于阈值判为新题，选项里定不到唯一答案时同样按新题处理；
+- 新题按最长选项猜，记录题面和选项并写入 `.cache-checkin/play_quiz_unknown.json`；
 - 结果写入 `detail.quiz`；
 - 答题接口不可用或答题失败不会改变签到结论。
 

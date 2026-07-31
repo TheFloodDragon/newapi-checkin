@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
@@ -84,18 +85,23 @@ QUIZ_SUBMIT_PATH = API_PREFIX + QUIZ_SUBMIT_ROUTE
 
 UNKNOWN_LOG = _HERE.parents[1] / ".cache-checkin" / "play_quiz_unknown.json"
 
-# 题库：题面 → 正确选项原文。
+# 题库：完整题面 → 正确选项原文。
 #
 # 为什么必须离线维护：取题接口**不返回**正确答案，提交结果也只给总分、不给逐题对错
 # —— 既无法从题面推导，也无法靠提交反馈逐题学习（一天只有一次机会）。
 #
-# 两个刻意的设计选择：
-# 1. 用题面而不是题目 id 作键：id 只是题库主键，站点改题库时可能复用；题面稳定且
-#    自解释，人工补录时也不必先查 id。
+# 为什么按相似度而不是精确相等匹配：站点的题面和选项都不稳定。实测题面末尾会拼上
+# 「（第7题）」这类序号，且同一道题在不同日期序号会变；选项也可能微调标点或措辞
+# （「、」改「，」、末尾多一个「里」）。精确匹配一旦对不上就静默退化成瞎猜，而
+# 「明明补录过却还在猜」这种症状极难发现。相似度低于阈值的才算新题。
+#
+# 三个刻意的设计选择：
+# 1. 用完整题面而不是题目 id 作键：id 只是题库主键，站点改题库时可能复用；完整题面
+#    自解释，人工补录时照抄日志即可，也不必先查 id。
 # 2. 值存正确选项的原文而不是下标：选项顺序由服务端给出、不保证跨天一致，存下标
 #    一旦顺序变化就会答错，且错得毫无征兆。
-#
-# 键值都会经 _norm 归一化后比较，所以照抄站点原文即可。
+# 3. 相似度不足、或最相似的两条咬得太紧时，一律**当作新题**去猜并记录，而不是挑
+#    一个凑：挑错和瞎猜的期望收益一样，却会让人误以为题库已经覆盖。
 ANSWERS: dict[str, str] = {
     "Which HTTP method is typically used to send a chat completion request?": "POST",
     "Which field usually carries the user message in an OpenAI-style chat request?": "messages",
@@ -104,7 +110,24 @@ ANSWERS: dict[str, str] = {
     "Why do providers cache prompt prefixes?":
         "To reduce latency and cost for repeated context",
     "What does RPM commonly limit?": "Requests per minute",
+    "以下哪项属于客户端应避免的行为": "把密钥硬编码到前端公开代码",
+    "流式输出（streaming）最主要的用户价值是": "首字节更快、边生成边展示",
+    "幂等键（Idempotency-Key）的主要作用是": "防止重试造成重复扣费或重复创建",
+    "在生产环境中处理超时，推荐做法是": "设置超时并做有限重试",
+    "提示词前缀缓存（Prompt Cache）的主要收益是": "提高重复上下文请求的速度并降低成本",
 }
+
+# 相似度阈值。实测本题库：同一题的各种变体最低 0.867，而**不同题之间**最高只有
+# 0.607，两者之间有很宽的空档，因此 0.75 既不会漏掉改写过的老题，也不会把新题
+# 硬套到老题上。margin 再要求「最佳比次佳明显更像」，防止题库里出现两条近似条目时
+# 随机二选一（实测正确命中的 margin 都在 0.45 以上，留足余量）。
+PROMPT_SIMILARITY_MIN = 0.75
+PROMPT_SIMILARITY_MARGIN = 0.08
+# 选项通常更短，措辞也更容易被整段替换，阈值相应收紧。
+OPTION_SIMILARITY_MIN = 0.80
+OPTION_SIMILARITY_MARGIN = 0.12
+# 覆盖率对短文本会虚高（"post" 与 "options" 能凑出 0.75），短串只用对称 ratio。
+_COVERAGE_MIN_LEN = 6
 
 
 def _norm(text: Any) -> str:
@@ -112,7 +135,75 @@ def _norm(text: Any) -> str:
     return re.sub(r"\s+", " ", str(text or "").strip().lower()).strip(" .?:!")
 
 
-_ANSWER_INDEX = {_norm(k): _norm(v) for k, v in ANSWERS.items()}
+# 题面末尾的题号：实测站点把「（第7题）」直接拼进 prompt，同一道题在不同日期
+# 会拿到不同序号（同一次取题里甚至出现过两个「第6题」）。序号纯属噪声，比较前剥掉。
+_PROMPT_INDEX_SUFFIX_RE = re.compile(r"[（(]\s*第\s*\d+\s*题\s*[)）]\s*$")
+
+
+def _norm_prompt(text: Any) -> str:
+    """题面归一化：在 _norm 之上剥掉末尾题号，让同一题的不同序号归一。"""
+    return _norm(_PROMPT_INDEX_SUFFIX_RE.sub("", str(text or "").strip()))
+
+
+def similarity(left: str, right: str) -> float:
+    """两段文本的相似度，取「对称 ratio」与「短串覆盖率」的较大值。
+
+    只用 SequenceMatcher.ratio() 不够：站点在题面前后加料（"问题3："、题号）时，
+    长度差本身就会把 ratio 拉下来，哪怕整条老题面被完整包含。覆盖率（匹配字符数 /
+    短串长度）正好补上这种「包含但更长」的情形。
+
+    覆盖率对短串会虚高，所以短串低于 _COVERAGE_MIN_LEN 时只认 ratio。
+    """
+    if not left or not right:
+        return 0.0
+    matcher = SequenceMatcher(None, left, right)
+    ratio = matcher.ratio()
+    shorter = min(len(left), len(right))
+    if shorter < _COVERAGE_MIN_LEN:
+        return ratio
+    matched = sum(block.size for block in matcher.get_matching_blocks())
+    return max(ratio, matched / shorter)
+
+
+def _best_match(target: str, candidates: list[str], *, minimum: float, margin: float) -> int | None:
+    """返回最相似候选的下标；相似度不足或与次佳咬得太紧时返回 None。"""
+    if not target or not candidates:
+        return None
+    scored = sorted(
+        ((similarity(target, candidate), index) for index, candidate in enumerate(candidates)),
+        reverse=True,
+    )
+    best, index = scored[0]
+    if best < minimum:
+        return None
+    if len(scored) > 1 and best - scored[1][0] < margin:
+        return None
+    return index
+
+
+_ANSWER_ITEMS = tuple(ANSWERS.items())
+_ANSWER_PROMPTS = [_norm_prompt(prompt) for prompt, _answer in _ANSWER_ITEMS]
+
+
+def match_answer(prompt: Any) -> str | None:
+    """按相似度找这道题的正确选项原文；判为新题或有歧义时返回 None。"""
+    index = _best_match(
+        _norm_prompt(prompt),
+        _ANSWER_PROMPTS,
+        minimum=PROMPT_SIMILARITY_MIN,
+        margin=PROMPT_SIMILARITY_MARGIN,
+    )
+    return None if index is None else _ANSWER_ITEMS[index][1]
+
+
+def _option_index(options: list[Any], answer: str) -> int | None:
+    """在选项里按相似度定位答案；拿不准时返回 None。"""
+    return _best_match(
+        _norm(answer),
+        [_norm(option) for option in options],
+        minimum=OPTION_SIMILARITY_MIN,
+        margin=OPTION_SIMILARITY_MARGIN,
+    )
 
 
 def summary(outcome: str, message: str, **extra: Any) -> dict[str, Any]:
@@ -125,19 +216,21 @@ def summary(outcome: str, message: str, **extra: Any) -> dict[str, Any]:
 
 
 def choose_index(question: Any) -> tuple[int, bool]:
-    """给一道题选一个选项下标，返回 (下标, 是否命中题库)。
+    """给一道题选一个选项下标，返回 (下标, 是否由题库确定)。
 
-    未命中题库时退化为「选最长的选项」——干扰项通常明显更短，这只是比选第一个
-    更好的猜法，不是答案。猜错只损失这一题的额度。
+    题库按相似度匹配（见 ANSWERS）。「相似度不足，判为新题」和「题库命中了但在选项里
+    定不到唯一答案」都返回 False，退化为「选最长的选项」——干扰项通常明显更短，这只是
+    比选第一个更好的猜法，不是答案。猜错只损失这一题的额度，而两种情况都会被记录并
+    打日志，人工补录时才看得到还缺什么。
     """
     options = question.get("options") if isinstance(question, dict) else None
     if not isinstance(options, list) or not options:
         return 0, False
-    wanted = _ANSWER_INDEX.get(_norm(question.get("prompt")))
-    if wanted:
-        for index, option in enumerate(options):
-            if _norm(option) == wanted:
-                return index, True
+    answer = match_answer(question.get("prompt"))
+    if answer:
+        index = _option_index(options, answer)
+        if index is not None:
+            return index, True
     longest = max(range(len(options)), key=lambda i: len(str(options[i] or "")))
     return longest, False
 
@@ -155,9 +248,11 @@ def record_unknown(questions: list[dict[str, Any]], path: Path | None = None) ->
             existing = []
         if not isinstance(existing, list):
             existing = []
-        seen = {_norm(item.get("prompt")) for item in existing if isinstance(item, dict)}
+        # 去重按剥掉题号后的题面：同一道题换个位置就换个「第N题」，
+        # 用原文去重会让同一题在文件里堆出好几条，人工补录时反复看到重复题。
+        seen = {_norm_prompt(item.get("prompt")) for item in existing if isinstance(item, dict)}
         for item in questions:
-            key = _norm(item.get("prompt"))
+            key = _norm_prompt(item.get("prompt"))
             if key and key not in seen:
                 seen.add(key)
                 existing.append({"prompt": item.get("prompt"), "options": item.get("options")})
@@ -174,7 +269,10 @@ def describe_unknown(unknown: list[dict[str, Any]]) -> list[str]:
     """
     if not unknown:
         return []
-    lines = [f"答题有 {len(unknown)} 道题不在题库（已按最长选项猜，并记入 {UNKNOWN_LOG.name}）："]
+    lines = [
+        f"答题有 {len(unknown)} 道题题库未能确定答案"
+        f"（已按最长选项猜，并记入 {UNKNOWN_LOG.name}）："
+    ]
     for question in unknown:
         options = question.get("options") if isinstance(question.get("options"), list) else []
         guess, _known = choose_index(question)

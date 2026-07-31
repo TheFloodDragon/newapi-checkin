@@ -112,6 +112,131 @@ def test_unknown_question_falls_back_to_longest_option() -> None:
     assert index == 1
 
 
+# ── 题面末尾的「（第N题）」序号 ───────────────────────────────────────────────
+_CN_CASES = [
+    ("以下哪项属于客户端应避免的行为", 7,
+     ["校验参数后再发请求", "遇到 429 时退避重试", "把密钥硬编码到前端公开代码", "记录关键错误日志"],
+     "把密钥硬编码到前端公开代码"),
+    ("流式输出（streaming）最主要的用户价值是", 6,
+     ["首字节更快、边生成边展示", "保证永不失败", "自动修复业务逻辑", "免除计费"],
+     "首字节更快、边生成边展示"),
+    ("幂等键（Idempotency-Key）的主要作用是", 8,
+     ["提升图片清晰度", "防止重试造成重复扣费或重复创建", "绕过权限校验", "跳过日志记录"],
+     "防止重试造成重复扣费或重复创建"),
+    ("在生产环境中处理超时，推荐做法是", 6,
+     ["无限等待", "直接忽略错误", "设置超时并做有限重试", "每次都重启服务"],
+     "设置超时并做有限重试"),
+    ("提示词前缀缓存（Prompt Cache）的主要收益是", 10,
+     ["提高重复上下文请求的速度并降低成本", "关闭流式输出", "禁用鉴权", "强制返回 HTML"],
+     "提高重复上下文请求的速度并降低成本"),
+]
+
+
+@pytest.mark.parametrize(("stem", "number", "options", "expected"), _CN_CASES)
+def test_recorded_chinese_questions_are_answered(
+    stem: str, number: int, options: list[str], expected: str
+) -> None:
+    """站点把题号拼进题面，补录的中文题必须能带序号命中。"""
+    index, known = quiz.choose_index({"id": 1, "prompt": f"{stem}（第{number}题）", "options": options})
+    assert known is True
+    assert options[index] == expected
+
+
+@pytest.mark.parametrize("number", [1, 3, 99])
+def test_answer_survives_question_renumbering(number: int) -> None:
+    """同一道题换位置就换序号；序号进了键，题库第二天就再也匹配不上。"""
+    stem, _n, options, expected = _CN_CASES[0]
+    shuffled = list(reversed(options))
+    index, known = quiz.choose_index({"id": 1, "prompt": f"{stem}（第{number}题）", "options": shuffled})
+    assert known is True
+    assert shuffled[index] == expected
+
+
+def test_answer_matches_prompt_without_number() -> None:
+    stem, _n, options, expected = _CN_CASES[0]
+    index, known = quiz.choose_index({"id": 1, "prompt": stem, "options": options})
+    assert known is True
+    assert options[index] == expected
+
+
+def test_number_suffix_stripping_does_not_swallow_real_text() -> None:
+    """只剥「末尾」的题号；题面里正常出现的括号内容不能被吃掉。"""
+    assert quiz._norm_prompt("以下哪项属于客户端应避免的行为（第7题）") == quiz._norm_prompt(
+        "以下哪项属于客户端应避免的行为"
+    )
+    assert quiz._norm_prompt("流式输出（streaming）最主要的用户价值是") != quiz._norm_prompt(
+        "流式输出最主要的用户价值是"
+    )
+
+
+# ── 相似度匹配语义 ───────────────────────────────────────────────────────────
+def test_similarity_tolerates_rewritten_prompt_and_option() -> None:
+    """站点改写题面/选项措辞后仍要答对——这正是不用精确相等匹配的原因。"""
+    index, known = quiz.choose_index(
+        {
+            "id": 3,
+            "prompt": "问题 3：以下哪项属于客户端应尽量避免的行为？（第2题）",
+            "options": ["记录关键错误日志", "把密钥硬编码到前端公开代码里", "遇到 429 时退避重试"],
+        }
+    )
+    assert known is True
+    assert index == 1
+
+
+def test_low_similarity_prompt_is_treated_as_new_question() -> None:
+    """相似度不足必须判为新题去猜并记录，不能硬套到最像的老题上。"""
+    assert quiz.match_answer("如何选择向量数据库的索引类型") is None
+    index, known = quiz.choose_index(
+        {"id": 99, "prompt": "如何选择向量数据库的索引类型", "options": ["短", "更长一些的选项"]}
+    )
+    assert known is False
+    assert index == 1, "退化路径仍是选最长选项"
+
+
+def test_bank_entries_are_separable_by_threshold() -> None:
+    """题库内不同题之间的相似度必须明显低于阈值，否则会互相串答案。"""
+    prompts = [quiz._norm_prompt(p) for p in quiz.ANSWERS]
+    worst = max(
+        quiz.similarity(a, b)
+        for i, a in enumerate(prompts)
+        for j, b in enumerate(prompts)
+        if i < j
+    )
+    assert worst < quiz.PROMPT_SIMILARITY_MIN, f"存在过于相似的题库条目：{worst:.3f}"
+
+
+def test_every_bank_entry_resolves_itself() -> None:
+    """每条题库条目都必须能用自己的题面命中自己的答案（防录入笔误）。"""
+    for prompt, answer in quiz.ANSWERS.items():
+        assert quiz.match_answer(prompt) == answer, prompt
+        assert quiz.match_answer(f"{prompt}（第3题）") == answer, prompt
+
+
+def test_ambiguous_option_match_is_treated_as_unknown() -> None:
+    """选项里定不到唯一答案时必须去猜并记录，不能随便挑一个充当已知答案。"""
+    answer = quiz.ANSWERS["提示词前缀缓存（Prompt Cache）的主要收益是"]
+    assert quiz._option_index([answer, answer], answer) is None
+    index, known = quiz.choose_index(
+        {"id": 4, "prompt": "提示词前缀缓存（Prompt Cache）的主要收益是", "options": [answer, answer]}
+    )
+    assert known is False
+    assert index == 0
+
+
+def test_similarity_uses_coverage_for_long_text_only() -> None:
+    """长文本用覆盖率兜住「被完整包含但更长」；短串只认对称 ratio，避免虚高。"""
+    # 长题面被完整包含：ratio 会被长度差拉低，覆盖率补上
+    assert quiz.similarity("以下哪项属于客户端应避免的行为", "问题3：以下哪项属于客户端应避免的行为") == 1.0
+    # 短串不吃覆盖率红利：post 与 options 只有零散字符相同
+    assert quiz.similarity("post", "options") < quiz.OPTION_SIMILARITY_MIN
+
+
+def test_similarity_handles_empty_input() -> None:
+    assert quiz.similarity("", "abc") == 0.0
+    assert quiz.match_answer("") is None
+    assert quiz.match_answer(None) is None
+
+
 def test_unknown_questions_are_recorded(tmp_path, monkeypatch) -> None:
     log = tmp_path / "unknown.json"
     monkeypatch.setattr(quiz, "UNKNOWN_LOG", log)
@@ -119,6 +244,16 @@ def test_unknown_questions_are_recorded(tmp_path, monkeypatch) -> None:
     quiz.record_unknown([{"prompt": "新题 A", "options": ["a", "b"]}, {"prompt": "新题 B", "options": ["c"]}])
     saved = json.loads(log.read_text(encoding="utf-8"))
     assert [item["prompt"] for item in saved] == ["新题 A", "新题 B"], "同一题面不应重复记录"
+
+
+def test_unknown_dedup_ignores_question_number(tmp_path, monkeypatch) -> None:
+    """同一道未收录题换了序号不该再记一条，否则人工补录时满屏重复题。"""
+    log = tmp_path / "unknown.json"
+    monkeypatch.setattr(quiz, "UNKNOWN_LOG", log)
+    quiz.record_unknown([{"prompt": "尚未收录的题（第2题）", "options": ["a", "b"]}])
+    quiz.record_unknown([{"prompt": "尚未收录的题（第9题）", "options": ["a", "b"]}])
+    saved = json.loads(log.read_text(encoding="utf-8"))
+    assert len(saved) == 1
 
 
 # ── 浏览器传输：run_quiz 状态机 ───────────────────────────────────────────────
