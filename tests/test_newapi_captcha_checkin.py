@@ -80,7 +80,9 @@ def _stub_solver(monkeypatch, answers, exact=True):
     模块拦不住，而且这个函数正是脚本真正依赖的那道边界。
     """
     seq = list(answers)
-    monkeypatch.setattr(captcha_script, "solve_image", lambda _url: (seq.pop(0), exact))
+    monkeypatch.setattr(
+        captcha_script, "solve_image", lambda _url, log=None: (seq.pop(0), exact)
+    )
     monkeypatch.setattr(captcha_script, "solver_available", lambda: True)
     return seq
 

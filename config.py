@@ -84,6 +84,19 @@ def _env_float(
     return value
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    """读取布尔型环境变量覆盖；无法识别时沿用默认值。"""
+    raw = os.environ.get(_ENV_PREFIX + name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "y", "on"}:
+        return True
+    if raw in {"0", "false", "no", "n", "off"}:
+        return False
+    _warn(name, raw, "不是布尔值")
+    return default
+
+
 def _env_int_set(name: str, default: frozenset[int]) -> frozenset[int]:
     """读取逗号分隔的整数集合覆盖（如 "429,503"）；非法或为空时沿用默认值。"""
     raw = os.environ.get(_ENV_PREFIX + name, "").strip()
@@ -119,7 +132,7 @@ class Timeouts:
     )
 
     # browser_script 默认脚本超时
-    BROWSER_SCRIPT_DEFAULT: int = _env_int("BROWSER_SCRIPT_DEFAULT", 180, maximum=7200)
+    BROWSER_SCRIPT_DEFAULT: int = _env_int("BROWSER_SCRIPT_DEFAULT", 240, maximum=7200)
 
     # browser_script 最大脚本超时上限（防止配置错误导致任务永久挂起）
     BROWSER_SCRIPT_MAX: int = _env_int("BROWSER_SCRIPT_MAX", 3600, maximum=7200)
@@ -176,6 +189,22 @@ class OutputConfig:
 
     # worker stdout JSON 扫描上限（字节）；worker 输出通常很短，超出部分舍弃
     MAX_OUTPUT_SCAN: int = _env_int("MAX_OUTPUT_SCAN", 4096, minimum=512, maximum=1024 * 1024)
+
+
+class LogConfig:
+    """诊断日志配置。
+
+    站点原始返回值是排查「签到到底被拒在哪一步」的第一手依据：光有一句
+    「签到失败」时，既看不出是业务码拒绝、验证码不通过还是被 WAF 换了页面。
+    默认打开，但必须限长——个别接口会回整页 HTML，原样刷进 CI 日志既没法看，
+    也把真正有用的行顶掉了。
+    """
+
+    # 是否输出每次 HTTP 请求的站点原始返回值（经脱敏）
+    HTTP_BODY: bool = _env_flag("LOG_HTTP_BODY", True)
+
+    # 单条原始返回值的字符上限，超出部分截断并标注
+    HTTP_BODY_MAX: int = _env_int("LOG_HTTP_BODY_MAX", 600, minimum=80, maximum=20000)
 
 
 def _validate() -> None:

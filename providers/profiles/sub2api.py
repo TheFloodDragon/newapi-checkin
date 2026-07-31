@@ -38,6 +38,7 @@ from ..base import (
     contains_any,
     extract_message,
     http_request,
+    log_http_exchange,
     normalize_access_token,
     normalize_base_url,
     normalize_cookie,
@@ -352,16 +353,23 @@ class Sub2ApiClient(ProfileClient):
             headers = self._headers()
             if raw_body is not None:
                 headers["Content-Type"] = "application/json"
-            payload = http_request(
-                url,
-                method=method,
-                headers=headers,
-                body=raw_body,
-                proxy=self.site.proxy,
-                retry_non_idempotent=retry_non_idempotent,
-                verify_ssl=getattr(self.site, "verify_ssl", True),
-                cookie_jar=self._cookie_jar,
-            )
+            try:
+                payload = http_request(
+                    url,
+                    method=method,
+                    headers=headers,
+                    body=raw_body,
+                    proxy=self.site.proxy,
+                    retry_non_idempotent=retry_non_idempotent,
+                    verify_ssl=getattr(self.site, "verify_ssl", True),
+                    cookie_jar=self._cookie_jar,
+                )
+            except ApiError as exc:
+                # 站点原始回执是排查第一手材料：端点探测失败、业务码拒绝和登录
+                # 失效在上层都只剩一句 message，看不出到底是哪一种。
+                log_http_exchange(self.site.name, method, url, error=exc)
+                raise
+            log_http_exchange(self.site.name, method, url, payload=payload)
             # Sub2API 统一响应：{code:0, data:{...}}；code != 0 视为失败
             if isinstance(payload, dict) and "code" in payload:
                 code = payload.get("code")

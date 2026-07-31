@@ -22,6 +22,7 @@ import gzip
 import json
 import math
 import random
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -60,6 +61,7 @@ VERIFICATION_PATTERNS = [
 # 网络层重试：对瞬时性错误（429 / 5xx / 连接超时）做指数退避重试。
 # 不重试 4xx（除 429）这类确定性错误，避免无意义的重复请求。
 # 具体数值集中在 config，这里保留同名别名以兼容既有引用。
+from config import LogConfig as _LogConfig  # noqa: E402
 from config import RetryConfig as _RetryConfig  # noqa: E402
 from config import Timeouts as _Timeouts  # noqa: E402
 
@@ -75,6 +77,60 @@ HTTP_REQUEST_TIMEOUT = _Timeouts.HTTP_REQUEST    # 单次 HTTP 请求默认超�
 
 # New API 内部 quota 与 USD 换算系数：quota / 500000 = $
 QUOTA_UNIT = 500_000
+
+
+# ── 站点原始返回值日志 ──────────────────────────────────────────────────────
+def _brief_payload(payload: Any, limit: int) -> str:
+    """把响应体压成单行、限长的可读文本。"""
+    if isinstance(payload, (dict, list)):
+        try:
+            text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
+        except (TypeError, ValueError):
+            text = str(payload)
+    else:
+        text = str(payload)
+    text = " ".join(text.split())
+    if len(text) > limit:
+        return f"{text[:limit]}…（共 {len(text)} 字符，已截断）"
+    return text
+
+
+def log_http_exchange(
+    tag: str,
+    method: str,
+    url: str,
+    *,
+    payload: Any = None,
+    error: BaseException | None = None,
+    log: Any = None,
+) -> None:
+    """记录一次 HTTP 交互的站点原始返回值（写 stderr，经脱敏与限长）。
+
+    为什么必须打出来：签到失败时最有用的信息是站点到底回了什么。此前各层只把
+    message 往上传，原始返回值只留在 ApiError.payload 里且默认不打印，于是
+    「签到失败」「验证码错误」这类结论无法复核——尤其站点静默改了业务码、或把
+    JSON 换成 HTML 挑战页时，日志里看不出任何区别。
+
+    tag 用站点名，前缀 [http:...] 与其它阶段日志一致，批量汇总会原样透出。
+    """
+    if not _LogConfig.HTTP_BODY:
+        return
+    from mask_utils import mask_secrets
+
+    limit = _LogConfig.HTTP_BODY_MAX
+    if error is not None:
+        status = getattr(error, "status", None)
+        body = getattr(error, "payload", None)
+        detail = _brief_payload(body, limit) if body not in (None, "") else str(error)
+        suffix = f" status={status}" if status else ""
+        line = f"[http:{tag}] {method.upper()} {url} 失败{suffix} → {detail}"
+    else:
+        line = f"[http:{tag}] {method.upper()} {url} → {_brief_payload(payload, limit)}"
+    line = mask_secrets(line)
+    if log:
+        log(line)
+        return
+    print(line, file=sys.stderr, flush=True)
 
 
 # ── 额度换算 / 展示 / detail 提取（唯一实现；CLI、GUI、browser 共用）────────────

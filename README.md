@@ -483,6 +483,26 @@ uv run python run__all_checkin.py --workers 4
 - 把脱敏结果写入 `.cache-checkin/checkin_result.json`；
 - 即使任务成功，也显示 API-first / 浏览器降级等关键阶段日志。
 
+### 8.1.1 站点原始返回值
+
+每次 HTTP 请求都会输出一行脱敏后的站点原始回执，前缀为 `[http:站点名]`，成功和失败都打：
+
+```text
+[http:她 API] GET https://x.example/api/status → {"success":true,"data":{"checkin_captcha_enabled":true}}
+[http:她 API] POST https://x.example/api/user/checkin 失败 status=400 → {"success":false,"message":"验证码错误，请重试"}
+```
+
+这类行是判断「业务码拒绝、验证码不通过还是被 WAF 换了页面」的唯一依据。相关开关：
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `CHECKIN_LOG_HTTP_BODY` | `true` | 设为 `0`/`false` 可整体关闭原始回执输出 |
+| `CHECKIN_LOG_HTTP_BODY_MAX` | `600` | 单条回执的字符上限，超出截断并标注 |
+
+图形验证码流程还会额外输出开关来源、命中的方言、图像尺寸、识别读数与是否可信，
+并把 `captcha_dialect` / `captcha_attempts` / `captcha_answer_exact` 写进结果
+`detail`，在批量汇总里渲染成「验证码：…」一列；每日答题同理渲染成「答题：…」。
+
 ### 8.2 直接读取配置运行
 
 ```bash

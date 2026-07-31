@@ -76,6 +76,9 @@ TASK_SCOPED_ENV = frozenset(
 # 新三维字段：站点适配器 / 登录方式 / 签到方式
 FLOW_LABELS = {
     "api": "接口签到",
+    # 走了脚本钩子的接口签到（如 scripts/newapi_captcha.py 的图形验证码）。
+    # 与纯 api 分开命名：这两条路径的失败原因完全不同，汇总里必须能一眼区分。
+    "api+captcha": "接口签到 + 图形验证码",
     "visit": "访问保活",
     "relogin": "浏览器重登",
     "browser_script": "浏览器脚本",
@@ -447,6 +450,47 @@ def append_part(parts: list[str], label: str, value: Any, *, skip_value: Any = N
     parts.append(f"{label}：{value_to_text(value)}")
 
 
+def captcha_note(detail: Any) -> str:
+    """图形验证码流程的摘要（走了几次、命中哪套方言、读数是否可信）。
+
+    这些字段由 scripts/newapi_captcha.py 通过 CheckinReward.extra 回传。
+    只打日志不够：日志会滚走，而「今天到底走没走验证码、试了几次」是判断
+    识别器是否在退化的唯一长期记录（实测 sheapi 站点此前完全看不到这段）。
+    """
+    if not isinstance(detail, dict):
+        return ""
+    attempts = detail.get("captcha_attempts")
+    dialect = detail.get("captcha_dialect")
+    if attempts in (None, "") and not dialect:
+        return ""
+    bits: list[str] = []
+    if dialect:
+        bits.append(str(dialect))
+    if isinstance(attempts, int) and attempts > 0:
+        bits.append(f"第 {attempts} 次通过" if not detail.get("captcha_failed") else f"{attempts} 次均失败")
+    if detail.get("captcha_answer_exact") is False:
+        bits.append("读数不可信")
+    return "，".join(bits)
+
+
+def quiz_note(detail: Any) -> str:
+    """每日答题的摘要（来自 detail["quiz"]，由站点脚本写入）。
+
+    答题是签到之外的独立收益，成功与否此前只体现在 message 尾部，一旦站点
+    改了文案就完全看不出答题有没有跑。这里从结构化字段单独渲染一列。
+    """
+    if not isinstance(detail, dict):
+        return ""
+    quiz = detail.get("quiz")
+    if not isinstance(quiz, dict):
+        return ""
+    text = str(quiz.get("message") or quiz.get("outcome") or "").strip()
+    unknown = quiz.get("unknown")
+    if isinstance(unknown, int) and unknown > 0:
+        text = f"{text}（{unknown} 题未收录，已猜）" if text else f"{unknown} 题未收录，已猜"
+    return text
+
+
 def build_detail_note(status: str, message: str, detail: Any) -> str:
     parts: list[str] = []
 
@@ -486,6 +530,8 @@ def build_detail_note(status: str, message: str, detail: Any) -> str:
     if source:
         source_text = FLOW_LABELS.get(str(source), str(source))
         append_part(parts, "流程", source_text)
+    append_part(parts, "验证码", captcha_note(detail))
+    append_part(parts, "答题", quiz_note(detail))
 
     if not parts and message:
         parts.append(message)
@@ -600,8 +646,15 @@ def task_result_to_summary(result: TaskResult) -> dict[str, Any]:
 # 各阶段调用日志的前缀（子进程写 stderr，形如「[api_first:站点名] ...」）。
 # 这类行是排查「卡在哪一级凭据」的主要依据，因此始终打印；真正可能回显
 # Cookie/token 的完整原始输出仍只在 --verbose 或任务失败时才输出。
+#
+# 白名单漏项会让整条链路「静默」：实测 sheapi.top 的图形验证码签到全程一行日志
+# 都看不到，根因就是站点脚本的日志走 providers/actions/api.py 的 [api:站点名]，
+# 而这里当时只放行了 api_first:（前缀不同，startswith 匹配不上）。凡是新增日志
+# 前缀都必须同步登记到这里，否则等于没写。
 STAGE_LOG_PREFIXES = (
-    "api_first:",
+    "api:",           # api action + 站点脚本（含图形验证码流程）
+    "api_first:",     # browser_script 的纯 HTTP 前置链
+    "http:",          # 站点原始返回值（providers.base.log_http_exchange）
     "sub2api:",
     "newapi:",
     "relogin:",

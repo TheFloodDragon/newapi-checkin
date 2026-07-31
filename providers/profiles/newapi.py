@@ -43,6 +43,7 @@ from ..base import (
     contains_any,
     extract_message,
     http_request,
+    log_http_exchange,
     normalize_base_url,
     parse_json,
     payload_code,
@@ -129,18 +130,31 @@ class NewApiClient(ProfileClient):
             if body is None:
                 body = b"{}"
 
-        payload = http_request(
-            url,
-            method=method,
-            headers=headers,
-            body=body,
-            proxy=self.site.proxy,
-            retry_non_idempotent=retry_non_idempotent,
-            verify_ssl=getattr(self.site, "verify_ssl", True),
-        )
+        try:
+            payload = http_request(
+                url,
+                method=method,
+                headers=headers,
+                body=body,
+                proxy=self.site.proxy,
+                retry_non_idempotent=retry_non_idempotent,
+                verify_ssl=getattr(self.site, "verify_ssl", True),
+            )
+        except ApiError as exc:
+            # 站点原始回执是排查的第一手材料：只上抛 message 时，业务码拒绝、
+            # 验证码不通过和 WAF 换页在日志里长得一模一样。
+            log_http_exchange(self.site.name, method, url, error=exc)
+            raise
+        log_http_exchange(self.site.name, method, url, payload=payload)
         if isinstance(payload, dict) and payload.get("success") is False:
             raise ApiError(None, payload, extract_message(payload))
         return payload
+
+    def _log_stage(self, message: str) -> None:
+        """签到流程的阶段日志（stderr；worker 的 stdout 是机器协议通道）。"""
+        from mask_utils import mask_secrets
+
+        print(f"[newapi:{self.site.name}] {mask_secrets(str(message))}", file=sys.stderr, flush=True)
 
     def get_checkin_status_raw(self, month: str | None = None) -> Any:
         month = month or datetime.now().strftime("%Y-%m")
@@ -174,6 +188,12 @@ class NewApiClient(ProfileClient):
 
     def do_checkin(self, turnstile: str = "") -> CheckinReward:
         variant = (self.site.api_variant or "auto").strip().lower()
+        # 明确记录走了哪条接口变体：challenge 与 legacy 的失败原因完全不同，
+        # 汇总里只有一句「签到失败」时无法判断该往哪个方向查。
+        self._log_stage(
+            "开始接口签到（api_variant="
+            + f"{variant or 'auto'}，{'challenge 优先' if variant != 'legacy' else 'legacy 优先'}）"
+        )
         try:
             if variant == "legacy":
                 data = self._legacy_with_fallback(turnstile)
@@ -258,6 +278,12 @@ class NewApiClient(ProfileClient):
             ) from exc
 
         output = (completed.stdout or completed.stderr or "").strip()
+        # Node 辅助脚本的原始输出同样要落日志：challenge 流程整段跑在子进程里，
+        # 不打出来的话「PoW 失败」「WASM 拉取失败」「站点回执」三种情况在上层
+        # 都只表现为一句签到失败。
+        self._log_stage(
+            f"challenge 辅助脚本 rc={completed.returncode} → {output[:600] or '（无输出）'}"
+        )
         try:
             payload = parse_json(output)
         except ApiError as exc:

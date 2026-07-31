@@ -79,6 +79,19 @@ ENDPOINT_MISSING_PATTERNS = [
 MAX_ATTEMPTS = 4
 
 
+def _brief(value: Any, limit: int = 300) -> str:
+    """把站点回执压成单行限长文本，供日志原样输出。"""
+    if isinstance(value, (dict, list)):
+        try:
+            text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+        except (TypeError, ValueError):
+            text = str(value)
+    else:
+        text = str(value)
+    text = " ".join(text.split())
+    return text if len(text) <= limit else f"{text[:limit]}…（共 {len(text)} 字符）"
+
+
 def solver_available() -> bool:
     """识别器是否可用。
 
@@ -95,11 +108,14 @@ def solver_available() -> bool:
     return True
 
 
-def solve_image(data_url: str) -> tuple[str, bool]:
+def solve_image(data_url: str, log: Any = None) -> tuple[str, bool]:
     """按图像尺寸派发到对应识别器，返回 (答案, 是否可信)。
 
     用尺寸而不是端点来选识别器：端点只说明「哪个 fork」，尺寸才说明「哪套生成器」。
     某个 fork 换了生成器时，靠尺寸能自动走对，不必改接线。
+
+    尺寸与识别器名要落日志：站点换了验证码生成器时，症状只是「一直识别不对」，
+    没有尺寸信息根本判断不出该去重建哪套模板库。
     """
     import base64
     import io
@@ -116,9 +132,13 @@ def solve_image(data_url: str) -> tuple[str, bool]:
 
     if (width, height) == (newapi_bitmap.WIDTH, newapi_bitmap.HEIGHT):
         result = newapi_bitmap.solve_array(array)
+        if log:
+            log(f"验证码 {width}×{height} → newapi_bitmap 识别为 {result.text!r}（exact={result.exact}）")
         return result.text, result.exact
     if (width, height) == (base64_captcha.WIDTH, base64_captcha.HEIGHT):
         result = base64_captcha.solve_array(array)
+        if log:
+            log(f"验证码 {width}×{height} → base64_captcha 识别为 {result.text!r}（exact={result.exact}）")
         return result.text, result.exact
     raise ApiError(
         None, None,
@@ -128,7 +148,7 @@ def solve_image(data_url: str) -> tuple[str, bool]:
     )
 
 
-def captcha_required(client: Any) -> bool:
+def captcha_required(client: Any, log: Any = None) -> bool:
     """站点签到是否需要图形验证码。
 
     两套方言把开关放在不同地方：jianzhile 系写在签到状态里（`captcha_enabled`），
@@ -136,18 +156,37 @@ def captcha_required(client: Any) -> bool:
     实测就是这样一路走到用错端点、报「Invalid URL」。
 
     两处都读不到时返回 False —— 此时仍会在签到被拒后靠「验证码不能为空」兜底切进来。
+
+    判定过程要落日志：返回 False 时脚本会整体让位给默认流程，一行日志都不打的话
+    （实测 sheapi.top 就是如此）用户完全看不出「脚本到底有没有被调用、开关读到了
+    什么」，只能看到一句签到失败。
     """
+    def _log(message: str) -> None:
+        if log:
+            log(message)
+
     try:
         data = unwrap_data(client.get_checkin_status_raw())
-    except Exception:
+    except Exception as exc:
+        _log(f"读签到状态失败（不影响后续判定）：{type(exc).__name__}: {exc}")
         data = None
     if isinstance(data, dict) and data.get("captcha_enabled"):
+        _log("签到状态接口的 captcha_enabled=true → 需要图形验证码")
         return True
+    if isinstance(data, dict):
+        _log(f"签到状态接口未标记需要验证码（captcha_enabled={data.get('captcha_enabled')!r}）")
     try:
         options = unwrap_data(client.request("GET", STATUS_PATH))
-    except Exception:
+    except Exception as exc:
+        _log(f"读 {STATUS_PATH} 失败：{type(exc).__name__}: {exc}")
         options = None
-    return bool(isinstance(options, dict) and options.get("checkin_captcha_enabled"))
+    if isinstance(options, dict):
+        flag = options.get("checkin_captcha_enabled")
+        _log(f"{STATUS_PATH} 的 checkin_captcha_enabled={flag!r}")
+        if flag:
+            return True
+    _log("两处开关均未标记需要验证码 → 让位给默认签到流程")
+    return False
 
 
 def _fetch_via(client: Any, dialect: CaptchaDialect) -> tuple[str, str]:
@@ -169,9 +208,14 @@ def _fetch_via(client: Any, dialect: CaptchaDialect) -> tuple[str, str]:
 class _Fetcher:
     """逐个方言试取图，记住命中的那个。"""
 
-    def __init__(self, client: Any) -> None:
+    def __init__(self, client: Any, log: Any = None) -> None:
         self.client = client
         self.dialect: CaptchaDialect | None = None
+        self._log = log
+
+    def _say(self, message: str) -> None:
+        if self._log:
+            self._log(message)
 
     def fetch(self) -> tuple[CaptchaDialect, str, str]:
         if self.dialect is not None:
@@ -189,24 +233,40 @@ class _Fetcher:
                 if not missing:
                     # 业务错误（如 401 未登录）必须原样抛出，否则会被掩盖成
                     # 「所有方言都不支持」，让人以为是站点问题。
+                    self._say(f"取图端点 {dialect.endpoint} 返回业务错误，停止探测：{exc.message}")
                     raise
+                self._say(f"取图端点 {dialect.endpoint} 不存在（{exc.message}），试下一种方言")
                 errors.append(f"{dialect.endpoint}: {exc.message}")
                 continue
             self.dialect = dialect
+            # 方言是「这个站属于哪个 fork」的唯一线索，命中后固定复用，必须记一行。
+            self._say(f"命中验证码方言 {dialect.key}（{dialect.method} {dialect.endpoint}）")
             return dialect, captcha_id, image
         raise ApiError(None, None, "站点未提供已知的签到验证码端点（" + "；".join(errors) + "）")
 
 
-def captcha_checkin(client: Any, log: Any = None) -> dict[str, Any] | None:
+def captcha_checkin(
+    client: Any,
+    log: Any = None,
+    stats: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     """取图 → 离线识别 → 带答案提交，失败则换一张重试；返回签到接口的 data。
 
     每次重试都必须重新取图：captcha_id 单次有效，复用会直接回「验证码已失效」。
     识别器给出 exact=False 时也主动换图 —— 取图不限次、不消耗签到机会，硬猜却会
     作废一次验证码；只有已经用到最后一次机会时才带着不确定的读数提交（总比放弃好）。
+
+    stats 是可选的输出参数：填入本次识别用了几次、命中哪套方言、读数是否可信，
+    由 do_checkin 放进 CheckinReward.extra，最终出现在批量汇总里。日志会滚走，
+    汇总和结果 JSON 才是事后能回查的记录。
     """
     def _log(message: str) -> None:
         if log:
             log(message)
+
+    def _stat(**values: Any) -> None:
+        if stats is not None:
+            stats.update(values)
 
     if not solver_available():
         raise ApiError(
@@ -215,13 +275,15 @@ def captcha_checkin(client: Any, log: Any = None) -> dict[str, Any] | None:
             "请执行 uv sync --extra dev 后重试，或在浏览器手动签到。",
         )
 
-    fetcher = _Fetcher(client)
+    fetcher = _Fetcher(client, log=_log)
     last_error: ApiError | None = None
     tried: list[str] = []
     for attempt in range(1, MAX_ATTEMPTS + 1):
         dialect, captcha_id, image = fetcher.fetch()
-        text, exact = solve_image(image)
+        _log(f"第 {attempt}/{MAX_ATTEMPTS} 次取图完成（captcha_id={captcha_id[:12] or '空'}…），开始离线识别")
+        text, exact = solve_image(image, log=_log)
         if not text:
+            _log(f"第 {attempt}/{MAX_ATTEMPTS} 次未从图像提取到任何字符，换一张重试")
             last_error = ApiError(None, None, f"验证码识别失败（第 {attempt} 次，未提取到字符）")
             continue
         if not exact and attempt < MAX_ATTEMPTS:
@@ -229,16 +291,32 @@ def captcha_checkin(client: Any, log: Any = None) -> dict[str, Any] | None:
             _log(f"验证码读数 {text} 不够可信，换一张重试（第 {attempt}/{MAX_ATTEMPTS} 次）")
             continue
         tried.append(text)
-        _log(f"提交验证码读数 {text}（{dialect.key}，第 {attempt}/{MAX_ATTEMPTS} 次）")
+        confidence = "可信" if exact else "不可信（已是最后一次机会，仍提交）"
+        _log(
+            f"提交验证码读数 {text}（{dialect.key}，字段 {dialect.answer_key}，"
+            f"{confidence}，第 {attempt}/{MAX_ATTEMPTS} 次）"
+        )
         body = json.dumps({"captcha_id": captcha_id, dialect.answer_key: text}).encode("utf-8")
         try:
-            return unwrap_data(client.request("POST", CHECKIN_PATH, body, retry_non_idempotent=True))
+            data = unwrap_data(client.request("POST", CHECKIN_PATH, body, retry_non_idempotent=True))
         except ApiError as exc:
+            # 站点回执必须原样打出来：「验证码错误」和「今日已签到」都会走到这里，
+            # 只看最终 message 分不清是识别错了还是根本不该重试。
+            _log(f"第 {attempt}/{MAX_ATTEMPTS} 次提交被拒：{exc.message}；原始回执：{_brief(exc.payload)}")
             if contains_any(exc.message, RETRY_PATTERNS):
                 last_error = exc
                 continue
             raise
+        _log(f"第 {attempt}/{MAX_ATTEMPTS} 次提交通过，站点原始返回：{_brief(data)}")
+        _stat(
+            captcha_dialect=dialect.key,
+            captcha_attempts=attempt,
+            captcha_answer_exact=exact,
+        )
+        return data
     detail = "、".join(tried) if tried else "无"
+    _log(f"验证码连续 {MAX_ATTEMPTS} 次未通过（识别结果：{detail}）")
+    _stat(captcha_attempts=MAX_ATTEMPTS, captcha_failed=True)
     raise ApiError(
         None,
         last_error.payload if last_error else None,
@@ -257,15 +335,21 @@ def do_checkin(client: Any, log: Any = None) -> CheckinReward | None:
         if log:
             log(message)
 
-    if not captcha_required(client):
+    _log(f"验证码脚本已接入（识别器可用={solver_available()}），开始判定站点是否需要验证码")
+    if not captcha_required(client, log=log):
         return None
 
     _log("站点签到需要图形验证码，走离线识别流程")
-    data = captcha_checkin(client, log=log)
+    stats: dict[str, Any] = {"checkin_source": "api+captcha"}
+    data = captcha_checkin(client, log=log, stats=stats)
+    _log(f"验证码签到完成，站点原始返回：{_brief(data)}")
     if isinstance(data, dict):
         return CheckinReward(
             quota_awarded=data.get("quota_awarded"),
             current_quota=data.get("quota"),
             raw=data,
+            # extra 会被 action 层合并进 detail，最终出现在批量汇总与结果 JSON 里。
+            # 只有日志时，「这次到底走了验证码流程吗、试了几次」在事后完全查不到。
+            extra=stats,
         )
-    return CheckinReward(raw=data)
+    return CheckinReward(raw=data, extra=stats)
