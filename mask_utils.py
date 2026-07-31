@@ -38,6 +38,41 @@ _SENSITIVE_KEYS = {
     "token",
 }
 
+# 精确表挡不住新增字段：实测 api_key / client_secret / proxy_password 会被原样
+# 输出。凭据字段名有稳定的后缀习惯，按后缀判断才能覆盖尚未出现的键。
+# 判断前先去掉下划线/连字符，让 api_key、api-key、apiKey 归一到同一形态。
+_SENSITIVE_SUFFIXES = (
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "apikey",
+    "privatekey",
+    "publickey",
+    "credential",
+    "credentials",
+    "cookie",
+)
+# 出现在任意位置即视为敏感（cookie 常以 site_cookie / cookies 形式出现）。
+_SENSITIVE_CONTAINS = ("cookie",)
+
+
+def is_sensitive_key(key: str) -> bool:
+    """字段名是否应整体脱敏。
+
+    先做规范化（小写 + 去掉下划线/连字符），再按精确表、后缀和包含关系判断，
+    这样 api_key / api-key / apiKey / client_secret / proxy_password 都能覆盖。
+    """
+    normalized = str(key or "").strip().lower()
+    if not normalized:
+        return False
+    if normalized.replace("-", "_") in _SENSITIVE_KEYS:
+        return True
+    compact = normalized.replace("_", "").replace("-", "")
+    if compact.endswith(_SENSITIVE_SUFFIXES):
+        return True
+    return any(marker in compact for marker in _SENSITIVE_CONTAINS)
+
 
 def _mask_value(value: str) -> str:
     """保留首尾各 4 位，中间用 • 替换；过短则整体掩码。"""
@@ -52,12 +87,18 @@ def _mask_value(value: str) -> str:
 _COOKIE_PATTERNS = tuple(
     re.compile(rf"({re.escape(key)}=)([^;\s\"',]+)", re.IGNORECASE) for key in _COOKIE_KEYS
 )
-_BEARER_RE = re.compile(r"(Bearer\s+)([A-Za-z0-9._\-]+)", re.IGNORECASE)
+# opaque token 可能含 base64 的 + / =：旧字符集只吃 [A-Za-z0-9._-]，
+# "Bearer abc+secret/xyz=" 只掩码到 abc，后半段原样泄露（已实测）。
+_BEARER_RE = re.compile(r"(Bearer\s+)(\S+)", re.IGNORECASE)
 _FIELD_RE = re.compile(
-    r"(?i)([\"']?(?:access_token|refresh_token|browser_state|oauth_state|password|secret|token|cookie|state)[\"']?\s*[:=]\s*[\"']?)([^\s,;\"'&}]+)"
+    r"(?i)([\"']?(?:access_token|refresh_token|browser_state|oauth_state|password|passwd"
+    r"|secret|client_secret|token|cookie|state|api[_-]?key|private[_-]?key)[\"']?\s*[:=]\s*[\"']?)"
+    r"([^\s,;\"'&}]+)"
 )
 _AUTH_RE = re.compile(r"(Authorization[\"']?\s*[:=]\s*[\"']?)(\S+)", re.IGNORECASE)
-_URL_CRED_RE = re.compile(r"(?i)(https?://)([^\s/@:]+):([^\s/@]+)@")
+# 代理 URL 不只有 http(s)：CLI 明确支持 socks5，旧正则完全不匹配，
+# socks5://user:pass@host 会原样进日志（已实测）。用户名同样属于凭据，一并隐藏。
+_URL_CRED_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://)([^\s/@:]+):([^\s/@]*)@")
 _JWT_RE = re.compile(r"\b(eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{8,})?)\b")
 _SK_RE = re.compile(r"\b(sk-[A-Za-z0-9_-]{12,})\b", re.IGNORECASE)
 
@@ -89,7 +130,11 @@ def mask_secrets(text: str) -> str:
     text = _AUTH_RE.sub(_mask_group2, text)
 
     # 5) URL 中的 user:password@ 认证信息（代理或误配的站点 URL）。
-    text = _URL_CRED_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}:<redacted>@", text)
+    #    用户名也可能是账号标识，同样掩码，不再原样保留。
+    text = _URL_CRED_RE.sub(
+        lambda m: f"{m.group(1)}<redacted>:<redacted>@",
+        text,
+    )
 
     # 6) 即使没有字段名，也掩码常见 JWT 和 sk-* 凭据。
     text = _JWT_RE.sub(_mask_group1, text)
@@ -100,7 +145,7 @@ def mask_secrets(text: str) -> str:
 
 def sanitize_data(value: Any, *, key: str = "") -> Any:
     """递归清理将要写入日志、stdout 或结果文件的数据。"""
-    if key.lower() in _SENSITIVE_KEYS:
+    if is_sensitive_key(key):
         if value in (None, ""):
             return value
         return "<redacted>"

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import math
 import random
 import time
 import urllib.error
@@ -78,12 +79,19 @@ QUOTA_UNIT = 500_000
 
 # ── 额度换算 / 展示 / detail 提取（唯一实现；CLI、GUI、browser 共用）────────────
 def quota_usd_value(value: Any, *, is_usd: bool = False) -> float | None:
-    """把站点额度数值换算为美元；非数字（含 bool）返回 None。"""
+    """把站点额度数值换算为美元；非数字（含 bool）或非有限值返回 None。
+
+    NaN / Infinity 必须挡在这里：Python 的 json 会把它们写成裸 NaN/Infinity
+    （非标准 JSON），并且 NaN 参与任何比较都为 False，会让「额度是否增长」
+    的交叉验证静默失效、GUI 总额度变成 NaN。
+    """
     if isinstance(value, bool):
         return None
     try:
         usd = float(value)
     except (TypeError, ValueError):
+        return None
+    if not math.isfinite(usd):
         return None
     return usd if is_usd else usd / QUOTA_UNIT
 
@@ -343,10 +351,12 @@ class ProfileClient(ABC):
     quota_is_usd: bool = False
 
     def quota_to_usd(self, value: Any) -> float | None:
-        """把站点原始额度换算为美元；非数字返回 None。"""
+        """把站点原始额度换算为美元；非数字或非有限值返回 None。"""
         try:
             v = float(value)
         except (TypeError, ValueError):
+            return None
+        if not math.isfinite(v):
             return None
         return v if self.quota_is_usd else v / QUOTA_UNIT
 

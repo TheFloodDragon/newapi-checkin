@@ -451,13 +451,18 @@ def parse_script_timeout(value: Any, default: int | None = None) -> int:
 
     default=None 时取 config.Timeouts.BROWSER_SCRIPT_DEFAULT，避免默认值散落成
     十几处硬编码字面量（改一处就得全仓库跟着改）。
+
+    default 同样要夹取上限：旧实现只在「解析成功」的分支限制上限，缺省或非法输入
+    会原样返回 default，于是 CHECKIN_BROWSER_SCRIPT_DEFAULT 大于 MAX 时，
+    「没填超时」的站点反而能拿到突破硬上限的超时（已实测）。
     """
     if default is None:
         default = Timeouts.BROWSER_SCRIPT_DEFAULT
+    fallback = max(1, min(int(default), Timeouts.BROWSER_SCRIPT_MAX))
     try:
         timeout = int(value)
     except (TypeError, ValueError):
-        return default
+        return fallback
     return max(1, min(timeout, Timeouts.BROWSER_SCRIPT_MAX))
 
 

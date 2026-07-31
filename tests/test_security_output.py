@@ -55,3 +55,53 @@ def test_shared_atomic_writer_replaces_complete_file(tmp_path: Path) -> None:
 
 def test_mask_secrets_preserves_non_secret_text() -> None:
     assert mask_secrets("plain message") == "plain message"
+
+
+# ── 已复现的脱敏缺口回归 ──────────────────────────────────────────────────────
+def test_non_http_proxy_credentials_are_masked() -> None:
+    """CLI 明确支持 socks5 代理，旧正则只匹配 http(s)，凭据原样进日志。"""
+    for scheme in ("socks5", "socks5h", "socks4", "http", "https"):
+        text = mask_secrets(f"{scheme}://fakeuser:fakepass123@proxy.invalid:1080")
+        assert "fakepass123" not in text
+        assert "fakeuser" not in text
+        assert scheme in text
+
+
+def test_opaque_bearer_token_is_fully_masked() -> None:
+    """base64 token 含 + / =，旧字符集只掩码到第一个 +，其后原样泄露。"""
+    raw = "abc+fakesecret/xyz=="
+    text = mask_secrets(f"Authorization: Bearer {raw}")
+    assert raw not in text
+    assert "fakesecret" not in text
+    assert "•" in text
+
+
+def test_suffix_based_sensitive_keys_are_redacted() -> None:
+    safe = sanitize_data(
+        {
+            "api_key": "FAKE_API_KEY_VALUE",
+            "api-key": "FAKE_API_KEY_DASHED",
+            "client_secret": "FAKE_CLIENT_SECRET",
+            "proxy_password": "FAKE_PROXY_PW",
+            "private_key": "FAKE_PRIVATE_KEY",
+            "site_cookie": "session=FAKE_SESSION",
+            "plain_field": "keep-me",
+        }
+    )
+    text = json.dumps(safe, ensure_ascii=False)
+    for secret in (
+        "FAKE_API_KEY_VALUE",
+        "FAKE_API_KEY_DASHED",
+        "FAKE_CLIENT_SECRET",
+        "FAKE_PROXY_PW",
+        "FAKE_PRIVATE_KEY",
+        "FAKE_SESSION",
+    ):
+        assert secret not in text
+    assert safe["plain_field"] == "keep-me"
+
+
+def test_free_form_api_key_field_is_masked() -> None:
+    text = mask_secrets('{"api_key": "FAKE_FREEFORM_KEY", "client_secret": "FAKE_FREEFORM_SECRET"}')
+    assert "FAKE_FREEFORM_KEY" not in text
+    assert "FAKE_FREEFORM_SECRET" not in text

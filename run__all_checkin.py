@@ -52,6 +52,27 @@ VALID_RESULT_STATUSES = OK_STATUSES | {
 }
 # 子任务因超时被强制终止时使用的约定退出码（与 GNU timeout 一致）。
 TIMEOUT_EXIT_CODE = 124
+
+# 「按任务解析」的凭据类环境变量：只能来自本站点配置，绝不能从父进程继承。
+#
+# build_site_tasks 只在站点值非空时写入 task.env，而 run_task 过去用
+# {**os.environ, **task.env} 构造子进程环境。于是父进程里任何一个
+# CHECKIN_ACCESS_TOKEN / CHECKIN_COOKIE 都会漏给「没配这项凭据」的站点，
+# 把 A 账号的 token 发到 B 站点去（已实测复现）。显式空值同样无法覆盖继承值。
+#
+# CHECKIN_PROXY 刻意不在此列：它是设计上的全局回退（CI 从 Secret 注入住宅代理），
+# build_site_tasks 已在站点无 proxy 时显式读取并写入 task.env。
+TASK_SCOPED_ENV = frozenset(
+    {
+        "CHECKIN_ACCESS_TOKEN",
+        "CHECKIN_REFRESH_TOKEN",
+        "CHECKIN_COOKIE",
+        "CHECKIN_USER_ID",
+        "CHECKIN_BROWSER_STATE",
+        "CHECKIN_SCRIPT_ARGS",
+        "CHECKIN_CACHE_POLICY",
+    }
+)
 # 新三维字段：站点适配器 / 登录方式 / 签到方式
 FLOW_LABELS = {
     "api": "接口签到",
@@ -255,10 +276,19 @@ def discover_tasks() -> list[CheckinTask]:
     return build_site_tasks() + build_script_tasks()
 
 
+def build_task_env(task: CheckinTask) -> dict[str, str]:
+    """构造子进程环境：先剔除所有任务级凭据变量，再写入本站点自己的值。
+
+    必须无条件剔除（而不是「有 task.env 时才处理」）：没有任何凭据的站点同样
+    不该继承父进程里别的账号的 token/cookie。
+    """
+    env = {key: value for key, value in os.environ.items() if key not in TASK_SCOPED_ENV}
+    env.update(task.env or {})
+    return env
+
+
 def run_task(task: CheckinTask) -> TaskResult:
-    run_env = None
-    if task.env:
-        run_env = {**os.environ, **task.env}
+    run_env = build_task_env(task)
     started_at = datetime.now()
     start_perf = time.perf_counter()
     try:
