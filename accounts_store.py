@@ -547,21 +547,28 @@ def _normalize_account_entry(entry: dict[str, Any]) -> dict[str, Any]:
     # 其实已经存了 localStorage 的 refresh_token，只是没提取到独立字段。不回填
     # 会导致「明明有长期凭据，却因 access_token 过期而每次都要启动浏览器」。
     if not str(out.get("refresh_token") or "").strip():
-        recovered = _refresh_token_from_state(str(out.get("browser_state") or ""))
+        recovered = _refresh_token_from_state(
+            str(out.get("browser_state") or ""), str(out.get("base_url") or "")
+        )
         if recovered:
             out["refresh_token"] = recovered
     return out
 
 
-def _refresh_token_from_state(state_text: str) -> str:
-    """从 browser_state 的 localStorage 提取 refresh_token；失败返回空串。"""
+def _refresh_token_from_state(state_text: str, base_url: str = "") -> str:
+    """从 browser_state 的 localStorage 提取 refresh_token；失败返回空串。
+
+    传 base_url 时只读同源条目：browser_state 是整个浏览器上下文的快照，可能同时
+    含第三方 OAuth 站点或上一站点残留的 origin，而 refresh_token 是各站通用键名。
+    不限定来源会把别站的长期凭据回填到本站配置里。
+    """
     if not state_text.strip():
         return ""
     try:
         from browser.session import storage_refresh_token
         from browser.state import decode_state
 
-        return storage_refresh_token(decode_state(state_text))
+        return storage_refresh_token(decode_state(state_text), base_url=base_url)
     except Exception:
         return ""
 

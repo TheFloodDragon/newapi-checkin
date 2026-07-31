@@ -193,8 +193,13 @@ async def _persist_session(site: Any, context: Any, log: Any) -> None:
         encoded = state.encode_state(storage_state)
     except Exception:
         encoded = ""
-    access = session.storage_access_token(storage_state)
-    refresh = session.storage_refresh_token(storage_state)
+    # 必须限定站点来源：脚本跑完的 storage_state 常含多个 origin（站点自身 +
+    # 共享 OAuth provider + 第三方 iframe），而 auth_token / refresh_token 这两个
+    # 键名各站通用。不限定就会把第一个同名值当成本站 token 写进缓存，下次运行
+    # 拿着别站身份去请求，表现为「明明刚捕获成功却一直登录失效」。
+    site_base = str(getattr(site, "base_url", "") or "")
+    access = session.storage_access_token(storage_state, base_url=site_base)
+    refresh = session.storage_refresh_token(storage_state, base_url=site_base)
     if not encoded and not access and not refresh:
         return
     try:

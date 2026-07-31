@@ -27,7 +27,7 @@ import os
 import re
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 from . import bypass, oauth_providers, popups, state
 
@@ -1718,7 +1718,7 @@ async def capture_sub2api_login(
             "access_token": token,
             # refresh_token 存进配置后，纯 HTTP 路径可自行续期短期 JWT，
             # 无需为「access_token 过期」这一常见情况再启动浏览器。
-            "refresh_token": storage_refresh_token(storage_state_dict),
+            "refresh_token": storage_refresh_token(storage_state_dict, base_url=base_url),
             "auth_verified": ok,
         }
     except Exception as exc:
@@ -1806,7 +1806,9 @@ async def capture_sub2api_token(
             # 的重注入来回竞争）。恰好在清空后导出就会丢掉一个仍然有效的
             # refresh_token。传入的登录态是解码后的静态快照，不受该竞争影响，
             # 因此活存储读不到时回落到它。
-            refresh = storage_refresh_token(storage_state) or storage_refresh_token(storage_state_dict)
+            refresh = storage_refresh_token(storage_state, base_url=base_url) or storage_refresh_token(
+                storage_state_dict, base_url=base_url
+            )
             return {
                 "access_token": token_value,
                 "refresh_token": refresh,
@@ -1871,7 +1873,7 @@ async def capture_sub2api_token(
         async def _refresh_via_refresh_token() -> str:
             # 从登录态快照兜底：token 过期时前端会清空 localStorage 再跳登录页，
             # 只读活存储会随机拿到空值并误报「refresh_token not found」。
-            fallback_refresh = storage_refresh_token(storage_state_dict)
+            fallback_refresh = storage_refresh_token(storage_state_dict, base_url=base_url)
             try:
                 result = await page.evaluate(
                     """async ([baseUrl, timeoutMs, fallbackRefresh]) => {
@@ -2127,12 +2129,44 @@ async def verify_state(
         await _safe_close_browser(browser)
 
 
-def storage_item(storage_state: dict[str, Any] | None, name: str) -> str:
-    """从 storage_state 的 localStorage 里取某个键的值；找不到返回空串。"""
+def _same_origin(left: str, right: str) -> bool:
+    """按 scheme + hostname + 生效端口比较来源，不做字符串包含判断。"""
+    try:
+        a, b = urlsplit(str(left or "")), urlsplit(str(right or ""))
+    except ValueError:
+        return False
+    scheme_a, scheme_b = a.scheme.lower(), b.scheme.lower()
+    host_a = oauth_providers.normalize_hostname(a.hostname)
+    host_b = oauth_providers.normalize_hostname(b.hostname)
+    if not scheme_a or not host_a or scheme_a != scheme_b or host_a != host_b:
+        return False
+    default = {"http": 80, "https": 443}
+    try:
+        port_a = a.port or default.get(scheme_a)
+        port_b = b.port or default.get(scheme_b)
+    except ValueError:
+        return False
+    return port_a == port_b
+
+
+def storage_item(storage_state: dict[str, Any] | None, name: str, *, base_url: str = "") -> str:
+    """从 storage_state 的 localStorage 里取某个键的值；找不到返回空串。
+
+    传入 base_url 时只读同源条目。storage_state 可能含多个 origin（共享 OAuth
+    登录态、上一站点残留、第三方 iframe），而 auth_token / refresh_token 这类键名
+    在各站点高度重复。不限定来源就会返回「第一个同名键」，把 A 站 token 当成 B 站的
+    存进缓存甚至发给 B 站（已实测）。找不到同源条目时返回空串，绝不跨源兜底——
+    宁可退化成重新登录，也不能拿错身份。
+
+    base_url 为空表示调用方明确不关心来源（如仅做存在性诊断），保持旧行为。
+    """
     if not isinstance(storage_state, dict):
         return ""
+    want_origin = str(base_url or "").strip()
     for origin_entry in storage_state.get("origins") or []:
         if not isinstance(origin_entry, dict):
+            continue
+        if want_origin and not _same_origin(origin_entry.get("origin") or "", want_origin):
             continue
         for item in origin_entry.get("localStorage") or []:
             if not isinstance(item, dict):
@@ -2144,20 +2178,22 @@ def storage_item(storage_state: dict[str, Any] | None, name: str) -> str:
     return ""
 
 
-def storage_refresh_token(storage_state: dict[str, Any] | None) -> str:
+def storage_refresh_token(storage_state: dict[str, Any] | None, *, base_url: str = "") -> str:
     """从 storage_state 的 localStorage 里取出 refresh_token。
 
     Sub2API 系站点把 access_token（短期 JWT）与 refresh_token（长期）都放在
     localStorage。把 refresh_token 提出来存进 ACCOUNTS.json，纯 HTTP 路径就能
     自行调 /api/v1/auth/refresh 续期，不必为「JWT 过期」这种常见情况开浏览器。
-    找不到返回空串。
+    找不到返回空串。传 base_url 可限定只读该站点自己的条目。
     """
-    return storage_item(storage_state, "refresh_token")
+    return storage_item(storage_state, "refresh_token", base_url=base_url)
 
 
-def storage_access_token(storage_state: dict[str, Any] | None) -> str:
+def storage_access_token(storage_state: dict[str, Any] | None, *, base_url: str = "") -> str:
     """从 storage_state 里取出 access_token（Sub2API 系前端存作 auth_token）。"""
-    return storage_item(storage_state, "auth_token") or storage_item(storage_state, "access_token")
+    return storage_item(storage_state, "auth_token", base_url=base_url) or storage_item(
+        storage_state, "access_token", base_url=base_url
+    )
 
 
 def _site_cookie_string(cookies: list[dict[str, Any]], base_url: str) -> str:
