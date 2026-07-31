@@ -113,3 +113,80 @@ def test_missing_tokens_do_not_wipe_previously_cached_ones(tmp_path, monkeypatch
     asyncio.run(script_runner._persist_session(site, FakeContext(without_tokens), lambda _m: None))
     entry = _entry(cache)
     assert (entry["access_token"], entry["refresh_token"]) == ("ACCESS", "REFRESH")
+
+
+# ── 未登录时不得续存（登出态会覆盖上次可用的登录态）──────────────────────────
+LOGGED_OUT_STATE = {
+    # 登出态：preflight / 登录失败后 localStorage 里的 auth 键已被清空，
+    # 只剩「使用说明已读」这类无关标记。cookies 也只有 WAF 通行证。
+    "cookies": [{"name": "cf_clearance", "value": "v2", "domain": "t.invalid", "path": "/"}],
+    "origins": [{
+        "origin": "https://t.invalid",
+        "localStorage": [{"name": "sub2api_site_usage_notice_v1", "value": "accepted"}],
+    }],
+}
+
+
+def test_unauthenticated_outcome_keeps_previous_cached_state(tmp_path, monkeypatch) -> None:
+    """Turnstile 没过 / 账密被拒时，不能把登出态的 browser_state 写进缓存。
+
+    这是实测到的丢登录态路径：_persist_session 在 finally 里无条件执行，而
+    save_site_tokens 只跳过空字段——token 确实不会被写空，但 browser_state
+    每次都非空，于是一次失败的登录就把上次还能用的登录态覆盖成登出态，
+    下次运行只能从零再登一次（表现为「登录失败之后就再也复用不上缓存」）。
+    """
+    cache = tmp_path / "token_cache.json"
+    monkeypatch.setattr(token_cache, "CACHE_PATH", cache)
+    site = _site()
+
+    # 第一次：登录成功，存下可用登录态。
+    asyncio.run(script_runner._persist_session(site, FakeContext(), lambda _m: None))
+    good_state = _entry(cache)["browser_state"]
+    assert good_state
+
+    # 第二次：Turnstile 未通过，脚本返回 need_verification。
+    logs: list[str] = []
+    asyncio.run(
+        script_runner._persist_session(
+            site, FakeContext(LOGGED_OUT_STATE), logs.append, status="need_verification"
+        )
+    )
+    assert _entry(cache)["browser_state"] == good_state, "登出态不得覆盖上次可用的登录态"
+    assert any("跳过续存" in line for line in logs), "跳过续存必须留下日志，否则无法解释缓存为何没更新"
+
+
+def test_all_unauthenticated_statuses_are_gated(tmp_path, monkeypatch) -> None:
+    """need_login / need_verification / need_config 都代表「这次没登录成功」。"""
+    cache = tmp_path / "token_cache.json"
+    monkeypatch.setattr(token_cache, "CACHE_PATH", cache)
+    site = _site()
+    for status in ("need_login", "need_verification", "need_config"):
+        asyncio.run(
+            script_runner._persist_session(site, FakeContext(), lambda _m: None, status=status)
+        )
+        assert not cache.exists(), f"{status} 不该写缓存"
+
+
+def test_script_error_still_persists_because_login_may_have_succeeded(tmp_path, monkeypatch) -> None:
+    """error / 超时仍要续存：登录很可能已经成功，只是签到那步失败了。
+
+    这份快照能让下次运行省掉一次 Turnstile 登录，直接从已登录状态继续。
+    """
+    cache = tmp_path / "token_cache.json"
+    monkeypatch.setattr(token_cache, "CACHE_PATH", cache)
+    site = _site()
+    asyncio.run(script_runner._persist_session(site, FakeContext(), lambda _m: None, status="error"))
+    assert _entry(cache)["access_token"] == "ACCESS"
+
+
+def test_success_statuses_persist_as_before(tmp_path, monkeypatch) -> None:
+    """成功路径行为不变（含不带 status 的旧调用）。"""
+    cache = tmp_path / "token_cache.json"
+    monkeypatch.setattr(token_cache, "CACHE_PATH", cache)
+    site = _site()
+    for status in ("success", "already_done", ""):
+        cache.unlink(missing_ok=True)
+        asyncio.run(
+            script_runner._persist_session(site, FakeContext(), lambda _m: None, status=status)
+        )
+        assert _entry(cache)["access_token"] == "ACCESS", f"status={status!r} 应正常续存"

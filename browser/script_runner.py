@@ -169,7 +169,12 @@ def _normalize_result(raw: Any, *, script_file: Path) -> BrowserScriptResult:
     return BrowserScriptResult(status, message, detail)
 
 
-async def _persist_session(site: Any, context: Any, log: Any) -> None:
+# 明确表示「这次没登录成功」的脚本结论：这类结果下浏览器里的 storage_state
+# 是登出态，续存它会毁掉上次还能用的缓存登录态。
+_UNAUTHENTICATED_STATUSES = frozenset({"need_login", "need_verification", "need_config"})
+
+
+async def _persist_session(site: Any, context: Any, log: Any, status: str = "") -> None:
     """脚本结束时把登录态与 token 写进运行期缓存（用真实 SiteConfig 算 basis）。
 
     为什么不能在脚本里做：脚本拿到的是脱敏的 ScriptSiteView，没有 access_token /
@@ -181,9 +186,18 @@ async def _persist_session(site: Any, context: Any, log: Any) -> None:
     启用 Turnstile 后纯 HTTP 无法登录（服务端校验，实测 TURNSTILE_VERIFICATION_FAILED），
     只有这两个值能让下次运行走纯 HTTP、完全不启动浏览器。
 
+    status 是脚本结论，用来挡掉「没登录成功却把登出态写进缓存」：本函数在 finally
+    里调用，以前无条件执行。save_site_tokens 只更新非空字段，所以 token 不会被写空，
+    但 browser_state 每次都非空 —— Turnstile 没过、账密登录被拒时，浏览器里是干净的
+    登出态，续存它会覆盖上次还能用的登录态，下次运行只能从零再登一次（表现为「登录
+    失败之后就再也复用不上缓存」）。
+
     任何失败都静默忽略：缓存写不进去只是下次要多开一次浏览器，不该影响本次结果。
     """
     if context is None:
+        return
+    if str(status or "").strip().lower() in _UNAUTHENTICATED_STATUSES:
+        log(f"脚本结论为 {status}（未完成登录），跳过续存登录态以保留上次可用的缓存")
         return
     try:
         storage_state = await context.storage_state()
@@ -253,6 +267,17 @@ async def run_browser_script(
     browser = None
     page = None
     context = None
+    # 记录最终结论供 finally 判断是否该续存登录态：need_login / need_verification
+    # 这类结果意味着浏览器里是登出态，写进缓存会覆盖上次还能用的登录态。
+    # error（脚本异常/超时）仍然续存 —— 登录可能已经成功，只是签到那步失败了，
+    # 这份快照下次还能省一次登录。
+    outcome_status = ""
+
+    def _record(result: BrowserScriptResult) -> BrowserScriptResult:
+        nonlocal outcome_status
+        outcome_status = result.status
+        return result
+
     try:
         log(f"启动浏览器执行脚本 {site_view.script}（超时 {timeout}s）")
         browser, context = await bypass.launch_camoufox(
@@ -284,7 +309,7 @@ async def run_browser_script(
                 }
                 detail.update({key: value for key, value in oauth_link.items() if key not in detail})
                 log("OAuth 自动登录未完成")
-                return BrowserScriptResult("need_login", "OAuth 自动登录未完成，请检查共享登录态或站点 OAuth 配置。", detail)
+                return _record(BrowserScriptResult("need_login", "OAuth 自动登录未完成，请检查共享登录态或站点 OAuth 配置。", detail))
             log("OAuth 登录已回跳站点")
             await popups.dismiss_popups(page)
 
@@ -298,7 +323,7 @@ async def run_browser_script(
             raw_result = maybe_result
         outcome = _normalize_result(raw_result, script_file=script_file)
         log(f"脚本结束：{outcome.status} - {outcome.message}")
-        return outcome
+        return _record(outcome)
     except asyncio.TimeoutError:
         screenshot = ""
         if page is not None:
@@ -343,6 +368,6 @@ async def run_browser_script(
             detail["screenshot"] = screenshot
         return BrowserScriptResult("error", f"浏览器脚本异常：{exc}", detail)
     finally:
-        await _persist_session(site, context, log)
+        await _persist_session(site, context, log, status=outcome_status)
         await session._safe_close_page(page)
         await session._safe_close_browser(browser)
