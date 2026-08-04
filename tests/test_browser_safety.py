@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import base64
 import gzip
+import importlib
 import json
+from pathlib import Path
 
 import pytest
 
 from browser import session, state
 from browser.oauth_flow import is_oauth_callback_url
 from browser.runtime_loop import BrowserResources
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _valid_state() -> dict:
@@ -224,6 +229,58 @@ def test_browser_session_error_carries_structured_status() -> None:
     assert str(error) == "文案可以任意修改"
     assert error.status == "need_config"
     assert error.detail == {"source": "state"}
+
+
+def _module_attribute_uses(alias_to_module: dict[str, str]) -> dict[str, set[str]]:
+    """静态收集仓库里 `<alias>.<attr>` 形式的跨模块属性引用。"""
+    uses: dict[str, set[str]] = {module: set() for module in alias_to_module.values()}
+    for path in sorted(REPO_ROOT.glob("**/*.py")):
+        if ".worktrees" in path.parts or "tests" in path.parts:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        local_aliases = {
+            alias.asname or alias.name.rsplit(".", 1)[-1]: module
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+            for alias in node.names
+            for module in [alias_to_module.get(alias.name)]
+            if module is not None
+        }
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id in local_aliases
+            ):
+                uses[local_aliases[node.value.id]].add(node.attr)
+    return uses
+
+
+def test_split_browser_modules_keep_every_referenced_symbol() -> None:
+    """拆分后的兼容门面必须覆盖全仓引用，包括 `_safe_close_page` 这类私有清理入口。
+
+    这条测试防的是一整类回归：模块拆分时漏了 re-export，调用点直到真正跑浏览器
+    才在 finally 里抛 AttributeError，把成功结果覆盖成异常并泄漏浏览器进程。
+    """
+    alias_to_module = {
+        "session": "browser.session",
+        "runtime_loop": "browser.runtime_loop",
+        "waf": "browser.waf",
+        "oauth_flow": "browser.oauth_flow",
+        "site_messages": "browser.site_messages",
+        "storage_scope": "browser.storage_scope",
+        "script_loader": "browser.script_loader",
+    }
+    uses = _module_attribute_uses(alias_to_module)
+    assert uses["browser.session"], "静态扫描必须至少发现既有的 session.* 调用"
+
+    missing: list[str] = []
+    for module_name, attributes in uses.items():
+        module = importlib.import_module(module_name)
+        missing.extend(
+            f"{module_name}.{attribute}" for attribute in sorted(attributes) if not hasattr(module, attribute)
+        )
+    assert not missing, f"以下符号在拆分后已不可访问：{missing}"
 
 
 def test_browser_resources_close_is_complete_and_idempotent() -> None:

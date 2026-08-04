@@ -236,14 +236,14 @@ def run_http_flow(
             site.name, base_url, "need_verification",
             "签到需要人机验证（Cloudflare Turnstile 或图形验证码），纯 HTTP 无法自动识别，"
             "请在浏览器手动完成签到，或传入 --turnstile。",
-            detail=status.raw,
+            detail=getattr(status, "raw", None),
         )
 
     # 4) 执行签到
     # 先记下签到前余额：部分 fork 的签到接口不返回奖励字段，只能靠前后余额差
     # 判断是否真的到账（避免把「HTTP 200 但未发放」误报成成功）。状态接口已给出
     # 余额时直接复用，省一次请求。
-    quota_before = status.quota_usd if status.quota_usd is not None else _read_quota(client)
+    quota_before = status_quota if status_quota is not None else _read_quota(client)
     try:
         notify("checkin_start")
         # 站点脚本优先：它可能实现了该 fork 私改的签到流程（如图形验证码）。

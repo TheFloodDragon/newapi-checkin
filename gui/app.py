@@ -77,6 +77,11 @@ class App(QMainWindow):
         self._saved_credentials: dict[str, dict[str, str]] = {}
         self._type_buttons: dict[str, QPushButton] = {}
         self._worker: BrowserWorker | None = None
+        # 已结束、等待下次启动时统一回收的 worker。不在 finished 回调里立即
+        # deleteLater：那时 QThread 可能尚未真正退出，而 capture 正处于
+        # dlg.exec() 的嵌套事件循环中，会就地处理 DeferredDelete 并触发
+        # 「QThread: Destroyed while thread is still running」直接终止进程。
+        self._retired_worker: BrowserWorker | None = None
         self._capture_dialog: QMessageBox | None = None
         self._leases = core.TaskLeaseRegistry()
         self._batch_active = 0
@@ -1819,6 +1824,7 @@ class App(QMainWindow):
 
     def _start_worker(self, action: str, params: dict[str, Any]) -> BrowserWorker:
         self._set_browser_buttons(False)
+        self._reap_retired_worker()
         worker = BrowserWorker(action, params, self)
         self._worker = worker
         worker.progress.connect(self._say)
@@ -1826,11 +1832,25 @@ class App(QMainWindow):
         worker.finished.connect(lambda current=worker: self._on_browser_finished(current))
         return worker
 
+    def _reap_retired_worker(self) -> None:
+        """回收上一个已结束的 worker；此时线程一定已退出，删除是安全的。"""
+        worker = self._retired_worker
+        self._retired_worker = None
+        if worker is None:
+            return
+        try:
+            if worker.isRunning():
+                worker.wait(3000)
+            worker.deleteLater()
+        except RuntimeError:
+            pass
+
     def _on_browser_finished(self, worker: BrowserWorker) -> None:
         self._set_browser_buttons(True)
         if self._worker is worker:
             self._worker = None
-        worker.deleteLater()
+        # 只登记待回收，实际删除推迟到下次启动或窗口关闭，避免销毁未退出的线程。
+        self._retired_worker = worker
 
     def _on_browser_failed(self, msg: str) -> None:
         self._set_browser_buttons(True)
@@ -1961,7 +1981,7 @@ class App(QMainWindow):
             if worker.isRunning():
                 worker.request_close()
         except RuntimeError:
-            # 自动捕获已完成且 QThread 已 deleteLater。
+            # 极端情况下 QThread 的 C++ 对象已被回收；此时无需再请求收尾。
             pass
         if self._capture_dialog is dlg:
             self._capture_dialog = None
@@ -2067,6 +2087,10 @@ class App(QMainWindow):
                     worker.wait(3000)
             except Exception:
                 pass
+        try:
+            self._reap_retired_worker()
+        except Exception:
+            pass
         try:
             self.runner.shutdown(5000)
         except Exception:

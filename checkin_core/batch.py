@@ -38,7 +38,7 @@ def run_serial_groups(
     *,
     key: Callable[[ItemT], str],
     execute: Callable[[ItemT], ResultT],
-    on_error: Callable[[ItemT, BaseException], ResultT],
+    on_error: Callable[[ItemT, Exception], ResultT],
     workers: int = 0,
     on_result: Callable[[ResultT], None] | None = None,
 ) -> list[ResultT]:
@@ -56,7 +56,9 @@ def run_serial_groups(
         for index, item in group:
             try:
                 result = execute(item)
-            except BaseException as exc:  # noqa: BLE001 - 批量任务必须收敛成结果
+            except Exception as exc:
+                # 单个任务失败收敛成结果；KeyboardInterrupt/SystemExit 必须继续
+                # 上抛，否则 Ctrl-C 会被当成一条普通失败、批量还接着跑完。
                 result = on_error(item, exc)
             completed.append((index, result))
         return completed

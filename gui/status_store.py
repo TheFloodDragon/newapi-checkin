@@ -62,9 +62,18 @@ class StatusStore:
         return accounts_store.normalize_base_url(row.base_url) or (row.name or "").strip()
 
     def _ensure_today(self) -> None:
-        current = time_utils.business_date()
-        if current != self.today:
+        """跨日时自动换日。
+
+        由 get()/apply_*/snapshot_payload 调用，其中 get() 位于 GUI 渲染路径上：
+        重载失败绝不能把异常抛进渲染。load() 自身是事务式的（失败后保留旧数据），
+        这里只需保证异常不外泄，最坏结果是本次仍按旧业务日渲染。
+        """
+        if time_utils.business_date() == self.today:
+            return
+        try:
             self.load()
+        except Exception:
+            pass
 
     def get(self, key: str) -> dict[str, Any] | None:
         self._ensure_today()

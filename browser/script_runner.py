@@ -17,7 +17,7 @@ from urllib.parse import urlparse
 from accounts_store import RESULTS_DIR_NAME
 from checkin_core.enums import VALID_RESULT_STATUSES
 
-from . import bypass, popups, script_loader, session, state
+from . import bypass, popups, runtime_loop, script_loader, session, state
 from .script_contract import LoadedSiteScript
 from .script_helpers import ScriptHelpers
 
@@ -370,5 +370,5 @@ async def run_browser_script(
         return BrowserScriptResult("error", f"浏览器脚本异常：{exc}", detail)
     finally:
         await _persist_session(site, context, log, status=outcome_status)
-        await session._safe_close_page(page)
-        await session._safe_close_browser(browser)
+        await runtime_loop.safe_close_page(page)
+        await runtime_loop.safe_close_browser(browser)
