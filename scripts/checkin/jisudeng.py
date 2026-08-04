@@ -34,9 +34,13 @@ from typing import Any
 # browser_script 运行器用 spec_from_file_location 加载本文件，父目录不在
 # sys.path 上，因此显式加入后再导入同目录的共享模块。
 _HERE = Path(__file__).resolve().parent
-if str(_HERE) not in sys.path:
-    sys.path.insert(0, str(_HERE))
+_REPO_ROOT = _HERE.parents[1]
+for _path in (_HERE, _REPO_ROOT):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
 
+import accounts_store  # noqa: E402
+import time_utils  # noqa: E402
 import _sub2api_common as common  # noqa: E402
 
 SPEC = common.SiteSpec(
@@ -83,12 +87,17 @@ QUIZ_SUBMIT_ROUTE = "/play/quiz/submit"
 QUIZ_TODAY_PATH = API_PREFIX + QUIZ_TODAY_ROUTE
 QUIZ_SUBMIT_PATH = API_PREFIX + QUIZ_SUBMIT_ROUTE
 
-UNKNOWN_LOG = _HERE.parents[1] / ".cache-checkin" / "play_quiz_unknown.json"
+QUIZ_CACHE_DIR = _REPO_ROOT / ".cache-checkin"
+UNKNOWN_LOG = QUIZ_CACHE_DIR / "play_quiz_unknown.json"
+LEARNED_BANK = QUIZ_CACHE_DIR / "play_quiz_learned.json"
+LEARNED_BANK_VERSION = 1
+LEARNED_HISTORY_LIMIT = 20
 
 # 题库：完整题面 → 正确选项原文。
 #
-# 为什么必须离线维护：取题接口**不返回**正确答案，提交结果也只给总分、不给逐题对错
-# —— 既无法从题面推导，也无法靠提交反馈逐题学习（一天只有一次机会）。
+# 内置题库仍是最可靠基线；运行期学习题库只吸收可证明的反馈。取题接口不返回答案，
+# 提交接口常只给总分：满分/零分可分别证明全部选择正确/错误；部分得分若无逐题明细
+# 只能记为 unresolved，绝不能把聚合分数臆测到某一道题上。
 #
 # 为什么按相似度而不是精确相等匹配：站点的题面和选项都不稳定。实测题面末尾会拼上
 # 「（第7题）」这类序号，且同一道题在不同日期序号会变；选项也可能微调标点或措辞
@@ -120,6 +129,13 @@ ANSWERS: dict[str, str] = {
     "HTTP 429 通常表示什么": "请求过于频繁或触发限流",
     "上下文长度指的是什么": "模型一次可处理的输入输出窗口",
     "对多语言题库最稳妥的实现方式是": "后端按语言返回对应题目",
+    # 以下 5 题由实测补录：当日题库未收录，按最长选项启发式作答，提交回执为
+    # 5/5（获得 $0.50），因此这些选项已被服务端确认为正确答案。
+    "奖池版本的价值是什么": "方便复盘不同配置效果",
+    "提交客服反馈时最好提供什么": "错误截图、时间和请求信息",
+    "签到失败提示应该包含什么": "失败原因和可操作下一步",
+    "API Key 泄露后第一步应该做什么": "立即禁用或重置密钥",
+    "请求接口时 Header 里的 Authorization 通常放什么": "访问令牌或 API Key",
 }
 
 # 相似度阈值。实测本题库：同一题的各种变体最低 0.867，而**不同题之间**最高只有
@@ -211,6 +227,97 @@ def _option_index(options: list[Any], answer: str) -> int | None:
     )
 
 
+def _normalize_learning_bank(payload: Any) -> dict[str, Any]:
+    """把磁盘学习数据收敛为版本化安全结构，忽略损坏条目。"""
+    questions: dict[str, dict[str, Any]] = {}
+    raw_questions = payload.get("questions") if isinstance(payload, dict) else None
+    if not isinstance(raw_questions, dict):
+        return {"version": LEARNED_BANK_VERSION, "questions": questions}
+    for raw_key, raw_entry in raw_questions.items():
+        if not isinstance(raw_entry, dict):
+            continue
+        prompt = str(raw_entry.get("prompt") or raw_key or "").strip()
+        key = _norm_prompt(prompt)
+        if not key:
+            continue
+        correct_answer = str(raw_entry.get("correct_answer") or "").strip()
+        wrong_answers: list[str] = []
+        raw_wrong_answers = raw_entry.get("wrong_answers")
+        if not isinstance(raw_wrong_answers, list):
+            raw_wrong_answers = []
+        for value in raw_wrong_answers:
+            text = str(value or "").strip()
+            if text and _norm(text) not in {_norm(item) for item in wrong_answers}:
+                wrong_answers.append(text)
+        history: list[dict[str, Any]] = []
+        for item in raw_entry.get("history") or []:
+            if not isinstance(item, dict):
+                continue
+            result = str(item.get("result") or "unresolved")
+            if result not in {"correct", "incorrect", "unresolved"}:
+                result = "unresolved"
+            history.append(
+                {
+                    "choice": str(item.get("choice") or ""),
+                    "result": result,
+                    "score": item.get("score"),
+                    "total": item.get("total"),
+                    "submitted_at": str(item.get("submitted_at") or ""),
+                }
+            )
+        questions[key] = {
+            "prompt": prompt,
+            "correct_answer": correct_answer,
+            "wrong_answers": wrong_answers,
+            "history": history[-LEARNED_HISTORY_LIMIT:],
+            "updated_at": str(raw_entry.get("updated_at") or ""),
+        }
+    return {"version": LEARNED_BANK_VERSION, "questions": questions}
+
+
+def load_learning_bank(path: Path | None = None) -> dict[str, Any]:
+    """读取运行期学习题库；文件缺失或损坏时返回空库。"""
+    target = path or LEARNED_BANK
+    try:
+        return _normalize_learning_bank(json.loads(target.read_text(encoding="utf-8")))
+    except Exception:
+        return _normalize_learning_bank({})
+
+
+def _learned_key(prompt: Any, bank: dict[str, Any]) -> str | None:
+    questions = bank.get("questions")
+    if not isinstance(questions, dict) or not questions:
+        return None
+    normalized = _norm_prompt(prompt)
+    if normalized in questions:
+        return normalized
+    keys = list(questions)
+    index = _best_match(
+        normalized,
+        keys,
+        minimum=PROMPT_SIMILARITY_MIN,
+        margin=PROMPT_SIMILARITY_MARGIN,
+    )
+    return keys[index] if index is not None else None
+
+
+def _learned_entry(prompt: Any, bank: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    loaded = bank if bank is not None else load_learning_bank()
+    questions = loaded.get("questions")
+    key = _learned_key(prompt, loaded)
+    entry = questions.get(key) if isinstance(questions, dict) and key else None
+    return entry if isinstance(entry, dict) else None
+
+
+def _option_matches(left: Any, right: Any) -> bool:
+    normalized_left, normalized_right = _norm(left), _norm(right)
+    return bool(normalized_left and normalized_right) and similarity(normalized_left, normalized_right) >= OPTION_SIMILARITY_MIN
+
+
+def _answer_is_wrong(answer: Any, wrong_answers: list[Any]) -> bool:
+    return any(_option_matches(answer, wrong) for wrong in wrong_answers)
+
+
 def summary(outcome: str, message: str, **extra: Any) -> dict[str, Any]:
     """统一摘要结构。
 
@@ -221,22 +328,41 @@ def summary(outcome: str, message: str, **extra: Any) -> dict[str, Any]:
 
 
 def choose_index(question: Any) -> tuple[int, bool]:
-    """给一道题选一个选项下标，返回 (下标, 是否由题库确定)。
+    """给一道题选项，优先复用学习题库并排除已确认错误选项。
 
-    题库按相似度匹配（见 ANSWERS）。「相似度不足，判为新题」和「题库命中了但在选项里
-    定不到唯一答案」都返回 False，退化为「选最长的选项」——干扰项通常明显更短，这只是
-    比选第一个更好的猜法，不是答案。猜错只损失这一题的额度，而两种情况都会被记录并
-    打日志，人工补录时才看得到还缺什么。
+    返回 (下标, 是否由题库/排除法确定)。既无内置答案、也无足够学习证据时，仍只在
+    尚未确认错误的候选中选最长项，并返回 False 让日志明确标记为猜测。
     """
     options = question.get("options") if isinstance(question, dict) else None
     if not isinstance(options, list) or not options:
         return 0, False
-    answer = match_answer(question.get("prompt"))
-    if answer:
+
+    prompt = question.get("prompt")
+    learned = _learned_entry(prompt)
+    wrong_answers = list(learned.get("wrong_answers") or []) if learned else []
+    learned_answer = str(learned.get("correct_answer") or "") if learned else ""
+    static_answer = match_answer(prompt) or ""
+
+    # 服务端反馈形成的学习答案优先；若它明确把旧静态答案判错，不再复用陈旧答案。
+    candidates = [learned_answer]
+    if static_answer and not _answer_is_wrong(static_answer, wrong_answers):
+        candidates.append(static_answer)
+    for answer in candidates:
+        if not answer:
+            continue
         index = _option_index(options, answer)
-        if index is not None:
+        if index is not None and not _answer_is_wrong(options[index], wrong_answers):
             return index, True
-    longest = max(range(len(options)), key=lambda i: len(str(options[i] or "")))
+
+    remaining = [
+        index
+        for index, option in enumerate(options)
+        if not _answer_is_wrong(option, wrong_answers)
+    ]
+    if len(remaining) == 1:
+        return remaining[0], True
+    pool = remaining or list(range(len(options)))
+    longest = max(pool, key=lambda index: len(str(options[index] or "")))
     return longest, False
 
 
@@ -316,7 +442,213 @@ def plan(data: Any) -> tuple[dict[str, Any] | None, list[dict[str, Any]], list[d
     return None, answers, unknown
 
 
-def summarize_submit(response: dict[str, Any], unknown: list[dict[str, Any]]) -> dict[str, Any]:
+def build_attempts(data: Any, answers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """构造本次选择快照；只含题面/选项，不含任何认证信息。"""
+    questions = data.get("questions") if isinstance(data, dict) else None
+    valid_questions = [item for item in (questions or []) if isinstance(item, dict)]
+    attempts: list[dict[str, Any]] = []
+    for question, answer in zip(valid_questions, answers):
+        options = question.get("options") if isinstance(question.get("options"), list) else []
+        try:
+            choice_index = int(answer.get("choice_index", 0))
+        except (TypeError, ValueError):
+            choice_index = 0
+        choice = str(options[choice_index] or "") if 0 <= choice_index < len(options) else ""
+        attempts.append(
+            {
+                "question_id": question.get("id"),
+                "prompt": str(question.get("prompt") or ""),
+                "options": [str(option or "") for option in options],
+                "choice_index": choice_index,
+                "choice": choice,
+            }
+        )
+    return attempts
+
+
+def _result_verdict(item: dict[str, Any]) -> bool | None:
+    for key in ("correct", "is_correct", "isCorrect", "was_correct"):
+        if key not in item:
+            continue
+        value = item.get(key)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return bool(value)
+        text = str(value or "").strip().lower()
+        if text in {"true", "yes", "correct", "right", "1"}:
+            return True
+        if text in {"false", "no", "incorrect", "wrong", "0"}:
+            return False
+    text = str(item.get("result") or item.get("status") or "").strip().lower()
+    if text in {"correct", "right", "passed", "success"}:
+        return True
+    if text in {"incorrect", "wrong", "failed", "error"}:
+        return False
+    return None
+
+
+def _correct_answer_from_result(item: dict[str, Any], attempt: dict[str, Any]) -> str:
+    for key in ("correct_answer", "correct_option", "correct_choice", "correct_option_text"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    options = attempt.get("options") if isinstance(attempt.get("options"), list) else []
+    for key in ("correct_index", "correct_choice_index", "correct_option_index", "correct_choice"):
+        try:
+            index = int(item.get(key))
+        except (TypeError, ValueError):
+            continue
+        if 0 <= index < len(options):
+            return str(options[index] or "")
+    return ""
+
+
+def _question_result_items(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """兼容不同后端可能使用的逐题结果字段名。"""
+    for key in ("question_results", "answer_results", "results", "details", "answers"):
+        raw = data.get(key)
+        if isinstance(raw, dict):
+            raw = list(raw.values())
+        if isinstance(raw, list):
+            items = [item for item in raw if isinstance(item, dict)]
+            if items:
+                return items
+    return []
+
+
+def learning_evidence(data: dict[str, Any], attempts: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """把逐题明细/聚合总分转换成每次选择的可证明结论。"""
+    evidence = [{"result": "unresolved", "correct_answer": ""} for _ in attempts]
+    result_items = _question_result_items(data)
+    used: set[int] = set()
+    for attempt_index, attempt in enumerate(attempts):
+        wanted_id = str(attempt.get("question_id"))
+        matched_index: int | None = None
+        for index, item in enumerate(result_items):
+            if index in used:
+                continue
+            item_id = item.get("question_id", item.get("id"))
+            if item_id is not None and str(item_id) == wanted_id:
+                matched_index = index
+                break
+        if matched_index is None and attempt_index < len(result_items) and attempt_index not in used:
+            matched_index = attempt_index
+        if matched_index is None:
+            continue
+        used.add(matched_index)
+        item = result_items[matched_index]
+        verdict = _result_verdict(item)
+        correct_answer = _correct_answer_from_result(item, attempt)
+        if verdict is None and correct_answer:
+            verdict = _option_matches(attempt.get("choice"), correct_answer)
+        if verdict is not None:
+            evidence[attempt_index]["result"] = "correct" if verdict else "incorrect"
+        evidence[attempt_index]["correct_answer"] = correct_answer
+
+    score, total = data.get("score"), data.get("total")
+    try:
+        numeric_score = float(score)
+        numeric_total = float(total)
+    except (TypeError, ValueError):
+        numeric_score = numeric_total = -1
+    if not isinstance(score, bool) and not isinstance(total, bool) and numeric_total > 0:
+        aggregate = (
+            "correct"
+            if numeric_score == numeric_total
+            else ("incorrect" if numeric_score == 0 else "")
+        )
+        if aggregate:
+            for item in evidence:
+                if item["result"] == "unresolved":
+                    item["result"] = aggregate
+    return evidence
+
+
+def record_submit_learning(
+    data: dict[str, Any],
+    attempts: list[dict[str, Any]],
+    path: Path | None = None,
+) -> dict[str, Any]:
+    """合并并原子写入本次答题证据；持久化失败不影响答题结果。"""
+    counts = {"correct": 0, "incorrect": 0, "unresolved": 0, "saved": False}
+    if not attempts:
+        return counts
+    target = path or LEARNED_BANK
+    evidence = learning_evidence(data, attempts)
+    for item in evidence:
+        counts[item["result"]] += 1
+
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with accounts_store.file_lock(target):
+            bank = load_learning_bank(target)
+            questions = bank.setdefault("questions", {})
+            submitted_at = time_utils.utc_iso()
+            for attempt, proof in zip(attempts, evidence):
+                prompt = str(attempt.get("prompt") or "").strip()
+                normalized = _norm_prompt(prompt)
+                if not normalized:
+                    continue
+                # 写入只按规范化题面精确聚合（题号已由 _norm_prompt 剥离）。
+                # 模糊合并会把「学习题 A/B」这类短而相似的不同题误并为一题；
+                # 相似度只用于读取时兼容轻微措辞变化，不能用于破坏性写合并。
+                key = normalized
+                entry = questions.setdefault(
+                    key,
+                    {
+                        "prompt": prompt,
+                        "correct_answer": "",
+                        "wrong_answers": [],
+                        "history": [],
+                        "updated_at": "",
+                    },
+                )
+                entry["prompt"] = prompt or entry.get("prompt") or key
+                choice = str(attempt.get("choice") or "").strip()
+                correct_answer = str(proof.get("correct_answer") or "").strip()
+                wrong_answers = list(entry.get("wrong_answers") or [])
+                result = proof["result"]
+                if result == "correct" and choice:
+                    correct_answer = correct_answer or choice
+                    entry["correct_answer"] = correct_answer
+                    wrong_answers = [item for item in wrong_answers if not _option_matches(item, correct_answer)]
+                elif result == "incorrect" and choice:
+                    if not _answer_is_wrong(choice, wrong_answers):
+                        wrong_answers.append(choice)
+                    if _option_matches(entry.get("correct_answer"), choice):
+                        entry["correct_answer"] = ""
+                if correct_answer:
+                    entry["correct_answer"] = correct_answer
+                    wrong_answers = [item for item in wrong_answers if not _option_matches(item, correct_answer)]
+                entry["wrong_answers"] = wrong_answers
+                history = list(entry.get("history") or [])
+                history.append(
+                    {
+                        "choice": choice,
+                        "result": result,
+                        "score": data.get("score"),
+                        "total": data.get("total"),
+                        "submitted_at": submitted_at,
+                    }
+                )
+                entry["history"] = history[-LEARNED_HISTORY_LIMIT:]
+                entry["updated_at"] = submitted_at
+            accounts_store.atomic_write_text(
+                target,
+                json.dumps(_normalize_learning_bank(bank), ensure_ascii=False, indent=2),
+            )
+        counts["saved"] = True
+    except Exception:
+        pass
+    return counts
+
+
+def summarize_submit(
+    response: dict[str, Any],
+    unknown: list[dict[str, Any]],
+    attempts: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """把提交回执归一成摘要。response 形如 {ok, status, code, message, data}。"""
     if not response.get("ok"):
         code = str(response.get("code") or "")
@@ -332,12 +664,29 @@ def summarize_submit(response: dict[str, Any], unknown: list[dict[str, Any]]) ->
     # 奖励可能是优惠券，此时 reward_amount 为 0；不写金额也不写券名。
     if isinstance(reward, (int, float)) and not isinstance(reward, bool) and reward > 0:
         text += f"，获得 ${float(reward):.2f}"
-    return summary(
-        "submitted", text,
-        score=score, total=total, reward=reward,
-        reward_type=data.get("reward_type"), unknown=len(unknown),
-        unknown_prompts=[str(item.get("prompt") or "") for item in unknown],
+    extra: dict[str, Any] = {
+        "score": score,
+        "total": total,
+        "reward": reward,
+        "reward_type": data.get("reward_type"),
+        "unknown": len(unknown),
+        "unknown_prompts": [str(item.get("prompt") or "") for item in unknown],
+    }
+    if attempts is not None:
+        extra["learning"] = record_submit_learning(data, attempts)
+    return summary("submitted", text, **extra)
+
+
+def learning_log_line(outcome: dict[str, Any]) -> str:
+    learning = outcome.get("learning") if isinstance(outcome, dict) else None
+    if not isinstance(learning, dict):
+        return ""
+    text = (
+        "学习题库：确认正确 "
+        f"{learning.get('correct', 0)}，确认错误 {learning.get('incorrect', 0)}，"
+        f"未决 {learning.get('unresolved', 0)}"
     )
+    return text if learning.get("saved") else text + "（写入失败，本次不影响答题结果）"
 
 
 def merge_message(base: str, extra: str) -> str:
@@ -405,16 +754,22 @@ async def run_quiz(page: Any, helpers: Any, origin: str) -> dict[str, Any]:
         reason = today.get("reason") or today.get("message") or f"HTTP {today.get('status')}"
         return summary("error", f"读取答题失败：{reason}")
 
-    early, answers, unknown = plan(today.get("data"))
+    today_data = today.get("data")
+    early, answers, unknown = plan(today_data)
     if early is not None:
         return early
+    attempts = build_attempts(today_data, answers)
     if unknown:
         record_unknown(unknown)
         for line in describe_unknown(unknown):
             common.log(helpers, line)
 
     submitted = await _quiz_call(page, origin, QUIZ_SUBMIT_PATH, {"answers": answers})
-    return summarize_submit(submitted, unknown)
+    outcome = summarize_submit(submitted, unknown, attempts)
+    learning_line = learning_log_line(outcome)
+    if learning_line:
+        common.log(helpers, learning_line)
+    return outcome
 
 
 # ── 传输二：纯 HTTP（不启动浏览器）────────────────────────────────────────────
@@ -454,9 +809,11 @@ def run_play_quiz_http(client: Any, log: Any = None) -> dict[str, Any] | None:
             return None
         return summary("error", f"读取答题失败：{getattr(exc, 'message', exc)}")
 
-    early, answers, unknown = plan(_unwrap(today))
+    today_data = _unwrap(today)
+    early, answers, unknown = plan(today_data)
     if early is not None:
         return early
+    attempts = build_attempts(today_data, answers)
     if unknown:
         record_unknown(unknown)
         for line in describe_unknown(unknown):
@@ -477,7 +834,11 @@ def run_play_quiz_http(client: Any, log: Any = None) -> dict[str, Any] | None:
             },
             unknown,
         )
-    return summarize_submit({"ok": True, "data": _unwrap(submitted)}, unknown)
+    outcome = summarize_submit({"ok": True, "data": _unwrap(submitted)}, unknown, attempts)
+    learning_line = learning_log_line(outcome)
+    if learning_line:
+        _log(learning_line)
+    return outcome
 
 
 def run_http_extras(client: Any, log: Any = None) -> dict[str, dict[str, Any]]:

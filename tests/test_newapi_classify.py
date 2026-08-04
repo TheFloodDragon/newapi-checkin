@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from providers.base import AuthInfo, SiteConfig
+import pytest
+
+from providers.base import ApiError, AuthInfo, SiteConfig
 from providers.profiles.newapi import NewApiClient
 
 
@@ -37,3 +39,27 @@ def test_already_done_message() -> None:
 
     error = ApiError(None, {"message": "今日已签到"}, "今日已签到")
     assert _client().classify(error) == "already_done"
+
+
+def test_auto_challenge_waf_falls_back_to_legacy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Node challenge 被 CF 单独拦截时，auto 模式仍应尝试 legacy API。"""
+    client = _client()
+    legacy_result = {"quota_awarded": 250000}
+
+    def blocked_challenge():
+        raise ApiError(
+            None,
+            "<!DOCTYPE html><title>Just a moment...</title>",
+            "接口返回非 JSON：<!DOCTYPE html><title>Just a moment...</title>",
+        )
+
+    legacy_calls: list[str] = []
+    monkeypatch.setattr(client, "_challenge_checkin", blocked_challenge)
+    monkeypatch.setattr(
+        client,
+        "_legacy_checkin",
+        lambda turnstile="": legacy_calls.append(turnstile) or legacy_result,
+    )
+
+    assert client._challenge_with_fallback("token") == legacy_result
+    assert legacy_calls == ["token"]

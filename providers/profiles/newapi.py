@@ -298,6 +298,13 @@ class NewApiClient(ProfileClient):
         except ApiError as exc:
             if exc.status in {404, 405} or contains_any(exc.message, CHALLENGE_UNSUPPORTED_PATTERNS):
                 return self._legacy_checkin(turnstile)
+            # Node challenge 使用独立的 fetch/TLS 指纹，可能被 Cloudflare/WAF 单独
+            # 挑战，而同站 legacy API 仍可由 Python HTTP 客户端访问。auto 模式在此
+            # 应继续尝试幂等的 legacy 签到；若 legacy 也被拦，parse_json 会返回明确
+            # 的验证提示，不再把 300 字符挑战 HTML 倾倒给用户。
+            if _is_antibot_block(exc):
+                self._log_stage("challenge 请求命中 Cloudflare/WAF，回落 legacy 签到接口")
+                return self._legacy_checkin(turnstile)
             # 辅助脚本连不上站点（Node 的 undici 只会给一句 "fetch failed"）时也回落：
             # 这只说明「新版端点这次没探到」，legacy 仍值得一试。实测 sheapi.top 偶发
             # TLS 握手超时，旧实现在这里直接判 error，把一次可用的 legacy 签到丢掉了。

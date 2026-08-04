@@ -32,6 +32,12 @@ from browser import script_loader  # noqa: E402
 quiz = script_loader.load_site_script("scripts/checkin/jisudeng.py")
 
 
+@pytest.fixture(autouse=True)
+def _isolated_learning_bank(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """每条测试使用独立学习库，绝不读写开发机的真实答题历史。"""
+    monkeypatch.setattr(quiz, "LEARNED_BANK", tmp_path / "learned.json")
+
+
 class FakeHelpers:
     def __init__(self, origin: str = "https://site.invalid") -> None:
         self.origin = origin
@@ -212,6 +218,112 @@ def test_every_bank_entry_resolves_itself() -> None:
         assert quiz.match_answer(f"{prompt}（第3题）") == answer, prompt
 
 
+def test_verified_2026_07_quiz_answers_are_recorded() -> None:
+    """实测未知题按带星选项提交后 5/5，固化该批服务端已验证答案。"""
+    verified = {
+        "奖池版本的价值是什么": "方便复盘不同配置效果",
+        "提交客服反馈时最好提供什么": "错误截图、时间和请求信息",
+        "签到失败提示应该包含什么": "失败原因和可操作下一步",
+        "API Key 泄露后第一步应该做什么": "立即禁用或重置密钥",
+        "请求接口时 Header 里的 Authorization 通常放什么": "访问令牌或 API Key",
+    }
+    for prompt, answer in verified.items():
+        options = ["无关选项", answer, "另一个无关选项", "短"]
+        index, known = quiz.choose_index({"id": prompt, "prompt": prompt, "options": options})
+        assert known is True
+        assert index == 1
+
+
+def _attempt(question_id: int, prompt: str, options: list[str], choice_index: int) -> dict[str, Any]:
+    return {
+        "question_id": question_id,
+        "prompt": prompt,
+        "options": options,
+        "choice_index": choice_index,
+        "choice": options[choice_index],
+    }
+
+
+def test_perfect_score_learns_answers_and_reuses_after_option_shuffle() -> None:
+    attempts = [
+        _attempt(1, "学习题 A", ["错误", "已验证答案 A", "短"], 1),
+        _attempt(2, "学习题 B", ["已验证答案 B", "错误", "短"], 0),
+    ]
+
+    learned = quiz.record_submit_learning({"score": 2, "total": 2}, attempts)
+
+    assert learned == {"correct": 2, "incorrect": 0, "unresolved": 0, "saved": True}
+    bank = quiz.load_learning_bank()
+    assert bank["questions"][quiz._norm_prompt("学习题 A")]["correct_answer"] == "已验证答案 A"
+    shuffled = {"id": 1, "prompt": "学习题 A（第8题）", "options": ["短", "错误", "已验证答案 A"]}
+    assert quiz.choose_index(shuffled) == (2, True)
+
+
+def test_zero_score_records_wrong_choice_and_excludes_it_next_time() -> None:
+    attempt = _attempt(1, "排除错误选项题", ["明显最长但错误的选项", "候选答案", "短"], 0)
+
+    learned = quiz.record_submit_learning({"score": 0, "total": 1}, [attempt])
+    index, known = quiz.choose_index(
+        {"id": 1, "prompt": "排除错误选项题", "options": ["明显最长但错误的选项", "候选答案", "短"]}
+    )
+
+    assert learned["incorrect"] == 1
+    assert index == 1, "已确认错误的最长项必须被排除"
+    assert known is False, "仍有两个候选时不能伪装成已确定答案"
+
+
+def test_partial_score_without_details_only_records_unresolved() -> None:
+    attempts = [
+        _attempt(1, "部分得分题 A", ["A0", "A1"], 0),
+        _attempt(2, "部分得分题 B", ["B0", "B1"], 1),
+    ]
+
+    learned = quiz.record_submit_learning({"score": 1, "total": 2}, attempts)
+    bank = quiz.load_learning_bank()
+
+    assert learned == {"correct": 0, "incorrect": 0, "unresolved": 2, "saved": True}
+    for entry in bank["questions"].values():
+        assert not entry["correct_answer"]
+        assert not entry["wrong_answers"]
+        assert entry["history"][-1]["result"] == "unresolved"
+
+
+def test_per_question_results_learn_mixed_outcomes_and_server_answer() -> None:
+    attempts = [
+        _attempt(11, "混合反馈题 A", ["猜错", "干扰", "服务端正确答案"], 0),
+        _attempt(12, "混合反馈题 B", ["干扰", "本次答对"], 1),
+    ]
+    data = {
+        "score": 1,
+        "total": 2,
+        "question_results": [
+            {"question_id": 11, "is_correct": False, "correct_index": 2},
+            {"question_id": 12, "correct": True},
+        ],
+    }
+
+    learned = quiz.record_submit_learning(data, attempts)
+    bank = quiz.load_learning_bank()["questions"]
+
+    assert learned == {"correct": 1, "incorrect": 1, "unresolved": 0, "saved": True}
+    first = bank[quiz._norm_prompt("混合反馈题 A")]
+    second = bank[quiz._norm_prompt("混合反馈题 B")]
+    assert first["correct_answer"] == "服务端正确答案"
+    assert first["wrong_answers"] == ["猜错"]
+    assert second["correct_answer"] == "本次答对"
+
+
+def test_learning_history_is_bounded_and_corrupt_file_recovers() -> None:
+    quiz.LEARNED_BANK.write_text("{broken", encoding="utf-8")
+    attempt = _attempt(1, "历史上限题", ["错", "对"], 1)
+    for _ in range(quiz.LEARNED_HISTORY_LIMIT + 5):
+        assert quiz.record_submit_learning({"score": 1, "total": 1}, [attempt])["saved"] is True
+
+    entry = quiz.load_learning_bank()["questions"][quiz._norm_prompt("历史上限题")]
+    assert len(entry["history"]) == quiz.LEARNED_HISTORY_LIMIT
+    assert entry["correct_answer"] == "对"
+
+
 def test_ambiguous_option_match_is_treated_as_unknown() -> None:
     """选项里定不到唯一答案时必须去猜并记录，不能随便挑一个充当已知答案。"""
     answer = quiz.ANSWERS["提示词前缀缓存（Prompt Cache）的主要收益是"]
@@ -263,9 +375,12 @@ def test_submits_chosen_answers_and_reports_score() -> None:
                                    "questions": QUESTIONS, "reward_per_correct": 0.1}),
         quiz.QUIZ_SUBMIT_PATH: _ok({"score": 2, "total": 2, "reward_amount": 0.2, "reward_type": "balance"}),
     })
-    outcome = asyncio.run(quiz.run_quiz(page, FakeHelpers(), "https://site.invalid"))
+    helpers = FakeHelpers()
+    outcome = asyncio.run(quiz.run_quiz(page, helpers, "https://site.invalid"))
     assert outcome["outcome"] == "submitted"
     assert (outcome["score"], outcome["total"], outcome["unknown"]) == (2, 2, 0)
+    assert outcome["learning"] == {"correct": 2, "incorrect": 0, "unresolved": 0, "saved": True}
+    assert any("学习题库：确认正确 2" in line for line in helpers.logs)
     assert "$0.20" in outcome["message"]
     submitted = [body for path, body in page.calls if path == quiz.QUIZ_SUBMIT_PATH]
     assert submitted == [{"answers": [{"question_id": 1, "choice_index": 1},
@@ -381,8 +496,11 @@ def test_http_quiz_submits_and_summarizes() -> None:
         quiz.QUIZ_SUBMIT_ROUTE: {"code": 0, "data": {"score": 2, "total": 2,
                                                      "reward_amount": 0.2, "reward_type": "balance"}},
     })
-    outcome = quiz.run_play_quiz_http(client)
+    logs: list[str] = []
+    outcome = quiz.run_play_quiz_http(client, log=logs.append)
     assert outcome["outcome"] == "submitted"
+    assert outcome["learning"]["correct"] == 2
+    assert any("学习题库：确认正确 2" in line for line in logs)
     assert "$0.20" in outcome["message"]
     assert client.calls[-1] == ("POST", quiz.QUIZ_SUBMIT_ROUTE,
                                 {"answers": [{"question_id": 1, "choice_index": 1},
