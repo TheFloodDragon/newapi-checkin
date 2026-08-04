@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from typing import Callable
 
+from checkin_core.enums import ACTION_VALUES, CheckinAction, parse_enum
+
 from ..base import CheckinResult, QueryStatus, SiteConfig, SiteProfile
 from . import api, browser_script, relogin, visit
 
@@ -31,13 +33,13 @@ _QUERY: dict[str, Callable[[SiteConfig, SiteProfile], QueryStatus]] = {
     "visit": visit.query_action,
 }
 
-KNOWN_ACTIONS = set(_RUN)
-DEFAULT_ACTION = "api"
+KNOWN_ACTIONS = set(ACTION_VALUES)
+DEFAULT_ACTION = CheckinAction.API.value
+assert set(_RUN) == KNOWN_ACTIONS == set(_QUERY)
 
 
 def normalize_action(value: str | None) -> str:
-    key = (value or DEFAULT_ACTION).strip().lower()
-    return key if key in KNOWN_ACTIONS else DEFAULT_ACTION
+    return parse_enum(CheckinAction, value, CheckinAction.API).value
 
 
 def run_action(site: SiteConfig, profile: SiteProfile, turnstile: str = "") -> CheckinResult:

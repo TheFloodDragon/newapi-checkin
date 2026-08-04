@@ -8,6 +8,8 @@ import json
 import pytest
 
 from browser import session, state
+from browser.oauth_flow import is_oauth_callback_url
+from browser.runtime_loop import BrowserResources
 
 
 def _valid_state() -> dict:
@@ -212,6 +214,40 @@ def test_restore_storage_state_accepts_empty_state() -> None:
     asyncio.run(state.restore_storage_state(FakeContext(), None))
 
 
+def test_browser_session_error_carries_structured_status() -> None:
+    error = session.BrowserSessionError(
+        "文案可以任意修改",
+        status="need_config",
+        detail={"source": "state"},
+    )
+
+    assert str(error) == "文案可以任意修改"
+    assert error.status == "need_config"
+    assert error.detail == {"source": "state"}
+
+
+def test_browser_resources_close_is_complete_and_idempotent() -> None:
+    calls: list[str] = []
+
+    class FailingPage:
+        async def close(self) -> None:
+            calls.append("page")
+            raise RuntimeError("page already closed")
+
+    class FakeBrowser:
+        async def close(self) -> None:
+            calls.append("browser")
+
+    resources = BrowserResources(browser=FakeBrowser(), page=FailingPage())
+
+    asyncio.run(resources.close())
+    asyncio.run(resources.close())
+
+    assert calls == ["page", "browser"]
+    assert resources.page is None
+    assert resources.browser is None
+
+
 def test_run_sync_inside_running_event_loop() -> None:
     async def outer() -> str:
         return session.run_sync(asyncio.sleep(0, result="ok"))
@@ -228,6 +264,18 @@ def test_run_sync_propagates_nested_exception() -> None:
             session.run_sync(fail())
 
     asyncio.run(outer())
+
+
+def test_oauth_callback_url_requires_exact_origin() -> None:
+    base_url = "https://site.invalid"
+
+    assert is_oauth_callback_url("https://site.invalid/api/oauth/linuxdo?code=ok", base_url)
+    assert is_oauth_callback_url("https://site.invalid:443/console", base_url)
+    assert not is_oauth_callback_url("https://evil-site.invalid/api/oauth/linuxdo?code=ok", base_url)
+    assert not is_oauth_callback_url("https://sub.site.invalid/api/oauth/linuxdo?code=ok", base_url)
+    assert not is_oauth_callback_url("http://site.invalid/api/oauth/linuxdo?code=ok", base_url)
+    assert not is_oauth_callback_url("https://site.invalid:8443/api/oauth/linuxdo?code=ok", base_url)
+    assert not is_oauth_callback_url("https://site.invalid/login?next=code", base_url)
 
 
 def test_site_success_message_extracts_agentrouter_toast() -> None:

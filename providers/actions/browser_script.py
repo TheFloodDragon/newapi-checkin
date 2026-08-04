@@ -10,6 +10,7 @@ import sys
 from typing import Any
 
 import accounts_store
+from checkin_core.auth import PasswordLoginCapable, TokenRefreshCapable
 
 from ..base import (
     ApiError,
@@ -17,11 +18,10 @@ from ..base import (
     QueryStatus,
     SiteConfig,
     SiteProfile,
-    format_usd,
-    has_awarded_amount,
     normalize_access_token,
     normalize_base_url,
 )
+from .api import run_http_flow
 
 
 def _load_runner():
@@ -182,8 +182,7 @@ def _persist_tokens(
 def _renew_access_token(site: SiteConfig, profile: SiteProfile, reason: str) -> str:
     """token 完全缺失时主动用 refresh_token 续期；已有 token 的 401 由 client 处理。"""
     base_url = normalize_base_url(site.base_url)
-    refresh_http = getattr(profile, "refresh_token_via_http", None)
-    if not callable(refresh_http):
+    if not isinstance(profile, TokenRefreshCapable):
         _api_log(site, f"{reason}，但站点适配器（{type(profile).__name__}）不支持纯 HTTP 续期")
         return ""
     configured = str(getattr(site, "refresh_token", "") or "").strip()
@@ -196,7 +195,7 @@ def _renew_access_token(site: SiteConfig, profile: SiteProfile, reason: str) -> 
         return ""
     _api_log(site, f"{reason}，尝试用 refresh_token 纯 HTTP 续期（{base_url}，rt {len(configured)} 字符）")
     try:
-        pair = refresh_http(site, log=lambda m: _api_log(site, m)) or {}
+        pair = profile.refresh_token_via_http(site, log=lambda m: _api_log(site, m)) or {}
     except Exception as exc:
         _api_log(site, f"refresh_token 续期异常（{base_url}）：{type(exc).__name__}: {exc}")
         return ""
@@ -211,52 +210,6 @@ def _renew_access_token(site: SiteConfig, profile: SiteProfile, reason: str) -> 
         log=lambda m: _api_log(site, m),
     )
     return renewed
-
-
-def _api_result_detail(client: Any, stage: str, *, status: Any = None, reward: Any = None) -> dict[str, Any]:
-    """构造 API-first 标准 detail，并尽力补齐当前余额。"""
-    is_usd = bool(getattr(client, "quota_is_usd", False))
-    detail: dict[str, Any] = {
-        "checkin_source": "api",
-        "api_first": True,
-        "api_stage": stage,
-        "quota_is_usd": is_usd,
-    }
-    status_quota = getattr(status, "quota_usd", None) if status is not None else None
-    if isinstance(status_quota, (int, float)):
-        # StatusInfo.quota_usd 已经是美元，必须覆盖单位标记。
-        detail["current_quota"] = status_quota
-        detail["quota_is_usd"] = True
-        return detail
-    reward_quota = getattr(reward, "current_quota", None) if reward is not None else None
-    if reward_quota is not None:
-        detail["current_quota"] = reward_quota
-        return detail
-    try:
-        user = client.fetch_user()
-    except Exception:
-        return detail
-    quota_raw = getattr(user, "quota_raw", None)
-    if quota_raw is not None:
-        detail["current_quota"] = quota_raw
-    return detail
-
-
-def _already_done_result(
-    site: SiteConfig,
-    client: Any,
-    stage: str,
-    *,
-    status: Any = None,
-    reward: Any = None,
-) -> CheckinResult:
-    return CheckinResult(
-        site.name,
-        normalize_base_url(site.base_url),
-        "already_done",
-        "今日已签到。",
-        detail=_api_result_detail(client, stage, status=status, reward=reward),
-    )
 
 
 def _merge_extra_message(base: str, extra: str) -> str:
@@ -287,16 +240,15 @@ def _run_http_extras(site: SiteConfig, client: Any, result: CheckinResult | None
     try:
         from browser import script_loader
 
-        module = script_loader.load_site_script(script_path)
+        hooks = script_loader.load_script_hooks(script_path)
     except Exception as exc:  # noqa: BLE001
         _api_log(site, f"加载站点脚本以执行附加任务失败：{type(exc).__name__}: {exc}")
         return result
-    runner = getattr(module, "run_http_extras", None)
-    if not callable(runner):
+    if hooks.run_http_extras is None:
         return result
 
     try:
-        extras = runner(client, log=lambda message: _api_log(site, message))
+        extras = hooks.run_http_extras(client, log=lambda message: _api_log(site, message))
     except Exception as exc:  # noqa: BLE001 - 附加任务异常绝不能影响签到结论
         extras = {"extras": {"outcome": "error", "message": f"附加任务异常：{type(exc).__name__}: {exc}"}}
     if not isinstance(extras, dict) or not extras:
@@ -331,75 +283,56 @@ def _try_api_checkin(site: SiteConfig, profile: SiteProfile) -> CheckinResult | 
     build_client = getattr(profile, "build_client", None)
     if not callable(build_client):
         return None
-    base_url = normalize_base_url(site.base_url)
+    # 结果里的 base_url 由 run_http_flow 按站点配置统一填写，这里不再各自拼一份。
     token = normalize_access_token(getattr(site, "access_token", "") or "")
 
     from ..base import AuthInfo
 
     def _attempt(client: Any, stage: str) -> CheckinResult | None:
-        """跑一次「读状态 → 签到」，成立时补做附加日常任务；无明确结论返回 None。"""
-        return _run_http_extras(site, client, _checkin_attempt(client, stage))
+        """复用 api action 的唯一 HTTP 状态机；本层只增加阶段日志与降级决策。"""
 
-    def _checkin_attempt(client: Any, stage: str) -> CheckinResult | None:
-        """用给定客户端跑一次「读状态 → 签到」；无明确结论返回 None。"""
-        try:
-            status = client.fetch_status()
-        except ApiError as exc:
-            kind = profile.classify(exc) if hasattr(profile, "classify") else "error"
-            _api_log(site, f"[{stage}] 读取签到状态失败：{_describe_failure(exc)}（判定 {kind}）")
-            if kind == "need_login":
-                raise
-            status = None
-        else:
-            checked = getattr(status, "checked_in_today", None)
-            quota = getattr(status, "quota_usd", None)
-            _api_log(
-                site,
-                f"[{stage}] 状态读取成功：今日已签={checked} 余额="
-                + (f"${quota:.2f}" if isinstance(quota, (int, float)) else "未知"),
-            )
-            raw_status = _brief_payload(getattr(status, "raw", None))
-            if raw_status:
-                _api_log(site, f"[{stage}] 状态接口原始返回：{raw_status}")
-            if checked:
-                return _already_done_result(site, client, stage, status=status)
+        def observe(event: str, payload: Any) -> None:
+            if event == "status":
+                checked = getattr(payload, "checked_in_today", None)
+                quota = getattr(payload, "quota_usd", None)
+                _api_log(
+                    site,
+                    f"[{stage}] 状态读取成功：今日已签={checked} 余额="
+                    + (f"${quota:.2f}" if isinstance(quota, (int, float)) else "未知"),
+                )
+                raw_status = _brief_payload(getattr(payload, "raw", None))
+                if raw_status:
+                    _api_log(site, f"[{stage}] 状态接口原始返回：{raw_status}")
+            elif event == "status_error":
+                kind = client.classify(payload)
+                _api_log(site, f"[{stage}] 读取签到状态失败：{_describe_failure(payload)}（判定 {kind}）")
+            elif event == "checkin_start":
+                _api_log(site, f"[{stage}] 调用签到接口...")
+            elif event == "reward":
+                raw_reward = _brief_payload(getattr(payload, "raw", None))
+                if raw_reward:
+                    _api_log(site, f"[{stage}] 签到接口原始返回：{raw_reward}")
+            elif event == "checkin_error":
+                _api_log(site, f"[{stage}] 签到接口失败：{_describe_failure(payload)}")
 
-        _api_log(site, f"[{stage}] 调用签到接口...")
-        reward = client.do_checkin("")
-        raw_reward = _brief_payload(getattr(reward, "raw", None))
-        if raw_reward:
-            _api_log(site, f"[{stage}] 签到接口原始返回：{raw_reward}")
-        detail = _api_result_detail(client, stage, status=status, reward=reward)
-        if getattr(reward, "already_done", False):
-            _api_log(site, f"[{stage}] 接口返回今日已签到")
-            return _already_done_result(site, client, stage, status=status, reward=reward)
-        raw = getattr(reward, "raw", None)
-        if isinstance(raw, dict) and raw.get("unsupported_checkin"):
+        result = run_http_flow(
+            site,
+            client,
+            allow_site_hook=False,
+            observer=observe,
+        )
+        if not isinstance(result.detail, dict):
+            result.detail = {} if result.detail is None else {"checkin_detail": result.detail}
+        result.detail.setdefault("api_first", True)
+        result.detail.setdefault("api_stage", stage)
+        if result.detail.get("unsupported_checkin"):
             _api_log(site, f"[{stage}] 站点无可用签到端点，交给浏览器脚本")
             return None
-        # 无签到成立证据时不谎报成功，交给浏览器脚本二次确认。
-        if getattr(reward, "checkin_unconfirmed", False):
-            _api_log(site, f"[{stage}] 接口回 200 但无签到证据，交给浏览器脚本确认")
+        if result.status not in {"success", "already_done"}:
+            _api_log(site, f"[{stage}] HTTP 状态机未完成（{result.status}）：{result.message}")
             return None
-        awarded = getattr(reward, "quota_awarded", None)
-        is_usd = bool(getattr(client, "quota_is_usd", False))
-        if awarded is not None:
-            detail["quota_awarded"] = awarded
-            # 必须带上单位标记：sub2api 的额度本身就是美元，不标记会被汇总层
-            # 再除一次 500000（$0.50 → $0.0000）。
-            detail["quota_is_usd"] = is_usd
-        # 只有确实拿到非零金额才写进消息。站点签到成功但不回具体金额时常给 0，
-        # 直接拼进去会显示「获得额度：$0.0000」——既不是事实（并非奖励 0 元），
-        # 也让用户以为签到出了问题。此外这里以前直接拼原始值、不走 format_usd，
-        # newapi 的内部 quota 会原样输出（如「获得额度：250000」）。
-        if has_awarded_amount(awarded, is_usd=is_usd):
-            text = format_usd(awarded, is_usd=is_usd)
-            _api_log(site, f"[{stage}] 签到成功，获得 {text}")
-            return CheckinResult(site.name, base_url, "success", f"签到成功，获得额度：{text}", detail=detail)
-        _api_log(site, f"[{stage}] 签到成功（站点未返回本次获得额度）")
-        return CheckinResult(
-            site.name, base_url, "success", "签到成功（站点未返回本次获得额度）。", detail=detail,
-        )
+        _api_log(site, f"[{stage}] {result.message}")
+        return _run_http_extras(site, client, result)
 
     # ── 第 0 级：完全没有可用 access_token 时，主动用 refresh_token 换一个 ──
     # 已有 token 的 401 由 Sub2ApiClient 内部最多续期一次；外层不再重复轮换。
@@ -409,6 +342,7 @@ def _try_api_checkin(site: SiteConfig, profile: SiteProfile) -> CheckinResult | 
     # ── 第 1 级：已配置的 access_token（含 refresh_token 纯 HTTP 续期）──
     if token:
         _api_log(site, "尝试纯 API 签到（使用已保存的 access_token）")
+        client: Any = None
         try:
             # 必须用纯 HTTP 客户端：build_lazy_refresh_client 注入的 refresher 会
             # 拉起 Camoufox（实测日志里出现过 "Camoufox 运行模式"），那就违背了
@@ -420,10 +354,9 @@ def _try_api_checkin(site: SiteConfig, profile: SiteProfile) -> CheckinResult | 
             if result is not None:
                 return result
         except ApiError as exc:
-            kind = profile.classify(exc) if hasattr(profile, "classify") else "error"
-            if kind == "already_done":
-                _api_log(site, "接口返回今日已签到")
-                return _run_http_extras(site, client, _already_done_result(site, client, "token"))
+            # 分类能力属于已认证的 ProfileClient，而不是 SiteProfile。构造客户端
+            # 本身失败时还没有 client，只能保守降级，不能引用未绑定变量。
+            kind = client.classify(exc) if client is not None else "error"
             _api_log(site, f"token 阶段未能完成（{kind}）：{_describe_failure(exc)}")
         except Exception as exc:
             _api_log(site, f"token 阶段异常：{type(exc).__name__}: {exc}")
@@ -433,12 +366,11 @@ def _try_api_checkin(site: SiteConfig, profile: SiteProfile) -> CheckinResult | 
         _api_log(site, f"跳过 token 阶段：{_describe_missing_token(site)}")
 
     # ── 第 2 级：纯 HTTP 账密登录换新 token（站点未启 Turnstile 时可行）──
-    login = getattr(profile, "http_password_login", None)
     email, password = _script_credentials(site)
-    if callable(login) and email and password:
+    if isinstance(profile, PasswordLoginCapable) and email and password:
         _api_log(site, "token 不可用，尝试纯 HTTP 账密登录换取新 token")
         try:
-            fresh = login(site, email, password, log=lambda m: _api_log(site, m))
+            fresh = profile.http_password_login(site, email, password, log=lambda m: _api_log(site, m))
         except Exception as exc:
             _api_log(site, f"账密登录异常：{exc}")
             fresh = {}
@@ -447,15 +379,14 @@ def _try_api_checkin(site: SiteConfig, profile: SiteProfile) -> CheckinResult | 
             new_refresh = str((fresh or {}).get("refresh_token") or "").strip()
             # 写入运行期缓存（不动 ACCOUNTS.json），让下次运行可直接复用。
             _persist_tokens(site, new_token, new_refresh, log=lambda m: _api_log(site, m))
-            password_client = build_client(site, AuthInfo(access_token=new_token))
+            password_client: Any = None
             try:
+                password_client = build_client(site, AuthInfo(access_token=new_token))
                 result = _attempt(password_client, "password")
                 if result is not None:
                     return result
             except ApiError as exc:
-                kind = profile.classify(exc) if hasattr(profile, "classify") else "error"
-                if kind == "already_done":
-                    return _run_http_extras(site, password_client, _already_done_result(site, password_client, "password"))
+                kind = password_client.classify(exc) if password_client is not None else "error"
                 _api_log(site, f"账密阶段未能完成（{kind}）：{_describe_failure(exc)}")
             except Exception as exc:
                 _api_log(site, f"账密阶段异常：{exc}")
@@ -624,7 +555,7 @@ def query_action(site: SiteConfig, profile: SiteProfile) -> QueryStatus:
                     status="success",
                 )
         except ApiError as exc:
-            kind = profile.classify(exc) if hasattr(profile, "classify") else "error"
+            kind = client.classify(exc)
             _api_log(site, f"[query:{stage}] 查询失败（{kind}）：{_describe_failure(exc)}")
         except Exception as exc:
             _api_log(site, f"[query:{stage}] 查询异常：{type(exc).__name__}: {exc}")
@@ -634,24 +565,37 @@ def query_action(site: SiteConfig, profile: SiteProfile) -> QueryStatus:
     if not token:
         token = _renew_access_token(site, profile, "查询时无可用 access_token")
     if token:
-        result = _query(build_client(site, AuthInfo(access_token=token)), "token")
-        if result is not None:
-            return result
+        try:
+            token_client = build_client(site, AuthInfo(access_token=token))
+        except ApiError as exc:
+            _api_log(site, f"[query:token] 构造客户端失败：{_describe_failure(exc)}")
+        except Exception as exc:
+            _api_log(site, f"[query:token] 构造客户端异常：{type(exc).__name__}: {exc}")
+        else:
+            result = _query(token_client, "token")
+            if result is not None:
+                return result
 
     # 纯 token/refresh 均不可用时，仍可尝试无 Turnstile 的 HTTP 账密登录；不启动浏览器。
-    login = getattr(profile, "http_password_login", None)
     email, password = _script_credentials(site)
-    if callable(login) and email and password:
+    if isinstance(profile, PasswordLoginCapable) and email and password:
         try:
-            fresh = login(site, email, password, log=lambda m: _api_log(site, m)) or {}
+            fresh = profile.http_password_login(site, email, password, log=lambda m: _api_log(site, m)) or {}
         except Exception as exc:
             _api_log(site, f"查询账密登录异常：{type(exc).__name__}: {exc}")
             fresh = {}
         new_token = normalize_access_token(str(fresh.get("access_token") or ""))
         if new_token:
             _persist_tokens(site, new_token, str(fresh.get("refresh_token") or ""))
-            result = _query(build_client(site, AuthInfo(access_token=new_token)), "password")
-            if result is not None:
-                return result
+            try:
+                password_client = build_client(site, AuthInfo(access_token=new_token))
+            except ApiError as exc:
+                _api_log(site, f"[query:password] 构造客户端失败：{_describe_failure(exc)}")
+            except Exception as exc:
+                _api_log(site, f"[query:password] 构造客户端异常：{type(exc).__name__}: {exc}")
+            else:
+                result = _query(password_client, "password")
+                if result is not None:
+                    return result
 
     return QueryStatus(ok=True, message="browser_script 站点需通过测试签到/定时签到执行脚本", status="success")

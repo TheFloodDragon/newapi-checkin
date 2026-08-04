@@ -19,6 +19,16 @@ def test_runtime_id_is_unique_and_not_persisted() -> None:
     assert a.runtime_id not in core.config_snapshot([a], {})
 
 
+def test_credential_baselines_use_runtime_identity() -> None:
+    row = _row("s", "https://s.invalid", access_token="a.b.c")
+
+    snapshots = core.credential_snapshots([row])
+
+    assert set(snapshots) == {row.runtime_id}
+    assert snapshots[row.runtime_id]["access_token"] == "a.b.c"
+    assert id(row) not in snapshots
+
+
 def test_copy_creates_new_runtime_identity() -> None:
     original = _row("orig", "https://a.invalid")
     clone = original.copy()

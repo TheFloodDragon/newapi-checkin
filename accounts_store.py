@@ -24,10 +24,12 @@ import os
 import tempfile
 import threading
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urlparse
+
+from checkin_core.auth import effective_auth, infer_auth_method
+from checkin_core.enums import ACTION_VALUES, AUTH_METHOD_VALUES, PROFILE_VALUES
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SITES_CONFIG_PATH = SCRIPT_DIR / "sites.json"
@@ -339,18 +341,18 @@ CONFIG_FIELDS = (
 
 # ── 旧 type + checkin_mode → 新 site_profile + auth_method + checkin_action 迁移 ──
 
-KNOWN_PROFILES = ("newapi", "sub2api")
-KNOWN_AUTH_METHODS = ("access_token", "cookie", "browser", "oauth")
-KNOWN_ACTIONS = ("api", "relogin", "visit", "browser_script")
+KNOWN_PROFILES = PROFILE_VALUES
+KNOWN_AUTH_METHODS = AUTH_METHOD_VALUES
+KNOWN_ACTIONS = ACTION_VALUES
 
 
 def _infer_auth_method(checkin_action: str, *, sub2api_browser: bool, has_token: bool) -> str:
-    """按规则推断登录方式：relogin → oauth；浏览器刷新 → browser；有 token → access_token；否则 cookie。"""
-    if checkin_action in {"relogin", "browser_script"}:
-        return "oauth"
-    if sub2api_browser:
-        return "browser"
-    return "access_token" if has_token else "cookie"
+    """兼容入口；认证推断的唯一实现在 checkin_core.auth。"""
+    return infer_auth_method(
+        checkin_action,
+        sub2api_browser=sub2api_browser,
+        has_token=has_token,
+    )
 
 
 def migrate_fields(entry: dict[str, Any]) -> dict[str, Any]:
@@ -424,6 +426,9 @@ def migrate_fields(entry: dict[str, Any]) -> dict[str, Any]:
         out.pop("provider", None)
         out.pop("checkin_mode", None)
         out.pop("mode", None)
+
+    # action 对 auth 的硬约束由共享契约统一应用，避免 GUI 与 CLI 解释不一致。
+    out["auth_method"] = effective_auth(out.get("checkin_action"), out.get("auth_method"))
 
     # 统一：OAuth 登录 / relogin 站点补 oauth_provider + oauth_account
     if out.get("auth_method") == "oauth" or out.get("checkin_action") == "relogin":
@@ -846,7 +851,7 @@ def save_oauth_state(
         provider_accounts[account_key] = {
             "state": str(state or "").strip(),
             "username": username,
-            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "updated_at": time_utils.utc_iso(),
         }
         _write_accounts_with_oauth(path, accounts, oauth)
 

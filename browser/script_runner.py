@@ -11,19 +11,20 @@ import sys
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from types import ModuleType
 from typing import Any
 from urllib.parse import urlparse
 
 from accounts_store import RESULTS_DIR_NAME
+from checkin_core.enums import VALID_RESULT_STATUSES
 
 from . import bypass, popups, script_loader, session, state
+from .script_contract import LoadedSiteScript
 from .script_helpers import ScriptHelpers
 
 CHECKIN_DIR = Path(__file__).resolve().parents[1]
 REPO_ROOT = CHECKIN_DIR
 SCREENSHOT_DIR = CHECKIN_DIR / RESULTS_DIR_NAME / "browser_script"
-VALID_STATUSES = {"success", "already_done", "need_login", "need_verification", "need_config", "network_error", "error"}
+VALID_STATUSES = VALID_RESULT_STATUSES  # 兼容公开名称
 
 
 class BrowserScriptError(Exception):
@@ -116,15 +117,15 @@ def resolve_script_path(script_path: str) -> Path:
         raise BrowserScriptError(str(exc)) from exc
 
 
-def _load_module(script_file: Path) -> ModuleType:
+def _load_module(script_file: Path) -> LoadedSiteScript:
     try:
-        module = script_loader.load_script_module(script_file)
+        hooks = LoadedSiteScript.from_module(script_loader.load_script_module(script_file))
+        hooks.require_browser_run()
     except script_loader.ScriptLoadError as exc:
         raise BrowserScriptError(str(exc)) from exc
-    run_func = getattr(module, "run", None)
-    if not callable(run_func):
-        raise BrowserScriptError("脚本必须定义 async def run(page, context, site, helpers)")
-    return module
+    except TypeError as exc:
+        raise BrowserScriptError(str(exc)) from exc
+    return hooks
 
 
 def _site_view(site: Any, script_path: str, script_args: dict[str, Any] | None, timeout: int) -> ScriptSiteView:
@@ -254,12 +255,12 @@ async def run_browser_script(
         storage_state = {"cookies": [], "origins": []}
 
     try:
-        module = _load_module(script_file)
+        hooks = _load_module(script_file)
     except BrowserScriptError as exc:
         return BrowserScriptResult("need_config", str(exc), {"checkin_source": "browser_script", "script": str(script_file.relative_to(REPO_ROOT)).replace("\\", "/")})
     except Exception as exc:
         return BrowserScriptResult("error", f"加载浏览器脚本异常：{exc}", {"checkin_source": "browser_script", "script": str(script_file.relative_to(REPO_ROOT)).replace("\\", "/")})
-    run_func = getattr(module, "run")
+    run_func = hooks.require_browser_run()
     site_view = _site_view(site, str(script_file.relative_to(REPO_ROOT)).replace("\\", "/"), script_args, timeout)
 
     log = _make_log(site_view.name)

@@ -22,6 +22,14 @@ run_checkin 流程：
 
 from __future__ import annotations
 
+from checkin_core.enums import (
+    ACTION_VALUES,
+    AUTH_METHOD_VALUES,
+    AuthMethod,
+    CheckinAction,
+    parse_enum,
+)
+
 from . import actions
 from .base import CheckinResult, QueryStatus, SiteConfig
 from .profiles import (
@@ -31,20 +39,19 @@ from .profiles import (
     normalize_profile,
 )
 
-# 登录方式 / 签到方式的合法值（供 GUI / CLI / 配置层共享）
-AUTH_METHODS = ("access_token", "cookie", "browser", "oauth")
-DEFAULT_AUTH_METHOD = "cookie"
-CHECKIN_ACTIONS = actions.KNOWN_ACTIONS
-DEFAULT_CHECKIN_ACTION = actions.DEFAULT_ACTION
+# 登录方式 / 签到方式的合法值来自 checkin_core 的唯一枚举契约。
+AUTH_METHODS = AUTH_METHOD_VALUES
+DEFAULT_AUTH_METHOD = AuthMethod.COOKIE.value
+CHECKIN_ACTIONS = ACTION_VALUES
+DEFAULT_CHECKIN_ACTION = CheckinAction.API.value
 
 
 def normalize_auth_method(value: str | None) -> str:
-    key = (value or DEFAULT_AUTH_METHOD).strip().lower()
-    return key if key in AUTH_METHODS else DEFAULT_AUTH_METHOD
+    return parse_enum(AuthMethod, value, AuthMethod.COOKIE).value
 
 
 def normalize_action(value: str | None) -> str:
-    return actions.normalize_action(value)
+    return parse_enum(CheckinAction, value, CheckinAction.API).value
 
 
 def run_checkin(site: SiteConfig, turnstile: str = "") -> CheckinResult:

@@ -20,6 +20,8 @@ from pathlib import Path
 from types import ModuleType
 from urllib.parse import urlparse
 
+from .script_contract import LoadedSiteScript
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -78,15 +80,22 @@ def load_script_module(script_file: Path) -> ModuleType:
 
 
 def load_site_script(script_path: str) -> ModuleType:
-    """校验路径并加载站点脚本模块。"""
+    """兼容入口：校验路径并加载原始站点脚本模块。"""
     return load_script_module(resolve_script_path(script_path))
+
+
+def load_script_hooks(script_path: str) -> LoadedSiteScript:
+    """加载并一次性解析受支持的 typed hooks，调用方无需再散落 getattr。"""
+    return LoadedSiteScript.from_module(load_site_script(script_path))
 
 
 __all__ = [
     "REPO_ROOT",
     "ScriptLoadError",
+    "LoadedSiteScript",
     "load_script_module",
     "load_site_script",
+    "load_script_hooks",
     "relative_script_path",
     "resolve_script_path",
 ]

@@ -13,7 +13,7 @@ browser / oauth 每次 action 最多刷新一次；刷新后的 HTTP 请求不�
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from ..base import (
     QUOTA_UNIT,
@@ -28,6 +28,7 @@ from ..base import (
     StatusInfo,
     format_usd,
     has_awarded_amount,
+    normalize_base_url,
 )
 from ._common import build_http_client, credentials_ready
 
@@ -55,15 +56,26 @@ def _need_login_message(site: SiteConfig) -> str:
 
 
 def _build_detail(client: ProfileClient, reward: CheckinReward) -> dict[str, Any]:
-    detail: dict[str, Any] = {"checkin_source": "api", "quota_is_usd": client.quota_is_usd}
-    detail.update(reward.extra)
-    if reward.quota_awarded is not None:
-        detail["quota_awarded"] = reward.quota_awarded
-    if reward.current_quota is not None:
-        detail["current_quota"] = reward.current_quota
-    if isinstance(reward.raw, dict):
+    """把 reward 摊平成 detail。
+
+    reward 的附加字段一律按「可缺失」处理：站点脚本的 do_checkin 钩子（见
+    _script_checkin）由用户维护，只保证给出签到结论，不保证填满 CheckinReward
+    的每个可选字段。硬取属性会让一次缺字段变成整站签到异常。
+    """
+    detail: dict[str, Any] = {"checkin_source": "api", "quota_is_usd": getattr(client, "quota_is_usd", False)}
+    extra = getattr(reward, "extra", None)
+    if isinstance(extra, dict):
+        detail.update(extra)
+    awarded = getattr(reward, "quota_awarded", None)
+    if awarded is not None:
+        detail["quota_awarded"] = awarded
+    current = getattr(reward, "current_quota", None)
+    if current is not None:
+        detail["current_quota"] = current
+    raw = getattr(reward, "raw", None)
+    if isinstance(raw, dict):
         # 保留原始字段（如 checked_in_today），便于聚合层识别
-        for key, value in reward.raw.items():
+        for key, value in raw.items():
             detail.setdefault(key, value)
     return detail
 
@@ -149,23 +161,40 @@ def _script_checkin(site: SiteConfig, client: ProfileClient, turnstile: str) -> 
     try:
         from browser import script_loader
 
-        module = script_loader.load_site_script(script_path)
+        hooks = script_loader.load_script_hooks(script_path)
     except Exception as exc:  # noqa: BLE001
         _script_log(site, f"加载站点脚本失败，改用默认签到流程：{type(exc).__name__}: {exc}")
         return None
-    runner = getattr(module, "do_checkin", None)
-    if not callable(runner):
+    if hooks.do_checkin is None:
         return None
-    reward = runner(client, log=lambda message: _script_log(site, message))
+    reward = hooks.do_checkin(client, log=lambda message: _script_log(site, message))
     return reward if isinstance(reward, CheckinReward) else None
 
 
-def _checkin_once(site: SiteConfig, client: ProfileClient, turnstile: str) -> CheckinResult:
-    base_url = client.base_url
+def run_http_flow(
+    site: SiteConfig,
+    client: ProfileClient,
+    turnstile: str = "",
+    *,
+    allow_site_hook: bool = True,
+    observer: Callable[[str, Any], None] | None = None,
+) -> CheckinResult:
+    """执行唯一的 HTTP 签到状态机；供 api 与 browser_script API-first 复用。
+
+    结果里的 base_url 以站点配置为准（client 的 base_url 仅作补充）：两条链路都按
+    站点身份汇总结果，而 profile 客户端不保证暴露该属性。
+    """
+    base_url = normalize_base_url(site.base_url) or str(getattr(client, "base_url", "") or "")
+
+    def notify(event: str, payload: Any = None) -> None:
+        if observer is not None:
+            observer(event, payload)
     # 1) 读签到状态
     try:
         status = client.fetch_status()
+        notify("status", status)
     except ApiError as exc:
+        notify("status_error", exc)
         if exc.transient:
             return CheckinResult(
                 site.name,
@@ -185,17 +214,24 @@ def _checkin_once(site: SiteConfig, client: ProfileClient, turnstile: str) -> Ch
         status = StatusInfo()
 
     # 2) 今日已签到
-    if status.checked_in_today:
-        detail: dict[str, Any] = {"checkin_source": "api", "quota_is_usd": client.quota_is_usd}
-        if status.quota_usd is not None:
-            detail["current_quota"] = status.quota_usd
+    # 状态对象按 StatusInfo 契约读取，但用 getattr 兜底：站点脚本与 profile 可返回
+    # 只带部分字段的等价对象，缺字段应当按「未知」处理，而不是抛 AttributeError
+    # 把一次可完成的签到变成 error。
+    status_quota = getattr(status, "quota_usd", None)
+    if getattr(status, "checked_in_today", None):
+        detail: dict[str, Any] = {
+            "checkin_source": "api",
+            "quota_is_usd": bool(getattr(client, "quota_is_usd", False)),
+        }
+        if status_quota is not None:
+            detail["current_quota"] = status_quota
             detail["quota_is_usd"] = True
         result = CheckinResult(site.name, base_url, "already_done", "今日已签到。", detail=detail)
         _inject_current_quota(client, detail)
         return result
 
     # 3) 需要人机验证（Cloudflare Turnstile 或图形验证码）但未提供
-    if status.turnstile_required and not turnstile:
+    if getattr(status, "turnstile_required", False) and not turnstile:
         return CheckinResult(
             site.name, base_url, "need_verification",
             "签到需要人机验证（Cloudflare Turnstile 或图形验证码），纯 HTTP 无法自动识别，"
@@ -209,11 +245,15 @@ def _checkin_once(site: SiteConfig, client: ProfileClient, turnstile: str) -> Ch
     # 余额时直接复用，省一次请求。
     quota_before = status.quota_usd if status.quota_usd is not None else _read_quota(client)
     try:
+        notify("checkin_start")
         # 站点脚本优先：它可能实现了该 fork 私改的签到流程（如图形验证码）。
-        reward = _script_checkin(site, client, turnstile)
+        # browser_script 的 API-first 调用关闭此 hook，避免把同一浏览器脚本误当 HTTP hook。
+        reward = _script_checkin(site, client, turnstile) if allow_site_hook else None
         if reward is None:
             reward = client.do_checkin(turnstile)
+        notify("reward", reward)
     except ApiError as exc:
+        notify("checkin_error", exc)
         if exc.transient:
             return CheckinResult(
                 site.name,
@@ -287,7 +327,7 @@ def run_action(site: SiteConfig, profile: SiteProfile, turnstile: str = "") -> C
         client = build_http_client(site, profile)
     except BrowserAuthError as exc:
         return CheckinResult(site.name, site.base_url, exc.status, exc.message, detail=exc.detail)
-    return _checkin_once(site, client, turnstile)
+    return run_http_flow(site, client, turnstile)
 
 
 def query_action(site: SiteConfig, profile: SiteProfile) -> QueryStatus:

@@ -1,5 +1,20 @@
 # 代码优化分析报告
 
+> 状态：下文保留为 2026-07-27 的历史基线；其中行号和“待实施”描述不再代表当前代码。
+
+## 当前实施结果（2026-07-30）
+
+- 正确性与安全边界：修复 worker 凭据环境继承、旧配置迁移残留、认证方式投影、跨 origin token、同站多账号状态键、GUI 事务式重载等问题，并补回归测试。
+- 统一契约：`checkin_core/` 集中状态枚举、认证约束、worker 事件和批量分组；provider/action/profile 不再各自维护有限值与结果语义。
+- 模块边界：Sub2API 协议、浏览器 runtime/WAF/OAuth/消息/storage scope、GUI config/status storage 已拆出；`browser/session.py` 从约 2490 行降至约 1100 行。
+- 生命周期与 I/O：浏览器资源采用幂等统一清理；GUI 配置和状态改为单线程后台写盘，正常退出不再调用 `os._exit`；状态缓存支持跨日自动换日和多 GUI 实例按时间合并。
+- 调度与脚本：CLI、总调度器和 GUI 统一“同站串行、站间并发”的分组语义；100xLabs/极速蹬复用同一 Sub2API browser-script 主流程。
+- 质量门：新增无 Secrets 的 Linux/Windows CI，执行锁文件检查、ruff、compileall、GUI 导入 smoke 和 pytest；本地最终验收为 **598 passed / 5 skipped**。
+
+尚未作为本轮阻断项处理：历史代码的全仓 `ruff format` 基线、真实 OCR 样本缺失导致的 5 个 skip，以及 CI/Secret 缓存与代理供应链的进一步加固。
+
+---
+
 > 分析基准：master @ 2449cec（2026-07-27）。行号以该版本为准。
 
 ## 一、代码全景

@@ -22,6 +22,13 @@ def _load_script() -> Any:
 SCRIPT = _load_script()
 
 
+def test_boolean_option_uses_default_for_null() -> None:
+    assert SCRIPT.common._as_bool(None, True) is True
+    assert SCRIPT.common._as_bool(None, False) is False
+    assert SCRIPT.common._as_bool("false", True) is False
+    assert SCRIPT.common._as_bool("yes", False) is True
+
+
 class FakeElement:
     def __init__(
         self,

@@ -29,6 +29,7 @@ _SENSITIVE_KEYS = {
     "access_token",
     "authorization",
     "browser_state",
+    "browser_state_text",
     "cookie",
     "oauth_state",
     "password",
@@ -52,6 +53,7 @@ _SENSITIVE_SUFFIXES = (
     "credential",
     "credentials",
     "cookie",
+    "state",
 )
 # 出现在任意位置即视为敏感（cookie 常以 site_cookie / cookies 形式出现）。
 _SENSITIVE_CONTAINS = ("cookie",)

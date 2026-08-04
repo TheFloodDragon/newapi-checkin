@@ -8,7 +8,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import time_utils
-from gui import core
+from gui import config_store, core
 
 
 def _mk_states(provider: str = "linuxdo", account: str = "default", state: str = "abc123") -> dict:
@@ -248,6 +248,53 @@ def test_parse_clipboard_site_variants() -> None:
     assert err
 
 
+def test_merge_clipboard_site_consumes_collector_three_dimensions() -> None:
+    original = core.SiteRow(
+        name="old",
+        base_url="https://old.invalid",
+        type="newapi",
+        auth_method="cookie",
+        checkin_action="api",
+        runtime_id="stable-row",
+        referer_path="/custom",
+    )
+    collector_data = {
+        "name": "Sub2 channel",
+        "base_url": "https://sub.invalid/",
+        "site_profile": "sub2api",
+        "auth_method": "oauth",
+        "checkin_action": "browser_script",
+        "oauth_provider": "github",
+        "oauth_account": "work",
+        "script": "scripts/checkin/100xlabs.py",
+        "access_token": "a.b.c",
+        "refresh_token": "refresh",
+        "enabled": False,
+    }
+
+    merged = core.merge_clipboard_site(original, collector_data)
+
+    assert merged.runtime_id == "stable-row"
+    assert merged.type == "sub2api"
+    assert merged.auth_method == "oauth"
+    assert merged.checkin_action == "browser_script"
+    assert merged.oauth_provider == "github"
+    assert merged.oauth_account == "work"
+    assert merged.access_token == "a.b.c"
+    assert merged.refresh_token == "refresh"
+    assert merged.enabled is False
+    assert merged.referer_path == "/custom"  # 未导入字段保持原值
+
+
+def test_merge_clipboard_site_accepts_legacy_type_field() -> None:
+    original = core.SiteRow(name="old", base_url="https://old.invalid")
+
+    merged = core.merge_clipboard_site(original, {"type": "sub2api", "access_token": "a.b.c"})
+
+    assert merged.type == "sub2api"
+    assert merged.access_token == "a.b.c"
+
+
 def test_format_usd_and_detail_quota() -> None:
     assert core.format_usd(246.1) == "$246.10"
     assert core.format_usd(0.004) == "$0.0040"
@@ -419,6 +466,92 @@ def test_status_store_apply_checkin_extracts_detail_quota(tmp_path: Path) -> Non
     assert entry["quota_usd"] == 2.0 and entry["checked_in"] is True
     entry = store.apply_checkin("k", {"status": "need_verification", "message": "ts"})
     assert entry["checked_in"] is None and entry["last_quota_usd"] == 2.0
+
+
+def test_status_store_can_defer_writes_for_gui_queue(tmp_path: Path) -> None:
+    store = core.StatusStore(results_dir=tmp_path, autosave=False)
+
+    store.apply_query("k", {"ok": True, "quota_usd": 3.0, "status": "success"})
+
+    path = tmp_path / "gui_status_cache.json"
+    assert not path.exists()
+    core.StatusStore.write_payload(tmp_path, store.snapshot_payload())
+    assert json.loads(path.read_text(encoding="utf-8"))["entries"]["k"]["quota_usd"] == 3.0
+
+
+def test_status_store_merges_concurrent_gui_snapshots(tmp_path: Path) -> None:
+    today = time_utils.business_date()
+    now = time_utils.utc_now()
+
+    def entry(quota: float, minutes: int) -> dict:
+        return {
+            "quota_usd": quota,
+            "last_quota_usd": quota,
+            "checked_in": True,
+            "ok": True,
+            "status": "success",
+            "message": "",
+            "saved_at": time_utils.utc_iso(now + timedelta(minutes=minutes)),
+            "business_date": today,
+        }
+
+    core.StatusStore.write_payload(
+        tmp_path,
+        {"business_date": today, "entries": {"shared": entry(9.0, 5), "first": entry(1.0, 0)}},
+    )
+    # 第二个 GUI 带着陈旧 shared 快照写盘时，不得覆盖第一个 GUI 的更新。
+    core.StatusStore.write_payload(
+        tmp_path,
+        {"business_date": today, "entries": {"shared": entry(2.0, -5), "second": entry(2.0, 1)}},
+    )
+
+    entries = json.loads((tmp_path / "gui_status_cache.json").read_text(encoding="utf-8"))["entries"]
+    assert entries["shared"]["quota_usd"] == 9.0
+    assert {"first", "second"} <= entries.keys()
+
+
+def test_status_store_rolls_over_while_gui_stays_open(tmp_path: Path, monkeypatch) -> None:
+    day = {"value": "2099-01-01"}
+    monkeypatch.setattr(time_utils, "business_date", lambda: day["value"])
+    store = core.StatusStore(results_dir=tmp_path, autosave=False)
+    store.apply_query("old", {"ok": True, "quota_usd": 1.0, "status": "success"})
+
+    day["value"] = "2099-01-02"
+
+    assert store.get("old") is None
+    assert store.today == "2099-01-02"
+
+
+def test_config_save_request_freezes_mutable_gui_state(monkeypatch) -> None:
+    row = core.SiteRow(name="before", base_url="https://site.invalid", access_token="old-token")
+    oauth_states = _mk_states(state="old-state")
+    previous = core.credential_snapshots([row])
+    request = config_store.build_save_request([row], oauth_states, previous)
+
+    row.name = "after"
+    row.access_token = "new-token"
+    oauth_states["linuxdo"]["accounts"]["default"]["state"] = "new-state"
+
+    assert request.accounts[0]["name"] == "before"
+    assert request.accounts[0]["access_token"] == "old-token"
+    assert request.oauth_states["linuxdo"]["accounts"]["default"]["state"] == "old-state"
+    assert request.rows[0].runtime_id == row.runtime_id
+
+    calls: dict[str, object] = {}
+    monkeypatch.setattr(
+        config_store.accounts_store,
+        "save_accounts",
+        lambda accounts, oauth_states: calls.update(accounts=accounts, oauth_states=oauth_states),
+    )
+    monkeypatch.setattr(
+        config_store.core,
+        "apply_credential_cache_changes",
+        lambda rows, saved: calls.update(rows=rows, saved=saved) or 2,
+    )
+
+    assert request.persist() == 2
+    assert calls["accounts"] == request.accounts
+    assert calls["saved"] == previous
 
 
 def test_summarize(tmp_path: Path) -> None:

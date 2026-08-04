@@ -9,6 +9,8 @@ profile 只负责「接口长什么样」：路径 / 请求头 / 响应解析 / 
 
 from __future__ import annotations
 
+from checkin_core.enums import PROFILE_VALUES, SiteProfileName, parse_enum
+
 from ..base import SiteProfile
 from .newapi import NewApiProfile
 from .sub2api import Sub2ApiProfile
@@ -18,13 +20,13 @@ _PROFILES: dict[str, SiteProfile] = {
     "sub2api": Sub2ApiProfile(),
 }
 
-KNOWN_PROFILES = set(_PROFILES)
-DEFAULT_PROFILE = "newapi"
+KNOWN_PROFILES = set(PROFILE_VALUES)
+DEFAULT_PROFILE = SiteProfileName.NEWAPI.value
+assert set(_PROFILES) == KNOWN_PROFILES
 
 
 def normalize_profile(value: str | None) -> str:
-    key = (value or DEFAULT_PROFILE).strip().lower()
-    return key if key in KNOWN_PROFILES else DEFAULT_PROFILE
+    return parse_enum(SiteProfileName, value, SiteProfileName.NEWAPI).value
 
 
 def get_profile(value: str | None) -> SiteProfile:

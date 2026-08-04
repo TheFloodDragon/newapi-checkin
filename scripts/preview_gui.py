@@ -19,6 +19,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
 import accounts_store  # noqa: E402
+import time_utils  # noqa: E402
 
 # ── 演示数据（写入临时目录并劫持 store 路径）─────────────────────────────────
 tmp = Path(tempfile.mkdtemp(prefix="gui-demo-"))
@@ -81,7 +82,8 @@ demo = {
 (tmp / accounts_store.RESULTS_DIR_NAME / "checkin_result.json").write_text(
     json.dumps(
         {
-            "generated_at": "2026-07-27T08:00:00",
+            "generated_at": time_utils.utc_iso(),
+            "business_date": time_utils.business_date(),
             "results": [
                 {"site": "AnyRouter", "base_url": "https://anyrouter.top", "status": "success", "current_quota": "$246.1"},
                 {"site": "示例中转站 A", "base_url": "https://relay-a.example.com", "status": "success", "current_quota": "$12.5"},
@@ -97,9 +99,15 @@ demo = {
 accounts_store.SCRIPT_DIR = tmp
 accounts_store.ACCOUNTS_PATH = tmp / "ACCOUNTS.json"
 accounts_store.SITES_CONFIG_PATH = tmp / "sites.json"
+accounts_store.RESULTS_DIR = tmp / accounts_store.RESULTS_DIR_NAME
 
+from PySide6.QtCore import QSettings  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
+
+# QSettings 默认在 Windows 写注册表；预览必须使用临时 INI，不能改真实主题/几何偏好。
+QSettings.setDefaultFormat(QSettings.IniFormat)
+QSettings.setPath(QSettings.IniFormat, QSettings.UserScope, str(tmp / "settings"))
 
 from gui import theme  # noqa: E402
 from gui.app import App  # noqa: E402
@@ -108,7 +116,7 @@ theme.save_theme("dark")
 theme.save_pref("log_visible", True)
 
 app = QApplication(sys.argv)
-win = App()
+win = App(results_dir=accounts_store.RESULTS_DIR)
 win.resize(1280, 840)
 win.show()
 QTest.qWait(300)

@@ -115,6 +115,11 @@ ANSWERS: dict[str, str] = {
     "幂等键（Idempotency-Key）的主要作用是": "防止重试造成重复扣费或重复创建",
     "在生产环境中处理超时，推荐做法是": "设置超时并做有限重试",
     "提示词前缀缓存（Prompt Cache）的主要收益是": "提高重复上下文请求的速度并降低成本",
+    "运营判断题库质量最应该看什么": "参与率、正确率、复玩率和转化率",
+    "管理员清理无效赠送余额前应先做什么": "筛选目标用户并预览影响",
+    "HTTP 429 通常表示什么": "请求过于频繁或触发限流",
+    "上下文长度指的是什么": "模型一次可处理的输入输出窗口",
+    "对多语言题库最稳妥的实现方式是": "后端按语言返回对应题目",
 }
 
 # 相似度阈值。实测本题库：同一题的各种变体最低 0.867，而**不同题之间**最高只有
@@ -513,84 +518,5 @@ async def _attach_quiz(page: Any, helpers: Any, result: dict[str, Any]) -> dict[
 
 
 async def _checkin(page: Any, context: Any, site: Any, helpers: Any) -> dict[str, Any]:
-    """恢复登录态后执行极速蹬每日签到。"""
-    opts = common.parse_options(SPEC, getattr(site, "script_args", {}))
-    start_target = opts.start_target or SPEC.default_start_path
-    resolved_url = helpers.resolve_url(start_target)
-    origin = helpers.resolve_url("/").rstrip("/")
-    login_detail: dict[str, Any] = {}
-
-    async def do_login() -> dict[str, Any] | None:
-        return await common.login_with_password(
-            page,
-            context,
-            helpers,
-            SPEC,
-            opts,
-            resolved_url=resolved_url,
-            origin=origin,
-            login_detail=login_detail,
-        )
-
-    # 无限跳转根因修复（实测定位）：token 已过期但 localStorage 里 auth_user 残留时，
-    # /dashboard 守卫判「未登录」踢去 /login，/login 守卫判「已登录」（auth_user 在）
-    # 又踢回 /dashboard，两个路由守卫互踢形成无限跳转，且跳转期间页面执行上下文
-    # 反复销毁、脚本 evaluate 全部失效。对策：导航前注入 init script，在
-    # document_start 检查 token_expires_at，已过期则清掉全部 auth 键，让登录态一致
-    # 地落为「已登出」，页面干净停在 /login，再交给账密登录兜底。
-    await common.add_init_script(context, common.preflight_init_script())
-
-    await common.navigate_and_settle(page, helpers, start_target, opts)
-
-    # 登录闸门：只以页面是否真正落在 /login 为判据。不能主动用 localStorage 的
-    # auth_token 探测 /auth/me——SPA 加载时会用 refresh_token 换出只存在内存的新
-    # token，localStorage 里的旧 token 已被服务端失效，主动探测必得 401，会把
-    # 「已正常登录」误判为未登录并触发不必要的账密兜底。
-    login_attempted = False
-    if await common.on_login_page(page):
-        login_attempted = True
-        login_result = await do_login()
-        if login_result is not None:
-            return login_result
-        await common.navigate_and_settle(page, helpers, start_target, opts)
-        if await common.on_login_page(page):
-            return helpers.need_login(
-                "极速蹬登录后仍停留在登录页，请检查凭据或稍后重试",
-                {"target_url": resolved_url, "login_fallback": "redirect_failed", **login_detail},
-            )
-
-    # 登录闸门已通过。把当前 storage_state 写入运行期缓存，让滚动续期后的
-    # refresh_token 在下次运行继续复用，而不改写用户账号配置。
-    await common.persist_state(context, site)
-
-    # SPA 的签到按钮要等前端拉完签到数据才渲染；轮询等待已签到状态或可点按钮。
-    control, early_result = await common.wait_for_checkin_control(
-        page, helpers, SPEC, opts, resolved_url=resolved_url, login_detail=login_detail
-    )
-    if early_result is not None:
-        return early_result
-
-    if control is None:
-        # 登录态有效但 SPA 未渲染签到按钮（控制台常跳 /dashboard，/check-in 主区
-        # 异步渲染滞后）。用已登录的 auth_token 直接调签到接口兜底，避免把
-        # 「页面没渲染」误报成需要人工签到。
-        return await common.api_fallback(
-            page,
-            helpers,
-            SPEC,
-            opts,
-            origin=origin,
-            resolved_url=resolved_url,
-            login_attempted=login_attempted,
-            do_login=do_login,
-        )
-
-    return await common.click_and_confirm(
-        page,
-        helpers,
-        SPEC,
-        opts,
-        control,
-        resolved_url=resolved_url,
-        extra_detail=login_detail,
-    )
+    """执行极速蹬签到；站点专属答题仍由本文件的 run() 追加。"""
+    return await common.run_checkin_flow(page, context, site, helpers, SPEC)

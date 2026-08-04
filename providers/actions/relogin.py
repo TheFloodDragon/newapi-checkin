@@ -96,9 +96,7 @@ def run_action(site: SiteConfig, profile: SiteProfile, turnstile: str = "") -> C
             )
         )
     except browser_session.BrowserSessionError as exc:
-        msg = str(exc)
-        status = "error" if "camoufox" in msg.lower() else "need_login"
-        return CheckinResult(site.name, base_url, status, msg)
+        return CheckinResult(site.name, base_url, exc.status, str(exc), detail=exc.detail)
     except Exception as exc:
         return CheckinResult(site.name, base_url, "error", f"浏览器自动 OAuth 异常：{exc}")
 
@@ -175,9 +173,7 @@ def query_action(site: SiteConfig, profile: SiteProfile) -> QueryStatus:
             )
         )
     except browser_session.BrowserSessionError as exc:
-        msg = str(exc)
-        status = "error" if "camoufox" in msg.lower() or "加载" in msg else "need_login"
-        return QueryStatus(ok=False, message=msg, status=status)
+        return QueryStatus(ok=False, message=str(exc), status=exc.status, detail=exc.detail)
     except Exception as exc:
         return QueryStatus(ok=False, message=f"查询异常：{exc}", status="error")
 

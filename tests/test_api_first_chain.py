@@ -47,6 +47,15 @@ class FakeClient:
         self.checkin_calls += 1
         return self._reward
 
+    def classify(self, error: ApiError) -> str:
+        if error.status == 401:
+            return "need_login"
+        if "already" in error.message.lower() or "已签到" in error.message:
+            return "already_done"
+        if "captcha" in error.message.lower() or "验证" in error.message:
+            return "need_verification"
+        return "error"
+
 
 class FakeProfile:
     """按 token 值分发客户端，模拟「旧 token 失效、新 token 可用」。"""
@@ -71,11 +80,6 @@ class FakeProfile:
         # 第 1 级必须是纯 HTTP：若被调用说明会拉起浏览器，属实现回退。
         self.lazy_calls += 1
         return None
-
-    def classify(self, error: ApiError) -> str:
-        if error.status == 401:
-            return "need_login"
-        return "error"
 
     def refresh_token_via_http(self, site, log=None):
         self.refresh_calls += 1
@@ -123,6 +127,29 @@ def test_stage1_token_already_checked_in_returns_without_login(monkeypatch) -> N
     assert result.detail["quota_is_usd"] is True
     assert profile.login_calls == 0
     assert client.checkin_calls == 0
+
+
+def test_status_error_classification_comes_from_client() -> None:
+    client = FakeClient(status_error=ApiError(409, {"code": "already_done"}, "already checked in"))
+    profile = FakeProfile({"old": client})
+
+    result = browser_script._try_api_checkin(_site(), profile)
+
+    assert result is not None and result.status == "already_done"
+    assert client.checkin_calls == 0
+    assert not hasattr(profile, "classify")
+
+
+def test_build_client_api_error_degrades_without_unbound_client(capsys) -> None:
+    class BrokenProfile(FakeProfile):
+        def build_client(self, site: SiteConfig, auth: Any) -> FakeClient:
+            raise ApiError(503, {"reason": "startup"}, "client build failed", transient=True)
+
+    result = browser_script._try_api_checkin(_site(), BrokenProfile({}))
+
+    assert result is None
+    err = capsys.readouterr().err
+    assert "token 阶段未能完成" in err
 
 
 def test_stage1_does_not_use_browser_lazy_client(monkeypatch) -> None:

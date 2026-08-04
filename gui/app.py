@@ -12,9 +12,8 @@
 from __future__ import annotations
 
 import json
-import os
 import sys
-from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
@@ -40,12 +39,14 @@ from PySide6.QtWidgets import (
 )
 
 import accounts_store
+import time_utils
+from checkin_core.batch import serial_groups
 from mask_utils import mask_secrets
 
-from . import core, theme
+from . import config_store, core, theme
 from . import widgets as w
 from .dialogs import TypeDialog
-from .workers import BrowserWorker, TaskRunner
+from .workers import BrowserWorker, StorageRunner, TaskRunner
 
 
 class _LogBridge(QObject):
@@ -62,7 +63,7 @@ def _button(text: str, kind: str = "ghost") -> QPushButton:
 
 
 class App(QMainWindow):
-    def __init__(self):
+    def __init__(self, *, results_dir: Path | None = None):
         super().__init__()
         self.rows: list[core.SiteRow] = []
         self.oauth_states: dict[str, dict[str, Any]] = {}
@@ -71,18 +72,21 @@ class App(QMainWindow):
         self._lock = False
         self._dirty = False
         self._saved_snapshot = ""
-        # 当前 GUI 会话内上次成功保存的凭据基线（按 SiteRow 对象 id 关联）。
-        # 用它区分真正的 token/state 编辑与普通配置保存，避免无关保存误删缓存。
-        self._saved_credentials: dict[int, dict[str, str]] = {}
+        # 当前 GUI 会话内上次成功保存的凭据基线（按 SiteRow.runtime_id 关联）。
+        # 稳定身份避免删除行后 CPython 复用对象 id，导致新行误继承旧凭据基线。
+        self._saved_credentials: dict[str, dict[str, str]] = {}
         self._type_buttons: dict[str, QPushButton] = {}
         self._worker: BrowserWorker | None = None
         self._capture_dialog: QMessageBox | None = None
         self._leases = core.TaskLeaseRegistry()
         self._batch_active = 0
+        self._save_inflight = False
+        self._config_load_failed = False
 
-        self.store = core.StatusStore()
+        self.store = core.StatusStore(results_dir=results_dir, autosave=False)
         self.store.load()
         self.runner = TaskRunner(self, max_threads=5)
+        self.storage = StorageRunner(self)
 
         self._theme = theme.load_theme()
         w.set_theme(self._theme)
@@ -91,6 +95,9 @@ class App(QMainWindow):
         self._dirty_timer = QTimer(self)
         self._dirty_timer.setSingleShot(True)
         self._dirty_timer.timeout.connect(self._compute_dirty)
+        self._status_save_timer = QTimer(self)
+        self._status_save_timer.setSingleShot(True)
+        self._status_save_timer.timeout.connect(self._persist_status_async)
 
         self._log_bridge = _LogBridge(self)
         core.add_log_sink(self._log_bridge.line.emit)
@@ -396,9 +403,9 @@ class App(QMainWindow):
         export_btn.clicked.connect(self._export)
         layout.addWidget(export_btn)
 
-        save_btn = _button("保存全部", "primary")
-        save_btn.clicked.connect(self._save)
-        layout.addWidget(save_btn)
+        self.save_btn = _button("保存全部", "primary")
+        self.save_btn.clicked.connect(self._save)
+        layout.addWidget(self.save_btn)
         return foot
 
     def _toggle_log(self) -> None:
@@ -739,13 +746,34 @@ class App(QMainWindow):
 
     # ── 数据装载 / 列表 ──
     def _reload(self) -> None:
+        if self.cur is not None:
+            self._flush()
+        if self._dirty_timer.isActive():
+            self._dirty_timer.stop()
+            self._compute_dirty()
+        if self._dirty:
+            answer = QMessageBox.question(
+                self,
+                "放弃未保存更改？",
+                "重新加载会放弃当前未保存的更改，确定继续吗？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+
         try:
-            self.rows = core.load_rows()
-            self.oauth_states = accounts_store.load_oauth_states()
+            loaded = config_store.load_configuration()
         except Exception as exc:
-            QMessageBox.critical(self, "错误", str(exc))
-            self.rows = []
-            self.oauth_states = {}
+            # 事务式失败：保留当前 rows / oauth_states / 保存基线，绝不清空后再标成已保存。
+            self._config_load_failed = True
+            QMessageBox.critical(self, "重新加载失败", mask_secrets(str(exc)))
+            self._say("重新加载失败，已保留当前内存配置；修复文件并成功重载前不会写盘")
+            return
+
+        self._config_load_failed = False
+        self.rows = loaded.rows
+        self.oauth_states = loaded.oauth_states
         self.store.load()
         self.cur = None
         self.search_edit.clear()
@@ -1298,7 +1326,7 @@ class App(QMainWindow):
                 self._update_summary(self.rows[idx])
 
     def _task_params_for_row(self, row: core.SiteRow) -> dict[str, Any]:
-        explicit = core.changed_credential_fields(row, self._saved_credentials.get(id(row)))
+        explicit = core.changed_credential_fields(row, self._saved_credentials.get(row.runtime_id))
         return core.task_params(
             row,
             self.oauth_states,
@@ -1331,6 +1359,7 @@ class App(QMainWindow):
         def on_done(result: dict[str, Any]) -> None:
             try:
                 entry = self.store.apply_query(key, result)
+                self._schedule_status_save()
                 current_idx = self._row_index(row_id)
                 if current_idx is not None:
                     self._refresh_row(current_idx)
@@ -1363,6 +1392,7 @@ class App(QMainWindow):
         def on_done(result: dict[str, Any]) -> None:
             try:
                 self.store.apply_checkin(key, result)
+                self._schedule_status_save()
                 current_idx = self._row_index(row_id)
                 if current_idx is not None:
                     self._refresh_row(current_idx)
@@ -1397,6 +1427,7 @@ class App(QMainWindow):
         def on_done(result: dict[str, Any]) -> None:
             try:
                 self.store.apply_checkin(key, result)
+                self._schedule_status_save()
                 current_idx = self._row_index(row_id)
                 if current_idx is not None:
                     self._refresh_row(current_idx)
@@ -1433,31 +1464,39 @@ class App(QMainWindow):
         """
         if self.cur is not None:
             self._flush()
-        groups: dict[str, list[core.TaskSnapshot]] = {}
+        snapshots: list[core.TaskSnapshot] = []
+        skipped_invalid = 0
         for row in self.rows:
             if not row.enabled:
                 continue
-            group_key = core.StatusStore.site_group_key(row)
-            if not group_key:
+            if not accounts_store.normalize_base_url(row.base_url):
+                skipped_invalid += 1
                 continue
-            groups.setdefault(group_key, []).append(
+            snapshots.append(
                 core.make_task_snapshot(
                     row,
                     self.oauth_states,
                     explicit_credential_fields=core.changed_credential_fields(
-                        row, self._saved_credentials.get(id(row))
+                        row, self._saved_credentials.get(row.runtime_id)
                     ),
                 )
             )
+        groups = serial_groups(snapshots, lambda snapshot: snapshot.site_group_key)
         runnable: list[list[core.TaskSnapshot]] = []
         skipped_running = 0
-        for group_key, snapshots in groups.items():
+        for group in groups:
+            group_key = group[0].site_group_key
             if self._leases.is_site_running(group_key):
-                skipped_running += len(snapshots)
+                skipped_running += len(group)
                 continue
-            runnable.append(snapshots)
+            runnable.append(group)
+        skipped_parts = []
+        if skipped_invalid:
+            skipped_parts.append(f"{skipped_invalid} 个缺少有效地址的草稿")
         if skipped_running:
-            self._say(f"已跳过 {skipped_running} 个运行中的站点任务。")
+            skipped_parts.append(f"{skipped_running} 个运行中的站点任务")
+        if skipped_parts:
+            self._say("已跳过 " + "、".join(skipped_parts) + "。")
         if not runnable:
             QMessageBox.information(self, "提示", f"没有可{label}的启用站点（可能都在运行中）。")
         return runnable
@@ -1538,6 +1577,7 @@ class App(QMainWindow):
                         self.store.apply_query(snapshot.status_key, result)
                     else:
                         self.store.apply_checkin(snapshot.status_key, result)
+                    self._schedule_status_save()
                     self._refresh_snapshot_row(snapshot)
                     ok = bool(result.get("ok"))
                     if not ok:
@@ -1641,32 +1681,17 @@ class App(QMainWindow):
             self._add()
         if self.cur is None:
             return
-        self._lock = True
-        if data.get("name"):
-            self.name_edit.setText(str(data["name"]))
-        if data.get("base_url"):
-            self.base_edit.setText(str(data["base_url"]))
-        t = str(data.get("type", "")).strip().lower()
-        if t in core.TYPES:
-            self._set_type_value(t)
-        if data.get("access_token"):
-            self.token_edit.setText(str(data["access_token"]))
-        # cred_json 会导出 refresh_token，这里必须对称地读回，否则「复制凭据 →
-        # 粘贴导入」会静默丢掉长期凭据，站点又退化成每次开浏览器。
-        if data.get("refresh_token"):
-            self.refresh_edit.setText(str(data["refresh_token"]))
-        if data.get("user_id"):
-            self.uid_edit.setText(str(data["user_id"]))
-        if data.get("cookie"):
-            self.cookie_edit.setPlainText(str(data["cookie"]))
-        if "verify_ssl" in data:
-            self.verify_ssl_check.setChecked(accounts_store.parse_enabled(data.get("verify_ssl"), True))
-        self._lock = False
-        self._sync_type_styles()
-        self._flush()
-        if self.cur is not None:
-            self._apply_form_plan(self.rows[self.cur])
-        self._say(f"已从剪贴板导入「{data.get('name', '?')}」")
+        try:
+            updated = core.merge_clipboard_site(self.rows[self.cur], data)
+        except Exception as exc:
+            QMessageBox.warning(self, "导入失败", mask_secrets(str(exc)))
+            return
+        self.rows[self.cur] = updated
+        self._load(self.cur)
+        self._refresh_row(self.cur)
+        self._update_overview()
+        self._schedule_dirty()
+        self._say(f"已从剪贴板导入「{updated.name or '?'}」")
 
     def _cpcred(self) -> None:
         if self.cur is None:
@@ -1679,7 +1704,16 @@ class App(QMainWindow):
         QApplication.clipboard().setText(text)
         self._say(f"已复制「{row.name}」的凭据 JSON")
 
-    # ── 脏状态 ──
+    # ── 后台持久化 / 脏状态 ──
+    def _schedule_status_save(self) -> None:
+        """合并短时间内的多条任务结果，避免每个回调都同步写盘。"""
+        self._status_save_timer.start(150)
+
+    def _persist_status_async(self) -> None:
+        payload = self.store.snapshot_payload()
+        results_dir = self.store.results_dir
+        self.storage.submit(lambda: core.StatusStore.write_payload(results_dir, payload))
+
     def _schedule_dirty(self) -> None:
         self._dirty_timer.start(250)
 
@@ -1702,22 +1736,47 @@ class App(QMainWindow):
 
     # ── 保存 / 导出 ──
     def _save(self) -> None:
+        if self._config_load_failed:
+            QMessageBox.critical(
+                self,
+                "保存已阻止",
+                "最近一次配置加载失败。为避免用不完整内存状态覆盖原文件，请先修复配置并重新加载成功。",
+            )
+            return
+        if self._save_inflight:
+            self._say("配置正在后台保存，请稍候…")
+            return
         if self.cur is not None:
             self._flush()
         error = core.validate_rows(self.rows)
         if error:
             QMessageBox.critical(self, "校验失败", error)
             return
-        try:
-            accounts_store.save_accounts(core.persist_accounts(self.rows), oauth_states=self.oauth_states)
-        except Exception as exc:
-            QMessageBox.critical(self, "保存失败", str(exc))
-            return
-        # 只处理相对上次成功保存真正变化的凭据字段。token 与 browser_state 分组
-        # 失效，普通配置保存不再误删刚续期出的有效缓存；删除/改名则清理旧身份。
-        core.apply_credential_cache_changes(self.rows, self._saved_credentials)
-        self._mark_saved()
-        self._say(f"已保存：{len(self.rows)} 个账号配置")
+
+        request = config_store.build_save_request(self.rows, self.oauth_states, self._saved_credentials)
+        self._save_inflight = True
+        self.save_btn.setEnabled(False)
+        self._say("正在后台保存配置…")
+
+        def on_saved(_result: object, save_error: BaseException | None) -> None:
+            self._save_inflight = False
+            self.save_btn.setEnabled(True)
+            if save_error is not None:
+                core.bg_log("ERROR", "保存账号配置失败", error=save_error)
+                QMessageBox.critical(self, "保存失败", mask_secrets(str(save_error)))
+                self._say("保存失败，当前更改仍未保存")
+                return
+
+            # 只把实际写入的冻结快照设为基线；保存期间继续编辑的内容仍保持“未保存”。
+            self._saved_snapshot = request.snapshot
+            self._saved_credentials = request.credentials
+            if self._dirty_timer.isActive():
+                self._dirty_timer.stop()
+            self._compute_dirty()
+            suffix = "；保存期间的新更改尚未保存" if self._dirty else ""
+            self._say(f"已保存：{len(request.accounts)} 个账号配置{suffix}")
+
+        self.storage.submit(request.persist, on_saved)
 
     def _export(self) -> None:
         if self.cur is not None:
@@ -1764,8 +1823,14 @@ class App(QMainWindow):
         self._worker = worker
         worker.progress.connect(self._say)
         worker.failed.connect(self._on_browser_failed)
-        worker.finished.connect(lambda: self._set_browser_buttons(True))
+        worker.finished.connect(lambda current=worker: self._on_browser_finished(current))
         return worker
+
+    def _on_browser_finished(self, worker: BrowserWorker) -> None:
+        self._set_browser_buttons(True)
+        if self._worker is worker:
+            self._worker = None
+        worker.deleteLater()
 
     def _on_browser_failed(self, msg: str) -> None:
         self._set_browser_buttons(True)
@@ -1826,7 +1891,7 @@ class App(QMainWindow):
                         bucket.setdefault("accounts", {})[account_key] = {
                             "state": str(result["state"] or "").strip(),
                             "username": str(result.get("username") or ""),
-                            "updated_at": datetime.now().isoformat(timespec="seconds"),
+                            "updated_at": time_utils.utc_iso(),
                         }
                         self.oauth_states = accounts_store.normalize_oauth_states(self.oauth_states)
                     except Exception as exc:
@@ -1892,7 +1957,12 @@ class App(QMainWindow):
             self._say("正在读取并打包登录态…")
         else:
             self._say("已关闭登录窗口，正在收尾…")
-        worker.request_close()
+        try:
+            if worker.isRunning():
+                worker.request_close()
+        except RuntimeError:
+            # 自动捕获已完成且 QThread 已 deleteLater。
+            pass
         if self._capture_dialog is dlg:
             self._capture_dialog = None
 
@@ -1998,7 +2068,14 @@ class App(QMainWindow):
             except Exception:
                 pass
         try:
-            self.runner.clear_pending()
+            self.runner.shutdown(5000)
+        except Exception:
+            pass
+        try:
+            if self._status_save_timer.isActive():
+                self._status_save_timer.stop()
+                self._persist_status_async()
+            self.storage.shutdown(5000)
         except Exception:
             pass
         try:
@@ -2042,10 +2119,4 @@ def main() -> int:
     app.setFont(QFont(theme.FONT_FAMILY, 10))
     win = App()
     win.show()
-    exit_code = app.exec()
-    # 事件循环退出后强制终止进程：线程池在飞的网络任务、BrowserWorker 拉起的
-    # Playwright/Chromium 子进程等非守护线程会让解释器挂起无法退出。os._exit 绕过
-    # 正常清理直接结束进程（OS 会回收文件锁与子进程），确保界面关闭后后台一并退出。
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os._exit(exit_code)
+    return app.exec()

@@ -22,303 +22,60 @@
 from __future__ import annotations
 
 import asyncio
-import json
-import os
-import re
 from pathlib import Path
-from typing import Any, Callable
-from urllib.parse import urlparse, urlsplit
+from typing import Any
 
 from . import bypass, oauth_providers, popups, state
-
-# WAF/OAuth 相关配置集中到 config 模块
-from config import WAFConfig, Timeouts
-
-SCRIPT_DIR = Path(__file__).resolve().parent.parent  # checkin/
-OAUTH_WAIT_SECONDS = Timeouts.OAUTH_WAIT
-WAF_RETRY = WAFConfig.RETRY_ATTEMPTS
-# 连续多少次「整轮」WAF 求解失败后，判定出口 IP 被阿里云 WAF 持续风控（熔断），
-# 后续跳过所有重复求解，避免在被风控的 IP 上空耗数分钟。
-WAF_BLOCK_THRESHOLD = WAFConfig.BLOCK_THRESHOLD
-
-
-def _env_headless() -> bool:
-    """读取 CHECKIN_HEADLESS 环境变量决定无头模式。
-
-    显式设置优先；未设置时 CI/GitHub Actions 默认无头，本地默认有头。
-    """
-    raw = os.getenv("CHECKIN_HEADLESS", "").strip().lower()
-    if raw in ("1", "true", "yes", "on"):
-        return True
-    if raw in ("0", "false", "no", "off"):
-        return False
-    return bool(os.getenv("GITHUB_ACTIONS") or os.getenv("CI"))
-
-
-# OAuth 登录入口候选选择器（站点未显式配置 login_selector 时使用）
-DEFAULT_LOGIN_SELECTORS = [
-    "text=/linux.?do/i",
-    "text=/使用.*登录/i",
-    "text=/登录|登入|Sign in|Log in/i",
-    "[href*='oauth']",
-    "[href*='/login']",
-    "button:has-text('Linux')",
-    "button:has-text('GitHub')",
-    "text=/github/i",
-]
-
-
-class BrowserSessionError(Exception):
-    """浏览器会话相关错误（供 provider 捕获）。"""
-
-
-LogFn = Callable[[str], None]
-
-
-def _noop(_msg: str) -> None:
-    pass
-
-
-def _origin_from_url(url: str) -> str:
-    parsed = urlparse(str(url or ""))
-    if not parsed.scheme or not parsed.netloc:
-        return str(url or "").rstrip("/")
-    return f"{parsed.scheme}://{parsed.netloc}"
-
-
-def _browser_mode_label(headless: bool) -> str:
-    ci = bool(os.getenv("GITHUB_ACTIONS") or os.getenv("CI"))
-    return f"{'headless' if headless else 'headful'} / {'CI' if ci else 'local'}"
-
-
-# 驱动/浏览器已关闭的错误特征（模块级常量，避免每次调用重建元组）
-_DRIVER_CLOSED_MARKERS = (
-    "connection closed",
-    "target closed",
-    "browser has been closed",
-    "browser closed",
-    "page closed",
-    "socket.send()",
-    "closed while reading from the driver",
-    "playwright driver",
-    "pipe closed by peer",
-    "os.write(pipe",
-    "cannot read properties of undefined (reading 'url')",
+from . import storage_scope as _storage_scope
+from .oauth_flow import (
+    DEFAULT_LOGIN_SELECTORS as DEFAULT_LOGIN_SELECTORS,
+    OAUTH_WAIT_SECONDS as OAUTH_WAIT_SECONDS,
+    attach_oauth_completion_messages as _attach_oauth_completion_messages,
+    oauth_checkin_result as _oauth_checkin_result,
+    oauth_landed as _oauth_landed,
+    trigger_oauth as _trigger_oauth,
+)
+from .runtime_loop import (
+    BrowserResources,
+    BrowserSessionError as BrowserSessionError,
+    LogFn,
+    browser_mode_label as _browser_mode_label,
+    env_headless as _env_headless,
+    is_driver_closed_error as _is_driver_closed_error,
+    noop as _noop,
+    run_sync as run_sync,
+    safe_goto as _safe_goto,
+    safe_storage_state as _safe_storage_state,
+)
+from .site_messages import (
+    add_site_error as _add_site_error,
+    attach_site_errors as _attach_site_errors,
+    install_site_error_collector as _install_site_error_collector,
+    message_with_site_error as _message_with_site_error,
+    site_error_messages as _site_error_messages,
+    site_success_message as _site_success_message_impl,
+    wait_for_site_success_message as _wait_for_site_success_message,
+)
+from .storage_scope import (
+    origin_of as _origin_from_url,
+    site_cookie_string as _site_cookie_string,
+    storage_access_token as storage_access_token,
+    storage_item as storage_item,
+    storage_refresh_token as storage_refresh_token,
+)
+from .waf import (
+    WAF_BLOCK_THRESHOLD as WAF_BLOCK_THRESHOLD,
+    WAF_RETRY as WAF_RETRY,
+    read_user as read_user,
+    waf_is_blocked as _waf_is_blocked,
+    wait_for_ready as _wait_for_ready,
 )
 
+# 私有旧名也保留，避免已有调用方因模块拆分失效。
+_same_origin = _storage_scope.same_origin
+_site_success_message = _site_success_message_impl
 
-def _is_driver_closed_error(exc: BaseException | str) -> bool:
-    text = str(exc).lower()
-    return any(marker in text for marker in _DRIVER_CLOSED_MARKERS)
-
-
-async def _safe_close_page(page) -> None:
-    if page is None:
-        return
-    try:
-        await page.close()
-    except Exception:
-        pass
-
-
-async def _safe_close_browser(browser) -> None:
-    if browser is None:
-        return
-    try:
-        await browser.close()
-    except Exception:
-        pass
-
-
-async def _safe_storage_state(context, log: LogFn = _noop) -> dict[str, Any]:
-    try:
-        return await context.storage_state()
-    except Exception as exc:
-        if _is_driver_closed_error(exc):
-            raise BrowserSessionError(
-                "浏览器驱动已关闭，无法导出登录态；这通常是站点页面脚本触发了 Playwright Firefox 兼容问题，请重试。"
-            ) from exc
-        raise
-
-
-async def _safe_goto(page, url: str, *, wait_until: str = "domcontentloaded", timeout: int = 30000, log: LogFn = _noop) -> bool:
-    """容错导航；domcontentloaded 失败时降级到 commit，驱动断连则继续抛出。"""
-    try:
-        await page.goto(url, wait_until=wait_until, timeout=timeout)
-        return True
-    except Exception as exc:
-        if _is_driver_closed_error(exc):
-            raise
-        if wait_until != "commit":
-            try:
-                await page.goto(url, wait_until="commit", timeout=min(timeout, 15000))
-                log(f"导航等待 {wait_until} 失败，已降级到 commit：{url}")
-                return True
-            except Exception as retry_exc:
-                if _is_driver_closed_error(retry_exc):
-                    raise
-                log(f"导航失败（{type(exc).__name__}，降级也失败：{type(retry_exc).__name__}）：{url}")
-                return False
-        log(f"导航失败（{type(exc).__name__}）：{url}")
-        return False
-
-
-async def _fetch_json_in_page(page, url: str, timeout_ms: int = 15000) -> dict[str, Any] | None:
-    """在页面上下文 fetch JSON，使用 AbortController 避免长期挂起。"""
-    try:
-        return await page.evaluate(
-            """async ([u, timeoutMs]) => {
-                const controller = new AbortController();
-                const timer = setTimeout(() => controller.abort(), timeoutMs);
-                try {
-                    const r = await fetch(u, {
-                        credentials: 'include',
-                        headers: { 'Accept': 'application/json' },
-                        signal: controller.signal,
-                    });
-                    const t = await r.text();
-                    try { return { ok: r.ok, status: r.status, body: JSON.parse(t) }; }
-                    catch { return { ok: r.ok, status: r.status, body: t.slice(0, 200) }; }
-                } catch (e) {
-                    return { ok: false, status: 0, body: String(e && e.name === 'AbortError' ? 'fetch timeout' : e) };
-                } finally {
-                    clearTimeout(timer);
-                }
-            }""",
-            [url, timeout_ms],
-        )
-    except Exception:
-        return None
-
-
-def _patch_windows_asyncio_finalizers() -> None:
-    """静默 Windows Proactor 管道关闭后的 __del__ 噪声。"""
-    if os.name != "nt":
-        return
-    try:
-        import asyncio.base_subprocess as base_subprocess
-        import asyncio.proactor_events as proactor_events
-    except Exception:
-        return
-
-    def _wrap(cls) -> None:
-        if getattr(cls, "_checkin_safe_del", False):
-            return
-        original = getattr(cls, "__del__", None)
-        if original is None:
-            return
-
-        def _safe_del(self):
-            try:
-                original(self)
-            except ValueError as exc:
-                if "I/O operation on closed pipe" not in str(exc):
-                    raise
-            except Exception:
-                pass
-
-        cls.__del__ = _safe_del
-        cls._checkin_safe_del = True
-
-    _wrap(proactor_events._ProactorBasePipeTransport)
-    _wrap(base_subprocess.BaseSubprocessTransport)
-
-
-def _run_loop(loop: asyncio.AbstractEventLoop, coro: Any) -> Any:
-    """在给定 loop 上运行协程，并在 finally 中做优雅清理。
-
-    适合在独立线程里调用（该线程已通过 asyncio.set_event_loop(loop) 绑定）。
-    Windows 专有清理逻辑（sleep + shutdown_asyncgens）同样在此执行。
-    """
-    import sys as _sys
-
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        # 取消所有残留 task（例如 Playwright Connection.run）
-        try:
-            pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
-            for t in pending:
-                t.cancel()
-            if pending:
-                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-        except Exception:
-            pass
-        # Windows：给传输一点时间优雅关闭，避免 __del__ 阶段的管道错误日志
-        if _sys.platform == "win32":
-            try:
-                loop.run_until_complete(asyncio.sleep(0.3))
-            except Exception:
-                pass
-        try:
-            loop.run_until_complete(loop.shutdown_asyncgens())
-        except Exception:
-            pass
-        try:
-            loop.close()
-        except Exception:
-            pass
-
-
-def run_sync(coro: Any) -> Any:
-    """同步执行一个 async 协程，并规避 Windows ProactorEventLoop 的清理警告。
-
-    Windows 上 Camoufox/Playwright 子进程退出时，asyncio 在 __del__ 里清理
-    管道传输会抛 "I/O operation on closed pipe" / "unclosed transport"。
-    通过手动创建 loop + 退出前 sleep 让传输优雅关闭，避免污染日志。
-
-    当调用线程已有一个正在运行的 event loop（例如 Jupyter / FastAPI / GUI 框架）时，
-    直接 loop.run_until_complete() 会抛 RuntimeError。此时把协程提交到一个独立线程
-    的新 loop 里执行，确保阻塞等待完成后再返回结果；任何异常都会原样重新抛出。
-    协程仅被调度一次，不会泄漏。
-    """
-    import concurrent.futures
-    import sys as _sys
-
-    _patch_windows_asyncio_finalizers()
-
-    # 探测当前线程是否已有运行中的 event loop
-    _running_loop: asyncio.AbstractEventLoop | None = None
-    try:
-        _running_loop = asyncio.get_running_loop()
-    except RuntimeError:
-        _running_loop = None
-
-    if _running_loop is not None:
-        # 当前线程在 loop 内 —— 必须在独立线程里跑新 loop，否则会死锁。
-        # 用 concurrent.futures.Future 把结果/异常传回主线程。
-        result_future: concurrent.futures.Future = concurrent.futures.Future()
-
-        def _thread_target() -> None:
-            if _sys.platform == "win32":
-                try:
-                    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-                except Exception:
-                    pass
-            new_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(new_loop)
-            try:
-                value = _run_loop(new_loop, coro)
-                result_future.set_result(value)
-            except BaseException as exc:  # noqa: BLE001
-                result_future.set_exception(exc)
-
-        t = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        t.submit(_thread_target)
-        t.shutdown(wait=True)
-        # 重新抛出在子线程中捕获的异常（含原始 traceback）
-        return result_future.result()
-
-    # 普通路径：当前线程没有运行中的 event loop
-    if _sys.platform == "win32":
-        try:
-            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-        except Exception:
-            pass
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    return _run_loop(loop, coro)
+SCRIPT_DIR = Path(__file__).resolve().parent.parent  # checkin/
 
 
 def quota_to_usd(value: Any) -> str:
@@ -326,1097 +83,6 @@ def quota_to_usd(value: Any) -> str:
     from providers.base import format_usd
 
     return format_usd(value, is_usd=False, fallback=str(value))
-
-
-# ───────────────────────── 辅助函数：/api/user/self ────────────────────────
-async def _fetch_self(page, base_url: str, fallback_uid: str) -> dict[str, Any] | None:
-    """在【页面上下文】里 fetch /api/user/self，返回 {ok,status,uid,body,is_waf}。
-
-    关键：用 page.evaluate 在页面里 fetch（credentials:'include' 带同源 cookie），
-    并从 localStorage 的 user/auth_user 读取真实 uid 作为 New-Api-User 头。
-    New API 的 /api/user/self 必须带正确的 New-Api-User，否则拒绝返回数据。
-    """
-    try:
-        return await page.evaluate(
-            """async ([baseUrl, fallbackUid, timeoutMs]) => {
-                let uid = '';
-                for (const key of ['user', 'auth_user']) {
-                    try {
-                        const stored = JSON.parse(localStorage.getItem(key) || '{}');
-                        const id = stored.id ?? stored.user_id;
-                        if (id != null && id !== '') { uid = String(id); break; }
-                    } catch (_) { /* 忽略 */ }
-                }
-                if (!uid && fallbackUid) uid = String(fallbackUid);
-                const headers = { 'Accept': 'application/json' };
-                if (uid) headers['New-Api-User'] = uid;
-                const controller = new AbortController();
-                const timer = setTimeout(() => controller.abort(), timeoutMs);
-                try {
-                    const r = await fetch(baseUrl + '/api/user/self', { credentials: 'include', headers, signal: controller.signal });
-                    const t = await r.text();
-                    const isWaf = /aliyun_waf|slidecaptcha|acw_sc__|Just a moment|cf-challenge/i.test(t);
-                    try { return { ok: r.ok, status: r.status, uid, body: JSON.parse(t), is_waf: false }; }
-                    catch { return { ok: r.ok, status: r.status, uid, body: t.slice(0, 200), is_waf: isWaf }; }
-                } catch (e) {
-                    return { ok: false, status: 0, uid, body: String(e && e.name === 'AbortError' ? 'fetch timeout' : e), is_waf: false };
-                } finally {
-                    clearTimeout(timer);
-                }
-            }""",
-            [base_url, fallback_uid, 15000],
-        )
-    except Exception as exc:
-        # Let a dead driver bubble up so the caller can stop instead of spinning.
-        if _is_driver_closed_error(exc):
-            raise
-        return None
-
-
-def _waf_circuit(page) -> dict[str, Any]:
-    """返回附着在 page 上的 WAF 熔断状态（跨多次求解调用共享）。
-
-    结构：{"fails": 连续整轮失败次数, "blocked": 是否已熔断}。
-    出口 IP 被阿里云 WAF 持续风控时，靠这个状态短路后续所有求解，避免空耗。
-    """
-    state = getattr(page, "_waf_circuit_state", None)
-    if not isinstance(state, dict):
-        state = {"fails": 0, "blocked": False}
-        try:
-            setattr(page, "_waf_circuit_state", state)
-        except Exception:
-            # page 是 C 扩展对象、无法附加属性时，退化为「无熔断」（每次新建）。
-            pass
-    return state
-
-
-def _waf_is_blocked(page) -> bool:
-    """当前 page 的出口 IP 是否已被判定为持续风控（熔断开启）。"""
-    return bool(_waf_circuit(page).get("blocked"))
-
-
-async def _is_waf_html(page) -> bool:
-    """检测当前页面是否仍是 WAF 拦截 / 挑战页（阿里云 / Cloudflare）。
-
-    阿里云 WAF 挑战页的特征是 HTML 源码里的 meta 标签（aliyun_waf_aa/bb），
-    用 innerText 检测不到，必须取 page.content() 的完整 HTML 源码匹配。
-    """
-    try:
-        html = (await page.content() or "").lower()
-    except Exception:
-        # content() 在 reload 瞬间可能抛异常，视为「仍在挑战中」
-        return True
-    return (
-        "aliyun_waf" in html
-        or "acw_sc__" in html
-        or "slidecaptcha" in html
-        or "just a moment" in html
-        or "cf-challenge" in html
-        or "checking your browser" in html
-    )
-
-
-async def _wait_for_ready(page, timeout_ms: int = 30000, log: LogFn = _noop) -> bool:
-    """等待页面真正可交互：WAF 通过 + 有可见的链接/按钮元素。
-
-    用 JS 探测排除 WAF 拦截文本，并确认页面渲染出可交互元素（SPA 站点
-    DOM 加载完不代表元素已渲染）。失败仅警告不抛异常，保持容错。
-
-    返回 True 表示页面就绪，False 表示超时/未就绪（调用方可继续尝试）。
-    """
-    ready_js = """() => {
-        const text = document.body ? document.body.innerText : '';
-        const blocked = /请进行验证|为了更好的访问体验|访问受限|Access denied|verify you are human|Just a moment|Checking your browser/i.test(text);
-        if (blocked) return false;
-        const isVisible = (el) => {
-            if (!el || !el.isConnected) return false;
-            const s = window.getComputedStyle(el);
-            if (s.display === 'none' || s.visibility === 'hidden' || parseFloat(s.opacity) === 0) return false;
-            const r = el.getBoundingClientRect();
-            return r.width > 0 && r.height > 0;
-        };
-        const countVisible = (sel) => [...document.querySelectorAll(sel)].filter(isVisible).length;
-        return countVisible('a') > 0 || countVisible('button') > 0;
-    }"""
-    try:
-        await page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
-    except Exception:
-        pass
-    # 若是 WAF 挑战页，提前返回（交由 read_user 的 _solve_waf 处理，不空等）
-    if await _is_waf_html(page):
-        log("页面为 WAF 挑战页，跳过就绪等待")
-        return False
-    try:
-        # 就绪检测超时取较短值（10s），避免在异常页面空等
-        await page.wait_for_function(ready_js, timeout=min(timeout_ms, 10000))
-        return True
-    except Exception:
-        log("页面就绪检测超时（继续尝试操作）")
-        return False
-
-
-async def _solve_waf(page, base_url: str, log: LogFn = _noop, rounds: int = 3) -> bool:
-    """用页面导航触发并等待阿里云 WAF 的 JS 挑战自动求解。
-
-    阿里云 WAF 的 aliyun_waf_aa/bb 挑战机制：返回的 HTML 内嵌 JS，浏览器执行后
-    计算出 acw_sc__v2 cookie 并【自动 reload】，带上该 cookie 后续请求即放行。
-    fetch() 不执行挑战页的 JS，所以必须用真实页面导航 + 等待自动 reload。
-
-    关键：不手动调 page.reload（会与 WAF 的自动 reload 冲突导致导航 pending 超时），
-    而是导航后轮询等待页面内容脱离挑战页。
-
-    返回 True 表示页面最终不再是 WAF 挑战页（挑战已解或本就无挑战）。
-
-    熔断：连续 WAF_BLOCK_THRESHOLD 次「整轮」求解失败后，判定出口 IP 被持续风控，
-    之后任何调用直接短路返回 False，不再重复导航，避免在被封 IP 上空耗数分钟。
-    """
-    circuit = _waf_circuit(page)
-    if circuit.get("blocked"):
-        log("WAF 已熔断（出口 IP 被持续风控），跳过重复求解")
-        return False
-
-    for r in range(rounds):
-        log(f"WAF 绕过尝试 {r + 1}/{rounds}（页面导航触发 JS 挑战）...")
-        try:
-            # domcontentloaded 即返回；挑战 JS 随后执行并自动 reload
-            await _safe_goto(page, base_url + "/console", wait_until="domcontentloaded", timeout=25000, log=log)
-        except Exception as exc:
-            # A dead driver would make every following poll spin uselessly.
-            # Only WAF auto-reload navigation aborts are expected here; bubble
-            # up real driver/browser crashes so the flow stops fast.
-            if _is_driver_closed_error(exc):
-                raise
-            # 导航可能因 WAF 自动 reload 中断，属正常，忽略继续轮询
-            log(f"WAF 求解导航中断（继续等待）：{type(exc).__name__}")
-        # 轮询等待挑战页被 WAF JS 替换（最多 ~15s 每轮）
-        for _ in range(15):
-            await asyncio.sleep(1.0)
-            if not await _is_waf_html(page):
-                log(f"WAF 挑战已通过（第 {r + 1} 轮）")
-                circuit["fails"] = 0  # 成功一次即重置失败计数
-                return True
-        log(f"WAF 挑战未通过，重试 {r + 1}/{rounds}")
-
-    # 整轮求解失败：累加失败计数，达到阈值则熔断
-    circuit["fails"] = int(circuit.get("fails", 0)) + 1
-    if circuit["fails"] >= WAF_BLOCK_THRESHOLD:
-        circuit["blocked"] = True
-        log(f"WAF 求解连续失败 {circuit['fails']} 次，判定出口 IP 被持续风控（熔断，后续跳过求解）")
-    else:
-        log(f"WAF 挑战求解失败（{circuit['fails']}/{WAF_BLOCK_THRESHOLD}，IP 可能被持续风控）")
-    return False
-
-
-async def read_user(
-    page,
-    base_url: str,
-    fallback_uid: str = "",
-    log: LogFn = _noop,
-) -> dict[str, Any] | None:
-    """读取 /api/user/self 用户信息（含 WAF 绕过 + 重试）。
-
-    Args:
-        page: Playwright Page 对象（已登录）。
-        base_url: 站点地址（如 "https://example.com"）。
-        fallback_uid: 兜底用户 ID（用于 New-Api-User 头）。
-        log: 日志回调。
-
-    Returns:
-        用户数据 dict（含 id/username/quota）或 None。
-    """
-    # 若当前页面本身就是 WAF 挑战页，先用页面导航解挑战（fetch 不执行挑战 JS）
-    if await _is_waf_html(page):
-        if _waf_is_blocked(page):
-            log("WAF 已熔断（出口 IP 被持续风控），跳过读取额度")
-            return None
-        log("当前页面为 WAF 挑战页，先用页面导航求解...")
-        await _solve_waf(page, base_url, log, rounds=WAF_RETRY)
-        # 熔断后不再进入 fetch 重试循环，直接返回失败（由调用方判定为 WAF 风控）
-        if _waf_is_blocked(page):
-            return None
-
-    for attempt in range(WAF_RETRY):
-        result = await _fetch_self(page, base_url, fallback_uid)
-        if not isinstance(result, dict):
-            await asyncio.sleep(1.0)
-            continue
-
-        body = result.get("body")
-        # 成功：New API 返回 {success:true, data:{...}}
-        if isinstance(body, dict) and body.get("success") and body.get("data"):
-            data = body["data"]
-            username = data.get("username") or ""
-            quota = data.get("quota")
-            log(f"当前用户：{username}，额度 {quota_to_usd(quota)}")
-            return data
-
-        # 命中 WAF：用页面导航求解挑战后重试；熔断后不再重试，快速失败
-        if result.get("is_waf") and attempt < WAF_RETRY - 1:
-            if _waf_is_blocked(page):
-                log("WAF 已熔断，停止重试读取额度")
-                break
-            log(f"命中 WAF，导航求解后重试 {attempt + 1}/{WAF_RETRY - 1}")
-            await _solve_waf(page, base_url, log, rounds=2)
-            if _waf_is_blocked(page):
-                log("WAF 已熔断，停止重试读取额度")
-                break
-            await asyncio.sleep(1.0)
-            continue
-
-        # 诊断日志（uid / 状态 / 响应片段），便于排错
-        snippet = body if isinstance(body, str) else str(body)[:120]
-        log(
-            f"读取额度未成功：status={result.get('status')} uid={result.get('uid')!r} "
-            f"waf={result.get('is_waf')} body={snippet}"
-        )
-        return None
-
-    log("读取用户信息失败（登录态可能已失效或 WAF 无法绕过）")
-    return None
-
-
-# ────────────────────────── OAuth 登录触发 ──────────────────────────────
-
-async def _api_get_json(page, url: str) -> dict[str, Any] | None:
-    """在页面上下文里 GET 一个 JSON 接口（带同源 cookie + 超时）。"""
-    return await _fetch_json_in_page(page, url, timeout_ms=15000)
-
-
-def _short_body(body: Any, limit: int = 180) -> str:
-    try:
-        if isinstance(body, (dict, list)):
-            text = json.dumps(body, ensure_ascii=False, default=str, separators=(",", ":"))
-        else:
-            text = str(body or "")
-    except Exception:
-        text = str(body or "")
-    return text.replace("\r", " ").replace("\n", " ")[:limit]
-
-
-def _extract_oauth_state(body: Any) -> str:
-    """兼容不同 New API 派生站的 state 响应结构。"""
-    if isinstance(body, dict):
-        for key in ("data", "state", "oauth_state", "oauthState"):
-            val = body.get(key)
-            if isinstance(val, dict):
-                nested = _extract_oauth_state(val)
-                if nested:
-                    return nested
-            elif val:
-                return str(val)
-    elif isinstance(body, str):
-        text = body.strip()
-        if text and not text.startswith("<") and len(text) <= 512:
-            return text
-    return ""
-
-
-_SITE_ERROR_REDACTIONS = [
-    (re.compile(r'(?i)("password"\s*:\s*")[^"]*(")'), r'\1<redacted>\2'),
-    (re.compile(r'(?i)(\\"password\\"\s*:\s*\\")[^\\"]*(\\")'), r'\1<redacted>\2'),
-    (re.compile(r'(?i)(password=)[^&\s]+'), r'\1<redacted>'),
-    (re.compile(r'(?i)("(?:access_token|auth_token|token|state|code|cookie|authorization)"\s*:\s*")[^"]*(")'), r'\1<redacted>\2'),
-    (re.compile(r'(?i)(\\"(?:access_token|auth_token|token|state|code|cookie|authorization)\\"\s*:\s*\\")[^\\"]*(\\")'), r'\1<redacted>\2'),
-    (re.compile(r'(?i)((?:access_token|auth_token|token|state|code|cookie|authorization)=)[^&\s]+'), r'\1<redacted>'),
-    (re.compile(r'(?i)(Bearer\s+)[A-Za-z0-9._~+/-]+=*'), r'\1<redacted>'),
-]
-
-
-def _redact_site_error(text: Any, limit: int = 500) -> str:
-    """保留站点原始错误含义，同时避免把密码/token/cookie 带进日志和返回值。"""
-    msg = str(text or "").replace("\r", " ").replace("\n", " ").strip()
-    msg = re.sub(r"\s+", " ", msg)
-    for pattern, repl in _SITE_ERROR_REDACTIONS:
-        msg = pattern.sub(repl, msg)
-    return msg[:limit]
-
-
-def _short_url(url: str) -> str:
-    return str(url or "").split("#", 1)[0].split("?", 1)[0]
-
-
-# 与签到成败无关的前端噪声。这些条目会被拼进「站点原始错误」直接展示给用户，
-# 留着只会掩盖真正的失败原因（实测 AgentRouter 的一次成功签到被这几条淹没）。
-SITE_ERROR_NOISE = [
-    "获取公告失败",          # 公告接口挂了不影响签到
-    "jshandle@",             # console.error 打的是对象，取不到内容，纯噪声
-    "cloudflareinsights",    # CF 统计 beacon 被 CORS 拦
-    "beacon.min.js",
-    "integrity attribute",   # 第三方脚本 SRI 校验告警
-    "storage access automatically granted",
-    "e.response is undefined",
-    "google-analytics",
-    "googletagmanager",
-]
-
-
-def _add_site_error(collector: dict[str, Any] | None, source: str, message: Any) -> None:
-    if collector is None:
-        return
-    text = _redact_site_error(message)
-    if not text:
-        return
-    lowered = text.lower()
-    if any(pattern in lowered for pattern in SITE_ERROR_NOISE):
-        return
-    item = f"{source}: {text}" if source else text
-    items = collector.setdefault("items", [])
-    if item not in items:
-        items.append(item)
-        del items[:-12]
-
-
-def _console_message_text(msg) -> str:
-    try:
-        text = getattr(msg, "text", "")
-        return text() if callable(text) else str(text or "")
-    except Exception:
-        return ""
-
-
-def _console_message_type(msg) -> str:
-    try:
-        typ = getattr(msg, "type", "")
-        return (typ() if callable(typ) else str(typ or "")).lower()
-    except Exception:
-        return ""
-
-
-def _install_site_error_collector(page, base_url: str = "", collector: dict[str, Any] | None = None) -> dict[str, Any]:
-    """采集站点前端原始错误：Toast/console/接口错误响应。"""
-    collector = collector or {"items": [], "tasks": []}
-    try:
-        page.on("console", lambda msg: _add_site_error(
-            collector,
-            f"console.{_console_message_type(msg) or 'log'}",
-            _console_message_text(msg),
-        ) if _console_message_type(msg) in {"error", "warning", "assert"} else None)
-    except Exception:
-        pass
-    # 不注册 pageerror：Playwright Firefox 驱动在部分页面错误缺少 location.url 时会崩溃。
-
-    async def _capture_response(response) -> None:
-        try:
-            status = int(getattr(response, "status", 0) or 0)
-            url = str(getattr(response, "url", "") or "")
-            if status < 400:
-                return
-            low_url = url.lower()
-            if any(x in low_url for x in ("googletagmanager", "google-analytics", "umami", "/assets/")):
-                return
-            if base_url and base_url.rstrip("/") not in url and "/api/" not in low_url and "oauth" not in low_url:
-                return
-            body = ""
-            try:
-                headers = getattr(response, "headers", {}) or {}
-                content_type = str(headers.get("content-type") or "").lower()
-                if not any(x in content_type for x in ("image/", "font/", "octet-stream")):
-                    body = await response.text()
-            except Exception:
-                body = ""
-            detail = f"HTTP {status} {_short_url(url)}"
-            if body:
-                detail += f" body={_short_body(body, 240)}"
-            _add_site_error(collector, "response", detail)
-        except Exception:
-            return
-
-    def _on_response(response) -> None:
-        try:
-            task = asyncio.create_task(_capture_response(response))
-            tasks = collector.setdefault("tasks", [])
-            tasks.append(task)
-            if len(tasks) > 50:
-                del tasks[:-50]
-        except Exception:
-            pass
-
-    try:
-        page.on("response", _on_response)
-    except Exception:
-        pass
-    return collector
-
-
-async def _collect_dom_site_errors(page, collector: dict[str, Any] | None = None) -> list[str]:
-    """从页面 DOM 中读取当前可见的 Toast / 弹窗 / 表单错误。"""
-    try:
-        texts = await page.evaluate(
-            """() => {
-                const selectors = [
-                    '.semi-toast-wrapper', '.semi-toast', '.semi-notification',
-                    '.Toastify__toast', '[role="alert"]', '.semi-form-field-error-message',
-                    '.semi-modal-content', '.ant-message', '.ant-notification', '.ant-alert'
-                ];
-                const visible = (el) => {
-                    if (!el || !el.isConnected) return false;
-                    const s = getComputedStyle(el);
-                    const r = el.getBoundingClientRect();
-                    return s.display !== 'none' && s.visibility !== 'hidden' && parseFloat(s.opacity || '1') !== 0 && r.width > 0 && r.height > 0;
-                };
-                const out = [];
-                for (const sel of selectors) {
-                    for (const el of document.querySelectorAll(sel)) {
-                        const text = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
-                        if (text && visible(el) && text.length <= 1000 && !out.includes(text)) out.push(text);
-                    }
-                }
-                return out.slice(0, 8);
-            }"""
-        )
-        for text in texts or []:
-            _add_site_error(collector, "dom", text)
-    except Exception:
-        pass
-    return list((collector or {}).get("items") or [])
-
-
-async def _site_error_messages(page=None, collector: dict[str, Any] | None = None) -> list[str]:
-    if collector:
-        all_tasks = list(collector.get("tasks", []))
-        tasks = [t for t in all_tasks if not t.done()]
-        if tasks:
-            try:
-                await asyncio.wait(tasks, timeout=2)
-            except Exception:
-                pass
-        collector["tasks"] = [t for t in all_tasks if not t.done()][-50:]
-    if page is not None:
-        await _collect_dom_site_errors(page, collector)
-    return list((collector or {}).get("items") or [])
-
-
-def _message_text(item: Any) -> str:
-    text = _redact_site_error(item)
-    source, separator, message = text.partition(": ")
-    if separator and source in {"dom", "toast", "notification"}:
-        return message.strip()
-    return text
-
-
-def _site_success_message(messages: list[str] | None) -> str:
-    """从站点 Toast/弹窗中提取明确的签到或登录奖励成功提示。"""
-    success_patterns = (
-        "签到成功",
-        "领取成功",
-        "登录成功",
-        "奖励已发放",
-        "额度已发放",
-        "成功获得",
-        "check-in success",
-        "check in success",
-        "checked in successfully",
-        "login successful",
-        "reward has been credited",
-    )
-    reject_patterns = (
-        "失败",
-        "错误",
-        "未成功",
-        "今日已",
-        "已经签到",
-        "already",
-        "failed",
-        "error",
-    )
-    for item in messages or []:
-        message = _message_text(item)
-        lowered = message.casefold()
-        if any(pattern in lowered for pattern in reject_patterns):
-            continue
-        if any(pattern in lowered for pattern in success_patterns):
-            return message
-    return ""
-
-
-def _attach_site_errors(target: dict[str, Any], errors: list[str], log: LogFn = _noop) -> None:
-    if not errors:
-        return
-    success_message = _site_success_message(errors)
-    if success_message:
-        target.setdefault("site_success_message", success_message)
-        log(f"站点成功提示：{success_message}")
-    error_items = [item for item in errors if _message_text(item) != success_message]
-    if not error_items:
-        return
-    summary = "；".join(error_items[:3])
-    target["site_errors"] = error_items
-    target["site_error"] = summary
-    log(f"站点原始错误：{summary}")
-
-
-async def _wait_for_site_success_message(
-    page,
-    collector: dict[str, Any] | None,
-    target: dict[str, Any],
-    timeout_ms: int = 3000,
-) -> str:
-    """短暂轮询 OAuth 回跳页，避免瞬时成功 Toast 消失后只能按额度差判断。"""
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + max(0, timeout_ms) / 1000
-    while True:
-        messages = await _site_error_messages(page, collector)
-        _attach_site_errors(target, messages)
-        success_message = str(target.get("site_success_message") or "").strip()
-        if success_message:
-            return success_message
-        if loop.time() >= deadline:
-            return ""
-        await asyncio.sleep(min(0.15, max(0, deadline - loop.time())))
-
-
-def _message_with_site_error(message: str, link: dict[str, Any]) -> str:
-    site_error = str(link.get("site_error") or "").strip()
-    if not site_error:
-        return message
-    return f"{message} 站点原始错误：{site_error}"
-
-
-def _oauth_landed(link: dict[str, Any]) -> bool:
-    """OAuth 是否已顺畅完成（授权后带 code 跳回站点）。
-
-    刻意**不看** cloudflare：它只表示「过程中弹过人机验证」，不代表最终没过。
-    实测 AgentRouter 的 Linux.do 授权页会先弹 CF 挑战、ClickSolver 报「未能通过」，
-    但随后授权按钮点击成功、顺利跳回站点并弹出「签到成功，新增额度已到账」——
-    人已经跳回来了还被这面旗子否决，就会把成功的签到误报成 need_login
-    （实测该站一次真实成功被报为「OAuth 链路未顺畅完成，请重新捕获登录态」）。
-    """
-    return bool(link.get("landed_back")) and not link.get("need_human") and not link.get("waf_blocked")
-
-
-def _oauth_checkin_result(quota_before: Any, quota_after: Any, link: dict[str, Any]) -> dict[str, Any]:
-    """综合额度变化、OAuth 回跳状态和站点弹窗生成签到结果。"""
-    result: dict[str, Any] = {
-        "quota_before": quota_before,
-        "quota_after": quota_after,
-        "delta": None,
-        "link": link,
-    }
-
-    if quota_before is not None and quota_after is not None and quota_after > quota_before:
-        delta = quota_after - quota_before
-        result["delta"] = delta
-        result["status"] = "success"
-        result["message"] = f"OAuth 重登成功，额度增加 {quota_to_usd(delta)}（当前 {quota_to_usd(quota_after)}）。"
-        return result
-
-    success_message = str(link.get("site_success_message") or "").strip()
-    oauth_completed = _oauth_landed(link)
-    if oauth_completed and success_message:
-        result["status"] = "success"
-        result["message"] = f"签到成功（站点弹窗：{success_message}）。"
-        return result
-
-    if quota_before is None and quota_after is None:
-        if link.get("waf_blocked"):
-            # 出口 IP 被阿里云 WAF 持续风控：登录态本身可能仍有效，不是登录问题。
-            result["status"] = "need_verification"
-            result["message"] = _message_with_site_error(
-                "站点阿里云 WAF 持续拦截当前出口 IP（数据中心/CI IP 信誉过低），"
-                "浏览器无法通过 JS 挑战，本次签到中止。登录态可能仍有效，无需重新捕获；"
-                "请为该账号配置住宅代理（proxy 字段），或改用住宅 IP 环境运行。",
-                link,
-            )
-        elif link.get("cloudflare"):
-            result["status"] = "need_verification"
-            result["message"] = _message_with_site_error(
-                "OAuth 过程命中 Cloudflare/WAF 人机验证，无法自动完成，请重新捕获登录态。",
-                link,
-            )
-        else:
-            result["status"] = "need_login"
-            result["message"] = _message_with_site_error("无法读取额度，登录态可能已失效，请重新捕获登录态。", link)
-        return result
-
-    if oauth_completed:
-        cur = quota_after if quota_after is not None else quota_before
-        result["status"] = "already_done"
-        result["message"] = f"OAuth 重登完成，额度无变化（当前 {quota_to_usd(cur)}，今日可能已发放）。"
-        return result
-
-    reason = (
-        "停在第三方登录页（共享登录态可能已过期）"
-        if link.get("need_human")
-        else ("OAuth 授权未带 code 顺畅跳回站点" if not link.get("landed_back") else "OAuth 链路未顺畅完成")
-    )
-    result["status"] = "need_login"
-    result["message"] = _message_with_site_error(f"OAuth 自动重登未完成：{reason}。请重新捕获登录态。", link)
-    return result
-
-
-async def _fetch_oauth_client_id(page, base_url: str, provider) -> tuple[str, bool]:
-    """从 {origin}/api/status 读取该 provider 的 client_id 与开关。"""
-    res = await _api_get_json(page, base_url + "/api/status")
-    body = res.get("body") if isinstance(res, dict) else None
-    data = body.get("data") if isinstance(body, dict) else None
-    if not isinstance(data, dict):
-        return "", False
-    cid = str(data.get(provider.status_client_id_field()) or "")
-    raw_enabled = data.get(provider.status_oauth_field())
-    if raw_enabled is None:
-        enabled = bool(cid)
-    elif isinstance(raw_enabled, bool):
-        enabled = raw_enabled
-    else:
-        enabled = str(raw_enabled).strip().lower() not in {"", "0", "false", "no", "off"}
-    return cid, enabled
-
-
-async def _fetch_oauth_state(page, base_url: str, log: LogFn = _noop) -> tuple[str, str]:
-    """从 {origin}/api/oauth/state 读取一次性 state；返回 (state, 诊断信息)。"""
-    last_diag = "接口无响应"
-    for attempt in range(3):
-        res = await _api_get_json(page, base_url + "/api/oauth/state")
-        if not isinstance(res, dict):
-            last_diag = "接口无响应"
-        else:
-            status = res.get("status")
-            body = res.get("body")
-            oauth_state = _extract_oauth_state(body)
-            if oauth_state:
-                return oauth_state, f"status={status}"
-            last_diag = f"status={status} body={_short_body(body)}"
-            if status not in (408, 425, 429, 500, 502, 503, 504):
-                break
-        if attempt < 2:
-            delay = 5 * (attempt + 1)
-            log(f"/api/oauth/state 暂不可用（{last_diag}），等待 {delay}s 后重试...")
-            await asyncio.sleep(delay)
-    return "", last_diag
-
-
-def _site_oauth_selectors(provider) -> list[str]:
-    if provider.key == "linuxdo":
-        return [
-            "main button:has-text('使用 LinuxDO 继续')",
-            "button:has-text('使用 LinuxDO 继续')",
-            "button:has-text('Continue with LinuxDO')",
-            "button:has-text('LinuxDO')",
-            "button:has-text('Linux.do')",
-            "button:has-text('Linux')",
-            "button:has(#linuxdo_icon)",
-            "text=/使用\\s*LinuxDO\\s*继续/i",
-            "text=/Continue\\s+with\\s+LinuxDO/i",
-            "text=/LinuxDO|Linux\\.do/i",
-            "#linuxdo_icon",
-        ]
-    if provider.key == "github":
-        return [
-            "main button:has-text('使用 GitHub 继续')",
-            "button:has-text('使用 GitHub 继续')",
-            "button:has-text('GitHub')",
-            "button:has([aria-label='github_logo'])",
-            "text=/使用\\s*GitHub\\s*继续/i",
-            "text=/GitHub/i",
-        ]
-    return DEFAULT_LOGIN_SELECTORS
-
-
-SITE_OAUTH_TOGGLE_SELECTORS = [
-    # AgentRouter / 部分 New API fork 首次进 /login 只显示账号密码表单，点“注册”后才显示 OAuth 按钮。
-    "main a[href='/register']",
-    "main a[href$='/register']",
-    "main a:has-text('注册')",
-    "main button:has-text('注册')",
-    "main >> text=/没有账户|No account|Create account|Sign up|Register/i",
-    # 也兼容反向情况：注册页无 OAuth 时再点回登录页。
-    "main a[href='/login']",
-    "main a[href$='/login']",
-    "main a:has-text('登录')",
-    "main button:has-text('登录')",
-    "main >> text=/已有账户|Already have|Sign in|Log in/i",
-]
-
-
-SITE_LOGIN_SELECTORS = [
-    "a[href='/login']",
-    "a[href$='/login']",
-    "a:has-text('登录')",
-    "a:has-text('登 录')",
-    "a:has-text('Log In')",
-    "a:has-text('Sign in')",
-    "button:has-text('登录')",
-    "button:has-text('登 录')",
-    "button:has-text('Log In')",
-    "button:has-text('Sign in')",
-    "text=/^\\s*登\\s*录\\s*$/",
-    "text=/^\\s*登录\\s*$/",
-    "text=/^\\s*Log\\s*In\\s*$/i",
-    "text=/^\\s*Sign\\s*in\\s*$/i",
-]
-
-
-async def _maybe_click_with_popup(page, locator, log: LogFn, error_collector: dict[str, Any] | None = None, base_url: str = ""):
-    popup_task = asyncio.create_task(page.wait_for_event("popup", timeout=10000))
-    before_url = page.url
-
-    async def _drain_popup_task() -> None:
-        popup_task.cancel()
-        try:
-            await popup_task
-        except BaseException:
-            pass
-
-    # 普通点击可能因不可见遮罩拦截指针事件而超时（Playwright 认为元素“可见/可用/稳定”
-    # 却卡在派发点击），此时不应让整轮 relogin 失败：依次尝试强制点击、DOM dispatch，
-    # 全部失败再返回 None，交由 _trigger_oauth 回退到直连授权 URL。仅真实驱动崩溃才上抛。
-    clicked = False
-    click_attempts = (
-        ("普通点击", lambda: locator.click(timeout=7000)),
-        ("强制点击", lambda: locator.click(timeout=3000, force=True)),
-        ("DOM dispatch", lambda: locator.dispatch_event("click")),
-    )
-    for label, do_click in click_attempts:
-        try:
-            await do_click()
-            clicked = True
-            break
-        except Exception as exc:
-            if _is_driver_closed_error(exc):
-                await _drain_popup_task()
-                raise
-            log(f"OAuth 入口{label}失败（{type(exc).__name__}）")
-
-    if not clicked:
-        log("OAuth 入口所有点击方式均失败，回退到直连授权 URL")
-        await _drain_popup_task()
-        return None
-
-    popup = None
-    try:
-        popup = await popup_task
-    except Exception:
-        popup = None
-    if popup:
-        try:
-            if error_collector is not None:
-                _install_site_error_collector(popup, base_url, error_collector)
-            await popup.wait_for_load_state("domcontentloaded", timeout=15000)
-        except Exception:
-            pass
-        log(f"站点前端已打开 OAuth 弹窗：{popup.url}")
-        return popup
-
-    await asyncio.sleep(2.5)
-    if page.url != before_url:
-        log(f"站点前端已跳转：{page.url}")
-        return page
-    log("点击后未检测到 OAuth 弹窗或跳转，可能 /api/oauth/state 被限流或按钮请求失败")
-    return None
-
-
-async def _click_site_oauth_entry(
-    page,
-    base_url: str,
-    provider,
-    log: LogFn = _noop,
-    error_collector: dict[str, Any] | None = None,
-):
-    """关闭公告并点击站点前端的 OAuth 登录按钮，作为 /api/oauth/state 直取失败的兜底。
-
-    AgentRouter 等 New API fork 可能首次进入 /login 只显示账号密码表单，
-    需要点一次“注册/登录”切换或直接进入 /register 后才渲染 LinuxDO/GitHub OAuth 按钮。
-    """
-    selectors = _site_oauth_selectors(provider)
-
-    async def _first_visible(selectors_to_try: list[str]):
-        for sel in selectors_to_try:
-            try:
-                loc = page.locator(sel).first
-                if await loc.count() <= 0:
-                    continue
-                try:
-                    visible = await loc.is_visible()
-                except Exception as vis_exc:
-                    if _is_driver_closed_error(vis_exc):
-                        raise
-                    visible = True
-                if not visible:
-                    continue
-                return sel, loc
-            except Exception as exc:
-                if _is_driver_closed_error(exc):
-                    raise
-                continue
-        return "", None
-
-    async def _dismiss_current_popups() -> None:
-        closed = await popups.dismiss_popups(page)
-        if closed:
-            log(f"已关闭 {closed} 个公告/弹窗")
-            await asyncio.sleep(0.5)
-
-    async def _click_oauth_if_visible():
-        sel, loc = await _first_visible(selectors)
-        if loc is None:
-            return None
-        log(f"点击站点前端 OAuth 登录入口：{sel}")
-        return await _maybe_click_with_popup(page, loc, log, error_collector, base_url)
-
-    async def _try_switch_auth_panel() -> bool:
-        """尝试切到另一个登录/注册面板；返回是否执行了点击。"""
-        for sel in SITE_OAUTH_TOGGLE_SELECTORS:
-            try:
-                loc = page.locator(sel).first
-                if await loc.count() <= 0:
-                    continue
-                try:
-                    visible = await loc.is_visible()
-                except Exception as vis_exc:
-                    if _is_driver_closed_error(vis_exc):
-                        raise
-                    visible = True
-                if not visible:
-                    continue
-                before_url = page.url
-                log(f"切换站点登录/注册面板以显示 OAuth 入口：{sel}")
-                await loc.click(timeout=7000)
-                try:
-                    await page.wait_for_load_state("domcontentloaded", timeout=10000)
-                except Exception:
-                    pass
-                await asyncio.sleep(1.2)
-                if page.url != before_url:
-                    log(f"站点登录/注册页已切换：{page.url}")
-                await _wait_for_ready(page, timeout_ms=8000, log=log)
-                await _dismiss_current_popups()
-                return True
-            except Exception as exc:
-                if _is_driver_closed_error(exc):
-                    raise
-                continue
-        return False
-
-    root = base_url.rstrip("/")
-    targets = [root + "/login", root + "/register", root]
-    seen: set[str] = set()
-    for target in targets:
-        if target in seen:
-            continue
-        # WAF 熔断（IP 被持续风控）：每个兜底页都是挑战页，逐个打开纯属空耗
-        if _waf_is_blocked(page):
-            log("WAF 熔断，停止逐个打开站点登录页兜底")
-            break
-        seen.add(target)
-        try:
-            current_url = page.url.split("#", 1)[0].split("?", 1)[0].rstrip("/")
-            target_url = target.rstrip("/")
-            if current_url != target_url:
-                log(f"打开站点登录页兜底：{target}")
-                await _safe_goto(page, target, wait_until="domcontentloaded", timeout=30000, log=log)
-            await _wait_for_ready(page, timeout_ms=15000, log=log)
-        except Exception as exc:
-            # Driver/browser crash must stop the whole flow, not spin against a
-            # dead process. Let it bubble up so run_oauth_checkin flags
-            # driver_crashed and returns immediately.
-            if _is_driver_closed_error(exc):
-                raise
-            log(f"打开登录页失败（继续尝试当前页）：{type(exc).__name__}")
-        await _dismiss_current_popups()
-
-        entry_page = await _click_oauth_if_visible()
-        if entry_page is not None:
-            return entry_page
-
-        # 部分站点要先从 /login 点“注册”，或从 /register 点“登录”，OAuth 按钮才渲染。
-        for _ in range(2):
-            if not await _try_switch_auth_panel():
-                break
-            entry_page = await _click_oauth_if_visible()
-            if entry_page is not None:
-                return entry_page
-
-    log("未找到可点击的站点前端 OAuth 登录入口")
-    return None
-
-
-def _attach_oauth_completion_messages(
-    result: dict[str, Any],
-    messages: list[str],
-    log: LogFn = _noop,
-) -> None:
-    """OAuth 授权完成后的消息处理：成功回跳时只保留成功提示。
-
-    登录前的 `/api/user/self` 401、SPA 初始化阶段的请求错误都可能留在同一个
-    collector 里。若已经跳回站点，再把这些历史错误打成「站点原始错误」既误导
-    用户，也会把一次真实成功说成登录失效。成功回跳时只抽取成功 Toast；只有
-    OAuth 没完成时才保留全部原始错误用于诊断。
-    """
-    if result.get("landed_back"):
-        success = _site_success_message(messages)
-        if success:
-            result.setdefault("site_success_message", success)
-            log(f"站点成功提示：{success}")
-        result.pop("site_error", None)
-        result.pop("site_errors", None)
-        return
-    _attach_site_errors(result, messages, log)
-
-
-async def _finish_oauth_authorization(
-    page,
-    base_url: str,
-    provider,
-    result: dict[str, Any],
-    log: LogFn = _noop,
-    error_collector: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """完成 provider 授权页：解验证、点击授权、等待回跳。"""
-    # 解 Cloudflare（linux.do 常套 CF）
-    if not await bypass.solve_cloudflare(page, log=log):
-        result["cloudflare"] = True
-
-    # 检测是否停在第三方登录页（共享登录态失效）
-    for marker in provider.login_markers:
-        try:
-            if await page.query_selector(marker):
-                result["need_human"] = True
-                log(f"停在 {provider.key} 登录页：共享登录态失效，请在 GUI 重新捕获 {provider.key} 登录态")
-                _attach_site_errors(result, await _site_error_messages(page, error_collector), log)
-                return result
-        except Exception as exc:
-            # A dead driver must stop the flow, not be swallowed as "marker absent".
-            if _is_driver_closed_error(exc):
-                raise
-            pass
-
-    # 点「同意授权」按钮（已授权过的账号可能自动回跳，无按钮）
-    for sel in provider.approve_selectors:
-        try:
-            await page.wait_for_selector(sel, timeout=8000)
-            btn = await page.query_selector(sel)
-            if btn:
-                log(f"点击授权按钮：{sel}")
-                await btn.click()
-                result["clicked"] = True
-                await asyncio.sleep(2)
-                await bypass.solve_cloudflare(page, log=log)
-                break
-        except Exception as exc:
-            # Let a dead driver bubble up instead of trying the next selector.
-            if _is_driver_closed_error(exc):
-                raise
-            continue
-    if not result["clicked"]:
-        log("未见授权按钮（可能已自动授权），继续等待回跳...")
-
-    # 等待带 code 回跳站点（{origin}/api/oauth/... 或 /console，或 URL 含 code=）
-    def _landed(u: str) -> bool:
-        return base_url in u and ("/console" in u or "code=" in u or "/oauth" in u)
-
-    try:
-        await page.wait_for_url(_landed, timeout=OAUTH_WAIT_SECONDS * 1000)
-        result["landed_back"] = True
-        log(f"OAuth 已跳回站点：{page.url}")
-        if await _is_waf_html(page):
-            await _solve_waf(page, base_url, log, rounds=2)
-    except Exception:
-        try:
-            cur = page.url
-        except Exception:
-            cur = ""
-        if base_url in cur or "code=" in cur:
-            result["landed_back"] = True
-            log(f"OAuth 回跳（超时但已在站点）：{cur}")
-        else:
-            content_low = ""
-            try:
-                content_low = (await page.content()).lower()
-            except Exception:
-                pass
-            if "just a moment" in content_low or "cloudflare" in content_low:
-                result["cloudflare"] = True
-                log("OAuth 被 Cloudflare 拦截")
-            else:
-                log(f"OAuth 未跳回站点，停在：{cur}")
-
-    _attach_oauth_completion_messages(result, await _site_error_messages(page, error_collector), log)
-    return result
-
-
-async def _trigger_oauth(
-    page,
-    base_url: str,
-    oauth_provider: str,
-    log: LogFn = _noop,
-    error_collector: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """OAuth 授权流程：站点前端登录入口优先，直连授权 URL 兜底。
-
-    优先路径（AgentRouter 等 fork）：
-      进入 /login，必要时切到 /register，再点击「使用 LinuxDO/GitHub 继续」，
-      让站点前端自己请求 /api/oauth/state 并打开第三方授权页。
-    兜底路径：
-      client_id ← GET /api/status（provider_client_id）
-      state     ← GET /api/oauth/state（一次性，每次重取）
-      授权 URL   ← provider.build_authorize_url(client_id, state)
-    浏览器已持有第三方登录态时，授权页会出现「同意授权」按钮或自动回跳；
-    回跳站点 {origin}/api/oauth/{provider} 后触发发额度。
-
-    Returns:
-        {clicked, landed_back, need_human, cloudflare, provider, driver_crashed?}
-    """
-    provider = oauth_providers.get_oauth_provider(oauth_provider)
-    result: dict[str, Any] = {
-        "clicked": False, "landed_back": False, "need_human": False,
-        "cloudflare": False, "provider": provider.key,
-    }
-
-    # 站点当前页须先脱离 WAF，否则 /api/status 也会被拦
-    if await _is_waf_html(page):
-        if not _waf_is_blocked(page):
-            await _solve_waf(page, base_url, log, rounds=2)
-        # WAF 熔断（IP 被持续风控）：前端入口和直连授权都会被同样拦截，直接早退
-        if _waf_is_blocked(page):
-            result["waf_blocked"] = True
-            log("WAF 熔断，跳过 OAuth 触发（出口 IP 被持续风控）")
-            _attach_site_errors(result, await _site_error_messages(page, error_collector), log)
-            return result
-
-    # 1) 优先走站点前端：AgentRouter 等站点访问 /login 后需切到注册/登录面板，点击 LinuxDO/GitHub 按钮。
-    log(f"尝试通过站点前端登录页触发 {provider.key} OAuth...")
-    entry_page = await _click_site_oauth_entry(page, base_url, provider, log, error_collector)
-    if entry_page is not None:
-        result["frontend_entry"] = True
-        return await _finish_oauth_authorization(entry_page, base_url, provider, result, log, error_collector)
-    log("站点前端 OAuth 入口未触发，回退到直连授权 URL")
-
-    # 2) client_id + 开关
-    client_id, enabled = await _fetch_oauth_client_id(page, base_url, provider)
-    if not client_id:
-        log(f"未能从 /api/status 获取 {provider.key}_client_id（站点未开启该 OAuth 或被 WAF 拦截）")
-        _attach_site_errors(result, await _site_error_messages(page, error_collector), log)
-        return result
-    if not enabled:
-        log(f"站点未开启 {provider.key} OAuth 登录")
-        _attach_site_errors(result, await _site_error_messages(page, error_collector), log)
-        return result
-    log(f"已获取 {provider.key} client_id={client_id}")
-
-    # 3) state（一次性）。前端路径已尝试过，直取失败则返回失败诊断。
-    oauth_state, state_diag = await _fetch_oauth_state(page, base_url, log)
-    if not oauth_state:
-        result["state_error"] = state_diag
-        log(f"未能获取 /api/oauth/state（{state_diag}）")
-        _attach_site_errors(result, await _site_error_messages(page, error_collector), log)
-        return result
-
-    # 4) 导航到第三方授权页
-    authorize_url = provider.build_authorize_url(client_id, oauth_state)
-    log(f"导航到 {provider.key} 授权页：{provider.authorize_endpoint}")
-    try:
-        await _safe_goto(page, authorize_url, wait_until="domcontentloaded", timeout=30000, log=log)
-    except Exception as exc:
-        if _is_driver_closed_error(exc):
-            result["driver_crashed"] = True
-            log(f"浏览器驱动崩溃：{exc}")
-        else:
-            log(f"导航授权页失败：{exc}")
-        _add_site_error(error_collector, "exception", exc)
-        _attach_site_errors(result, await _site_error_messages(page, error_collector), log)
-        return result
-
-    return await _finish_oauth_authorization(page, base_url, provider, result, log, error_collector)
 
 
 # ═══════════════════════════ 公开 API（async）═══════════════════════════
@@ -1452,10 +118,11 @@ async def capture_login(
     except Exception as exc:
         raise BrowserSessionError(f"启动 Camoufox 失败（请先运行 `camoufox fetch` 安装浏览器）：{exc}") from exc
 
+    resources = BrowserResources(browser=browser)
     page = None
     try:
         # 打开登录页
-        page = await context.new_page()
+        page = resources.track_page(await context.new_page())
         await popups.setup_popup_guard(page, allowed_origin=_origin_from_url(base_url))
         await _safe_goto(page, base_url, wait_until="domcontentloaded", timeout=30000, log=log)
 
@@ -1507,8 +174,7 @@ async def capture_login(
         raise
 
     finally:
-        await _safe_close_page(page)
-        await _safe_close_browser(browser)
+        await resources.close()
 
 
 async def capture_oauth_state(
@@ -1535,9 +201,10 @@ async def capture_oauth_state(
     except Exception as exc:
         raise BrowserSessionError(f"启动 Camoufox 失败（请先运行 `camoufox fetch` 安装浏览器）：{exc}") from exc
 
+    resources = BrowserResources(browser=browser)
     page = None
     try:
-        page = await context.new_page()
+        page = resources.track_page(await context.new_page())
         # provider 页面不安装通用站点公告守卫，避免误作用到 OAuth 授权/提示弹窗。
         await _safe_goto(page, provider.capture_url, wait_until="domcontentloaded", timeout=30000, log=log)
 
@@ -1600,8 +267,7 @@ async def capture_oauth_state(
             raise BrowserSessionError(f"浏览器驱动已关闭，{provider.key} 登录态捕获中断；请重试，若反复出现请更新 camoufox/playwright。") from exc
         raise
     finally:
-        await _safe_close_page(page)
-        await _safe_close_browser(browser)
+        await resources.close()
 
 
 async def capture_sub2api_login(
@@ -1629,9 +295,10 @@ async def capture_sub2api_login(
     except Exception as exc:
         raise BrowserSessionError(f"启动 Camoufox 失败（请先运行 `camoufox fetch` 安装浏览器）：{exc}") from exc
 
+    resources = BrowserResources(browser=browser)
     page = None
     try:
-        page = await context.new_page()
+        page = resources.track_page(await context.new_page())
         await popups.setup_popup_guard(page, allowed_origin=_origin_from_url(base_url))
         await _safe_goto(page, base_url, wait_until="domcontentloaded", timeout=30000, log=log)
 
@@ -1726,8 +393,7 @@ async def capture_sub2api_login(
             raise BrowserSessionError("浏览器驱动已关闭，Sub2API 登录态捕获中断；请重试，若反复出现请更新 camoufox/playwright。") from exc
         raise
     finally:
-        await _safe_close_page(page)
-        await _safe_close_browser(browser)
+        await resources.close()
 
 
 async def capture_sub2api_token(
@@ -1760,7 +426,7 @@ async def capture_sub2api_token(
         storage_state_dict = state.decode_state(browser_state_text)
         log(f"已解码登录态：{state.state_summary(storage_state_dict)}")
     except state.BrowserStateError as exc:
-        raise BrowserSessionError(f"登录态解码失败：{exc}") from exc
+        raise BrowserSessionError(f"登录态解码失败：{exc}", status="need_config") from exc
 
     headless = _env_headless()
     log(f"Camoufox 运行模式：{_browser_mode_label(headless)}" + (" / proxy" if proxy else ""))
@@ -1771,11 +437,12 @@ async def capture_sub2api_token(
     except Exception as exc:
         raise BrowserSessionError(f"启动 Camoufox 失败：{exc}") from exc
 
+    resources = BrowserResources(browser=browser)
     page = None
     try:
         await state.restore_storage_state(context, storage_state_dict)
 
-        page = await context.new_page()
+        page = resources.track_page(await context.new_page())
         await popups.setup_popup_guard(page, allowed_origin=_origin_from_url(base_url))
         await _safe_goto(page, base_url, wait_until="domcontentloaded", timeout=30000, log=log)
         await _wait_for_ready(page, timeout_ms=30000, log=log)
@@ -2039,8 +706,7 @@ async def capture_sub2api_token(
         log(f"浏览器驱动已关闭：{exc}")
         return None
     finally:
-        await _safe_close_page(page)
-        await _safe_close_browser(browser)
+        await resources.close()
 
 
 async def verify_state(
@@ -2071,7 +737,7 @@ async def verify_state(
             storage_state_dict = state.decode_state(browser_state_text)
             log(f"已解码登录态：{state.state_summary(storage_state_dict)}")
         except state.BrowserStateError as exc:
-            raise BrowserSessionError(f"登录态解码失败：{exc}") from exc
+            raise BrowserSessionError(f"登录态解码失败：{exc}", status="need_config") from exc
 
     headless = _env_headless()
     log(f"Camoufox 运行模式：{_browser_mode_label(headless)}" + (" / proxy" if proxy else ""))
@@ -2085,11 +751,12 @@ async def verify_state(
     except Exception as exc:
         raise BrowserSessionError(f"启动 Camoufox 失败：{exc}") from exc
 
+    resources = BrowserResources(browser=browser)
     page = None
     try:
         await state.restore_storage_state(context, storage_state_dict)
 
-        page = await context.new_page()
+        page = resources.track_page(await context.new_page())
         await popups.setup_popup_guard(page, allowed_origin=_origin_from_url(base_url))
         await _safe_goto(page, base_url, wait_until="domcontentloaded", timeout=30000, log=log)
         await _wait_for_ready(page, timeout_ms=30000, log=log)
@@ -2125,100 +792,7 @@ async def verify_state(
         return {"ok": False, "message": "浏览器驱动已关闭或页面脚本触发 Playwright Firefox 兼容问题，请重试。", "username": "", "quota": 0, "driver_crashed": True}
 
     finally:
-        await _safe_close_page(page)
-        await _safe_close_browser(browser)
-
-
-def _same_origin(left: str, right: str) -> bool:
-    """按 scheme + hostname + 生效端口比较来源，不做字符串包含判断。"""
-    try:
-        a, b = urlsplit(str(left or "")), urlsplit(str(right or ""))
-    except ValueError:
-        return False
-    scheme_a, scheme_b = a.scheme.lower(), b.scheme.lower()
-    host_a = oauth_providers.normalize_hostname(a.hostname)
-    host_b = oauth_providers.normalize_hostname(b.hostname)
-    if not scheme_a or not host_a or scheme_a != scheme_b or host_a != host_b:
-        return False
-    default = {"http": 80, "https": 443}
-    try:
-        port_a = a.port or default.get(scheme_a)
-        port_b = b.port or default.get(scheme_b)
-    except ValueError:
-        return False
-    return port_a == port_b
-
-
-def storage_item(storage_state: dict[str, Any] | None, name: str, *, base_url: str = "") -> str:
-    """从 storage_state 的 localStorage 里取某个键的值；找不到返回空串。
-
-    传入 base_url 时只读同源条目。storage_state 可能含多个 origin（共享 OAuth
-    登录态、上一站点残留、第三方 iframe），而 auth_token / refresh_token 这类键名
-    在各站点高度重复。不限定来源就会返回「第一个同名键」，把 A 站 token 当成 B 站的
-    存进缓存甚至发给 B 站（已实测）。找不到同源条目时返回空串，绝不跨源兜底——
-    宁可退化成重新登录，也不能拿错身份。
-
-    base_url 为空表示调用方明确不关心来源（如仅做存在性诊断），保持旧行为。
-    """
-    if not isinstance(storage_state, dict):
-        return ""
-    want_origin = str(base_url or "").strip()
-    for origin_entry in storage_state.get("origins") or []:
-        if not isinstance(origin_entry, dict):
-            continue
-        if want_origin and not _same_origin(origin_entry.get("origin") or "", want_origin):
-            continue
-        for item in origin_entry.get("localStorage") or []:
-            if not isinstance(item, dict):
-                continue
-            if str(item.get("name") or "").strip() == name:
-                value = str(item.get("value") or "").strip()
-                if value:
-                    return value
-    return ""
-
-
-def storage_refresh_token(storage_state: dict[str, Any] | None, *, base_url: str = "") -> str:
-    """从 storage_state 的 localStorage 里取出 refresh_token。
-
-    Sub2API 系站点把 access_token（短期 JWT）与 refresh_token（长期）都放在
-    localStorage。把 refresh_token 提出来存进 ACCOUNTS.json，纯 HTTP 路径就能
-    自行调 /api/v1/auth/refresh 续期，不必为「JWT 过期」这种常见情况开浏览器。
-    找不到返回空串。传 base_url 可限定只读该站点自己的条目。
-    """
-    return storage_item(storage_state, "refresh_token", base_url=base_url)
-
-
-def storage_access_token(storage_state: dict[str, Any] | None, *, base_url: str = "") -> str:
-    """从 storage_state 里取出 access_token（Sub2API 系前端存作 auth_token）。"""
-    return storage_item(storage_state, "auth_token", base_url=base_url) or storage_item(
-        storage_state, "access_token", base_url=base_url
-    )
-
-
-def _site_cookie_string(cookies: list[dict[str, Any]], base_url: str) -> str:
-    """从 context.cookies() 里挑出属于站点域的 cookie，拼成 "k=v; k2=v2"。
-
-    仿 millylee：把浏览器过 WAF 后拿到的 acw_tc 等 WAF cookie 与站点 session
-    cookie 一起导出，交给 HTTP 层复用。只保留 cookie 作用域真正覆盖站点 host 的
-    条目（cookie 域等于 host 或为其父域），避免把第三方 OAuth（linux.do/github）
-    或兄弟子域的 cookie 混入站点请求。域边界判定复用 oauth_providers 的唯一实现。
-    """
-    host = urlparse(_origin_from_url(base_url)).hostname or ""
-    if not host:
-        return ""
-    pairs: dict[str, str] = {}
-    for cookie in cookies or []:
-        name = str(cookie.get("name") or "")
-        if not name:
-            continue
-        domain = str(cookie.get("domain") or "")
-        if not domain:
-            continue
-        # host 位于 cookie 域边界内即代表该 cookie 会被发送给站点。
-        if oauth_providers.hostname_matches_domain(host, domain):
-            pairs[name] = str(cookie.get("value") or "")
-    return "; ".join(f"{k}={v}" for k, v in pairs.items())
+        await resources.close()
 
 
 async def refresh_site_cookies(
@@ -2256,7 +830,7 @@ async def refresh_site_cookies(
             storage_state_dict = state.decode_state(browser_state_text)
             log(f"已解码登录态：{state.state_summary(storage_state_dict)}")
         except state.BrowserStateError as exc:
-            raise BrowserSessionError(f"登录态解码失败：{exc}") from exc
+            raise BrowserSessionError(f"登录态解码失败：{exc}", status="need_config") from exc
 
     headless = _env_headless()
     log(f"Camoufox 运行模式：{_browser_mode_label(headless)}" + (" / proxy" if proxy else ""))
@@ -2270,11 +844,12 @@ async def refresh_site_cookies(
     except Exception as exc:
         raise BrowserSessionError(f"启动 Camoufox 失败：{exc}") from exc
 
+    resources = BrowserResources(browser=browser)
     page = None
     try:
         await state.restore_storage_state(context, storage_state_dict)
 
-        page = await context.new_page()
+        page = resources.track_page(await context.new_page())
         await popups.setup_popup_guard(page, allowed_origin=_origin_from_url(base_url))
         await _safe_goto(page, base_url, wait_until="domcontentloaded", timeout=30000, log=log)
         await _wait_for_ready(page, timeout_ms=30000, log=log)
@@ -2360,8 +935,7 @@ async def refresh_site_cookies(
             "driver_crashed": True,
         }
     finally:
-        await _safe_close_page(page)
-        await _safe_close_browser(browser)
+        await resources.close()
 
 
 async def run_oauth_checkin(
@@ -2396,7 +970,7 @@ async def run_oauth_checkin(
             storage_state_dict = state.decode_state(browser_state_text)
             log(f"已解码登录态：{state.state_summary(storage_state_dict)}")
         except state.BrowserStateError as exc:
-            raise BrowserSessionError(f"登录态解码失败：{exc}") from exc
+            raise BrowserSessionError(f"登录态解码失败：{exc}", status="need_config") from exc
 
     headless = _env_headless()
     log(f"Camoufox 运行模式：{_browser_mode_label(headless)}" + (" / proxy" if proxy else ""))
@@ -2410,6 +984,7 @@ async def run_oauth_checkin(
     except Exception as exc:
         raise BrowserSessionError(f"启动 Camoufox 失败：{exc}") from exc
 
+    resources = BrowserResources(browser=browser)
     page = None
     error_collector: dict[str, Any] | None = None
     quota_before = None
@@ -2419,7 +994,7 @@ async def run_oauth_checkin(
     try:
         await state.restore_storage_state(context, storage_state_dict)
 
-        page = await context.new_page()
+        page = resources.track_page(await context.new_page())
         error_collector = _install_site_error_collector(page, base_url)
         await popups.setup_popup_guard(page, allowed_origin=_origin_from_url(base_url))
         await _safe_goto(page, base_url, wait_until="domcontentloaded", timeout=30000, log=log)
@@ -2522,7 +1097,6 @@ async def run_oauth_checkin(
                 )
             except Exception:
                 pass
-        await _safe_close_page(page)
-        await _safe_close_browser(browser)
+        await resources.close()
 
     return _oauth_checkin_result(quota_before, quota_after, link)

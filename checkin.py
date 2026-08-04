@@ -27,7 +27,6 @@
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
 import contextlib
 import json
 import os
@@ -36,6 +35,8 @@ from pathlib import Path
 
 import accounts_store
 import providers
+from checkin_core.batch import run_serial_groups
+from checkin_core.enums import OK_STATUSES
 from config import Timeouts
 from mask_utils import sanitize_data
 from providers.base import CheckinResult, SiteConfig
@@ -47,7 +48,6 @@ if hasattr(sys.stderr, "reconfigure"):
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = SCRIPT_DIR / "sites.json"
-OK_STATUSES = {"success", "already_done"}
 
 
 # base_url 归一化唯一实现在 accounts_store；保留模块级别名兼容既有引用。
@@ -87,26 +87,15 @@ def load_sites(config_path: Path) -> list[SiteConfig]:
 
 
 def run_sites(sites: list[SiteConfig], turnstile: str = "", workers: int = 0) -> list[CheckinResult]:
+    """同站账号串行、不同站点并发执行，结果保持配置顺序。"""
     enabled_sites = [site for site in sites if site.enabled]
-    if not enabled_sites:
-        return []
-
-    max_workers = workers if workers > 0 else min(8, len(enabled_sites))
-    results: list[CheckinResult | None] = [None] * len(enabled_sites)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {
-            executor.submit(run_site_checkin, site, turnstile): index
-            for index, site in enumerate(enabled_sites)
-        }
-        for future in concurrent.futures.as_completed(future_map):
-            index = future_map[future]
-            site = enabled_sites[index]
-            try:
-                results[index] = future.result()
-            except Exception as exc:
-                results[index] = CheckinResult(site.name, site.base_url, "error", f"签到任务异常：{exc}")
-
-    return [result for result in results if result is not None]
+    return run_serial_groups(
+        enabled_sites,
+        key=lambda site: normalize_base_url(site.base_url),
+        execute=lambda site: run_site_checkin(site, turnstile),
+        on_error=lambda site, exc: CheckinResult(site.name, site.base_url, "error", f"签到任务异常：{exc}"),
+        workers=workers,
+    )
 
 
 def parse_args() -> argparse.Namespace:

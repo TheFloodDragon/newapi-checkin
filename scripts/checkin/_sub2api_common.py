@@ -105,6 +105,8 @@ def _as_list(value: Any, default: tuple[str, ...]) -> list[str]:
 
 
 def _as_bool(value: Any, default: bool = True) -> bool:
+    if value is None:
+        return default
     if isinstance(value, str):
         return value.strip().casefold() not in {"0", "false", "no", "off"}
     return bool(value)
@@ -1351,3 +1353,78 @@ async def wait_for_checkin_control(
             return None, None
         remaining_ms = max(1, int((deadline - loop.time()) * 1000))
         await page.wait_for_timeout(min(opts.poll_interval_ms * 3, remaining_ms))
+
+
+async def run_checkin_flow(
+    page: Any,
+    context: Any,
+    site: Any,
+    helpers: Any,
+    spec: SiteSpec,
+) -> dict[str, Any]:
+    """执行 Sub2API browser_script 的统一登录、状态探测、点击与 API 兜底流程。"""
+    opts = parse_options(spec, getattr(site, "script_args", {}))
+    start_target = opts.start_target or spec.default_start_path
+    resolved_url = helpers.resolve_url(start_target)
+    origin = helpers.resolve_url("/").rstrip("/")
+    login_detail: dict[str, Any] = {}
+
+    async def do_login() -> dict[str, Any] | None:
+        return await login_with_password(
+            page,
+            context,
+            helpers,
+            spec,
+            opts,
+            resolved_url=resolved_url,
+            origin=origin,
+            login_detail=login_detail,
+        )
+
+    await add_init_script(context, preflight_init_script())
+    await navigate_and_settle(page, helpers, start_target, opts)
+
+    login_attempted = False
+    if await on_login_page(page):
+        login_attempted = True
+        failure = await do_login()
+        if failure is not None:
+            return failure
+        await navigate_and_settle(page, helpers, start_target, opts)
+        if await on_login_page(page):
+            return helpers.need_login(
+                f"{spec.site_label}登录后仍停留在登录页，请检查凭据或稍后重试",
+                {"target_url": resolved_url, "login_fallback": "redirect_failed", **login_detail},
+            )
+
+    await persist_state(context, site)
+    control, early_result = await wait_for_checkin_control(
+        page,
+        helpers,
+        spec,
+        opts,
+        resolved_url=resolved_url,
+        login_detail=login_detail,
+    )
+    if early_result is not None:
+        return early_result
+    if control is None:
+        return await api_fallback(
+            page,
+            helpers,
+            spec,
+            opts,
+            origin=origin,
+            resolved_url=resolved_url,
+            login_attempted=login_attempted,
+            do_login=do_login,
+        )
+    return await click_and_confirm(
+        page,
+        helpers,
+        spec,
+        opts,
+        control,
+        resolved_url=resolved_url,
+        extra_detail=login_detail,
+    )

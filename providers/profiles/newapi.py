@@ -371,9 +371,7 @@ class NewApiProfile(SiteProfile):
                 )
             )
         except browser_session.BrowserSessionError as exc:
-            msg = str(exc)
-            status = "error" if ("camoufox" in msg.lower() or "启动" in msg) else "need_login"
-            raise BrowserAuthError(status, msg) from exc
+            raise BrowserAuthError(exc.status, str(exc), detail=exc.detail) from exc
         except Exception as exc:
             raise BrowserAuthError("error", f"浏览器过 WAF 异常：{exc}") from exc
 

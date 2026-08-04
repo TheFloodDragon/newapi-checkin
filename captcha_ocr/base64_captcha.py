@@ -51,6 +51,7 @@ docs/captcha_algorithm.md，不在此重复以免漂移。
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -246,14 +247,14 @@ class Templates:
         ]
 
 
-_TEMPLATES: Templates | None = None
+@lru_cache(maxsize=None)
+def _templates_for_path(path: Path) -> Templates:
+    return Templates.load(path)
 
 
 def templates(path: Path | str = TEMPLATES_PATH) -> Templates:
-    global _TEMPLATES
-    if _TEMPLATES is None:
-        _TEMPLATES = Templates.load(path)
-    return _TEMPLATES
+    """按规范化文件路径懒加载模板；不同模板库绝不能共享同一个全局实例。"""
+    return _templates_for_path(Path(path).expanduser().resolve())
 
 
 # ── 分割：按「颜色方向」聚类 ─────────────────────────────────────────────────

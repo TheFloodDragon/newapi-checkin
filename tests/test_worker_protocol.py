@@ -10,6 +10,7 @@ import pytest
 
 import checkin
 import run__all_checkin as runner
+from checkin_core.events import WorkerEvent
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -269,6 +270,14 @@ def test_stage_logs_picks_known_prefixes_only() -> None:
     assert any("尝试纯 API 签到" in line for line in picked)
     assert not any("should-not-be-picked" in line for line in picked)
     assert not any("unknown" in line for line in picked)
+
+
+def test_stage_logs_accepts_structured_worker_events() -> None:
+    event = WorkerEvent(stage="api_first", site="s", message="token 已续期")
+
+    picked = runner.stage_logs(_result_with_diagnostics(event.to_line()))
+
+    assert picked == ["[api_first:s] token 已续期"]
 
 
 def test_stage_logs_empty_without_diagnostics() -> None:

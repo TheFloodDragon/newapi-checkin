@@ -69,7 +69,6 @@ CHECKIN_PATH = "/api/user/checkin"
 STATUS_PATH = "/api/status"
 
 # 「这次不算」的回执：换一张重试，而不是判定站点不支持。
-MISSING_PATTERNS = ["请输入验证码", "captcha is required", "验证码不能为空"]
 RETRY_PATTERNS = ["验证码错误", "验证码已失效", "验证码不正确", "captcha", "刷新后重试", "已过期"]
 # 取图端点不存在：换下一种方言。
 ENDPOINT_MISSING_PATTERNS = [

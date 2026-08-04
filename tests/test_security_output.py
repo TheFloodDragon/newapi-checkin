@@ -85,6 +85,8 @@ def test_suffix_based_sensitive_keys_are_redacted() -> None:
             "proxy_password": "FAKE_PROXY_PW",
             "private_key": "FAKE_PRIVATE_KEY",
             "site_cookie": "session=FAKE_SESSION",
+            "storage_state": "FAKE_STORAGE_STATE",
+            "browser_state_text": "FAKE_BROWSER_STATE_TEXT",
             "plain_field": "keep-me",
         }
     )
@@ -96,6 +98,8 @@ def test_suffix_based_sensitive_keys_are_redacted() -> None:
         "FAKE_PROXY_PW",
         "FAKE_PRIVATE_KEY",
         "FAKE_SESSION",
+        "FAKE_STORAGE_STATE",
+        "FAKE_BROWSER_STATE_TEXT",
     ):
         assert secret not in text
     assert safe["plain_field"] == "keep-me"

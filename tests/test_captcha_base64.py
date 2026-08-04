@@ -76,6 +76,28 @@ def test_templates_cover_charset_font_and_size_grid() -> None:
     assert set(table.chars) == set(BC.CHARSETS[table.charset])
 
 
+def test_template_cache_is_scoped_by_path(monkeypatch, tmp_path: Path) -> None:
+    first = object()
+    second = object()
+    calls: list[Path] = []
+
+    def fake_load(path: Path) -> object:
+        normalized = Path(path)
+        calls.append(normalized)
+        return first if normalized.name == "first.npz" else second
+
+    BC._templates_for_path.cache_clear()
+    monkeypatch.setattr(BC.Templates, "load", staticmethod(fake_load))
+    first_path = tmp_path / "first.npz"
+    second_path = tmp_path / "second.npz"
+
+    assert BC.templates(first_path) is first
+    assert BC.templates(first_path) is first
+    assert BC.templates(second_path) is second
+    assert calls == [first_path.resolve(), second_path.resolve()]
+    BC._templates_for_path.cache_clear()
+
+
 # ── 准确率 ───────────────────────────────────────────────────────────────────
 def test_per_character_accuracy_does_not_regress(results) -> None:
     ok = total = 0

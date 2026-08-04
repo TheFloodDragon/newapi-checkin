@@ -11,13 +11,11 @@
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
 import json
 import os
 import subprocess
 import sys
 import textwrap
-import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -26,6 +24,9 @@ from typing import Any
 
 import accounts_store
 import time_utils
+from checkin_core.batch import run_serial_groups
+from checkin_core.enums import OK_STATUSES, VALID_RESULT_STATUSES, status_meta
+from checkin_core.events import WorkerEvent
 from config import Timeouts, OutputConfig
 from mask_utils import mask_secrets, sanitize_data
 from providers import base as providers_base
@@ -42,14 +43,7 @@ CHECKIN_SCRIPT = SCRIPT_DIR / "checkin.py"
 RESULTS_DIR = accounts_store.RESULTS_DIR
 RESULT_JSON_PATH = RESULTS_DIR / "checkin_result.json"
 OLD_NEWAPI_SCRIPTS = {"elysiver_checkin.py", "chybenzun_checkin.py"}
-OK_STATUSES = {"success", "already_done"}
-VALID_RESULT_STATUSES = OK_STATUSES | {
-    "need_login",
-    "need_verification",
-    "need_config",
-    "network_error",
-    "error",
-}
+# 结果状态集合由 checkin_core.enums 统一维护。
 # 子任务因超时被强制终止时使用的约定退出码（与 GNU timeout 一致）。
 TIMEOUT_EXIT_CODE = 124
 
@@ -549,37 +543,15 @@ def build_detail_note(status: str, message: str, detail: Any) -> str:
 
 
 def compact_status(status: str, returncode: int) -> str:
-    if status == "success":
-        return "成功"
-    if status == "already_done":
-        return "已领取"
-    if status == "need_login":
-        return "登录失效"
-    if status == "need_verification":
-        return "需验证"
-    if status == "need_config":
-        return "需配置"
-    if status == "network_error":
-        return "网络错误"
     if status == "unknown":
         return "协议错误"
-    if status == "error":
-        return "失败"
-    return status if status != "unknown" else "失败"
+    return status_meta(status).label
 
 
 def status_icon(status: str, returncode: int) -> str:
-    if status == "success":
-        return "✅"
-    if status == "already_done":
-        return "🎁"
-    if status == "need_login":
-        return "🔐"
-    if status == "need_verification":
-        return "⚠️"
-    if status == "need_config":
-        return "🛠️"
-    return "❌"
+    if status == "unknown":
+        return "❌"
+    return status_meta(status).icon
 
 
 def task_result_to_summary(result: TaskResult) -> dict[str, Any]:
@@ -676,6 +648,12 @@ def stage_logs(result: TaskResult) -> list[str]:
     picked: list[str] = []
     for line in text.splitlines():
         stripped = line.strip()
+        event = WorkerEvent.from_line(stripped)
+        if event is not None:
+            marker = f"{event.stage}:{event.site}" if event.site else event.stage
+            picked.append(f"[{marker}] {event.message}")
+            continue
+        # 兼容尚未迁移的旧前缀日志。
         if not stripped.startswith("["):
             continue
         marker = stripped[1:].split("]", 1)[0]
@@ -718,36 +696,21 @@ def print_result(result: TaskResult, verbose: bool = False) -> None:
 
 
 def run_tasks(tasks: list[CheckinTask], workers: int = 0, verbose: bool = False) -> list[TaskResult]:
-    if not tasks:
-        return []
-
-    max_workers = workers if workers > 0 else min(8, len(tasks))
-    site_locks = {task.site_key: threading.Lock() for task in tasks if task.site_key}
-
-    def run_task_guarded(task: CheckinTask) -> TaskResult:
-        if not task.site_key:
-            return run_task(task)
-        with site_locks[task.site_key]:
-            return run_task(task)
-
-    results: list[TaskResult] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {executor.submit(run_task_guarded, task): task for task in tasks}
-        for future in concurrent.futures.as_completed(future_map):
-            task = future_map[future]
-            try:
-                result = future.result()
-            except Exception as exc:
-                result = TaskResult(
-                    task.name,
-                    1,
-                    "",
-                    diagnostics=f"任务异常：{exc}",
-                    worker_protocol=task.worker_protocol,
-                )
-            results.append(result)
-            print_result(result, verbose=verbose)
-    return results
+    """复用统一分组器：同站任务串行、独立脚本和不同站点并发。"""
+    return run_serial_groups(
+        tasks,
+        key=lambda task: task.site_key,
+        execute=run_task,
+        on_error=lambda task, exc: TaskResult(
+            task.name,
+            1,
+            "",
+            diagnostics=f"任务异常：{exc}",
+            worker_protocol=task.worker_protocol,
+        ),
+        workers=workers,
+        on_result=lambda result: print_result(result, verbose=verbose),
+    )
 
 
 def write_result_file(summaries: list[dict[str, Any]]) -> None:

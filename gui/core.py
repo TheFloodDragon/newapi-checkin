@@ -19,13 +19,16 @@ import uuid
 from copy import deepcopy
 from dataclasses import dataclass, field, fields, replace
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Callable
 
 import accounts_store
-import time_utils
+from checkin_core.auth import can_optional_oauth as _can_optional_oauth
+from checkin_core.auth import effective_auth as _effective_auth
+from checkin_core.enums import ACTION_VALUES, AUTH_METHOD_VALUES, PROFILE_VALUES, status_meta
 from config import Timeouts as _Timeouts
-from mask_utils import mask_secrets
+from mask_utils import is_sensitive_key, mask_secrets
+
+from .status_store import StatusStore as StatusStore
 
 _SCRIPT_TIMEOUT_DEFAULT = _Timeouts.BROWSER_SCRIPT_DEFAULT
 SCRIPT_TIMEOUT_DEFAULT = _SCRIPT_TIMEOUT_DEFAULT
@@ -37,11 +40,11 @@ _BROWSER_PROFILE_DEFAULT = ".browser_profile"
 REFERER_PATH_DEFAULT = _REFERER_PATH_DEFAULT
 BROWSER_PROFILE_DEFAULT = _BROWSER_PROFILE_DEFAULT
 
-# ── 词表（与 providers / accounts_store 对齐）─────────────────────────────────
-TYPES = ("newapi", "sub2api")
+# ── 词表（有限值由 checkin_core 唯一维护）────────────────────────────────────
+TYPES = PROFILE_VALUES
 CRED_FIELDS = ("user_id", "access_token", "refresh_token", "cookie")
-AUTH_METHODS = ("access_token", "cookie", "browser", "oauth")
-CHECKIN_ACTIONS = ("api", "visit", "relogin", "browser_script")
+AUTH_METHODS = AUTH_METHOD_VALUES
+CHECKIN_ACTIONS = ACTION_VALUES
 API_VARIANTS = ("auto", "legacy")
 OAUTH_PROVIDERS = accounts_store.KNOWN_OAUTH_PROVIDERS
 DEFAULT_OAUTH_ACCOUNT = accounts_store.DEFAULT_OAUTH_ACCOUNT
@@ -72,20 +75,7 @@ SCRIPT_HINT_API = "可留空。纯 HTTP 接管签到，用于图形验证码等�
 SCRIPT_PLACEHOLDER_API = "scripts/newapi_captcha.py（需要图形验证码时填）"
 
 
-# ── 脱敏日志（沿用旧版语义）───────────────────────────────────────────────────
-_SENSITIVE_LOG_KEYS = {
-    "access_token",
-    "authorization",
-    "auth_token",
-    "browser_state",
-    "browser_state_text",
-    "cookie",
-    "cookies",
-    "state",
-    "storage_state",
-    "token",
-}
-
+# ── 脱敏日志（敏感键规则统一由 mask_utils 维护）───────────────────────────────
 LogSink = Callable[[str], None]
 _LOG_SINKS: list[LogSink] = []
 
@@ -102,8 +92,7 @@ def remove_log_sink(sink: LogSink) -> None:
 
 
 def _is_sensitive_log_key(key: Any) -> bool:
-    text = str(key or "").strip().lower()
-    return text in _SENSITIVE_LOG_KEYS or text.endswith("_token") or text.endswith("_state") or "cookie" in text
+    return is_sensitive_key(str(key or ""))
 
 
 def _redact_log_value(value: Any) -> Any:
@@ -170,20 +159,13 @@ def error_result(message: str, exc: BaseException | None = None, **fields_: Any)
 
 # ── auth 矫正（唯一实现）─────────────────────────────────────────────────────
 def effective_auth(checkin_action: str, auth_method: str) -> str:
-    """checkin_action 对 auth_method 的强制约束：relogin 必用 oauth；
-    browser_script 只接受 browser/oauth（否则归 oauth）。"""
-    if checkin_action == "relogin":
-        return "oauth"
-    if checkin_action == "browser_script" and auth_method not in {"browser", "oauth"}:
-        return "oauth"
-    return auth_method
+    """兼容入口；认证约束的唯一实现在 checkin_core.auth。"""
+    return _effective_auth(checkin_action, auth_method)
 
 
 def can_optional_oauth(site_type: str, checkin_action: str, auth_method: str) -> bool:
-    """「可选 OAuth 兜底」开放条件：sub2api 接口签到 + token，或脚本 + 站点登录态。"""
-    return (site_type == "sub2api" and checkin_action == "api" and auth_method == "access_token") or (
-        checkin_action == "browser_script" and auth_method == "browser"
-    )
+    """兼容入口；可选 OAuth 矩阵的唯一实现在 checkin_core.auth。"""
+    return _can_optional_oauth(site_type, checkin_action, auth_method)
 
 
 # ── 行模型 ────────────────────────────────────────────────────────────────────
@@ -609,7 +591,7 @@ def config_snapshot(rows: list[SiteRow], oauth_states: dict[str, Any]) -> str:
 
 
 def credential_snapshot(row: SiteRow) -> dict[str, str]:
-    """GUI 成功保存时的凭据基线；用对象 id 关联，仅在当前进程内存在。"""
+    """GUI 成功保存时的凭据基线；用稳定 runtime_id 关联，仅在当前进程内存在。"""
     return {
         "name": row.name.strip(),
         "base_url": accounts_store.normalize_base_url(row.base_url),
@@ -619,8 +601,9 @@ def credential_snapshot(row: SiteRow) -> dict[str, str]:
     }
 
 
-def credential_snapshots(rows: list[SiteRow]) -> dict[int, dict[str, str]]:
-    return {id(row): credential_snapshot(row) for row in rows}
+def credential_snapshots(rows: list[SiteRow]) -> dict[str, dict[str, str]]:
+    """按 SiteRow.runtime_id 建立基线，避免对象销毁后 CPython id 被复用。"""
+    return {row.runtime_id: credential_snapshot(row) for row in rows}
 
 
 def changed_credential_fields(row: SiteRow, saved: dict[str, str] | None) -> set[str]:
@@ -762,7 +745,7 @@ def persist_accounts(rows: list[SiteRow]) -> list[dict[str, Any]]:
 
 def apply_credential_cache_changes(
     rows: list[SiteRow],
-    saved_credentials: dict[int, dict[str, str]],
+    saved_credentials: dict[str, dict[str, str]],
 ) -> int:
     """保存配置后标记「凭据已变」，但不再删除任何运行期缓存。
 
@@ -780,7 +763,7 @@ def apply_credential_cache_changes(
         return 0
 
     changed = 0
-    current_ids = {id(row) for row in rows}
+    current_ids = {row.runtime_id for row in rows}
     all_fields = {"access_token", "refresh_token", "browser_state"}
 
     # 已删除的行：标记而非清空，重建同名渠道时不会误继承旧凭据，也不丢数据。
@@ -792,7 +775,7 @@ def apply_credential_cache_changes(
 
     for row in rows:
         current = credential_snapshot(row)
-        old = saved_credentials.get(id(row))
+        old = saved_credentials.get(row.runtime_id)
         name, base = current["name"], current["base_url"]
         if old is None or (old.get("name", ""), old.get("base_url", "")) != (name, base):
             # 新行或改了身份：旧身份与新身份都打标记，等价于「这套凭据换了」。
@@ -841,6 +824,63 @@ def parse_clipboard_site(text: str) -> tuple[dict[str, Any] | None, str]:
     return data, ""
 
 
+_CLIPBOARD_SITE_FIELDS = frozenset({
+    "name",
+    "base_url",
+    "url",
+    "site_profile",
+    "type",
+    "provider",
+    "auth_method",
+    "checkin_action",
+    "script",
+    "script_args",
+    "script_timeout",
+    "api_variant",
+    "oauth_provider",
+    "oauth_account",
+    "oauth_account_id",
+    "oauth_fallback_provider",
+    "oauth_fallback_account",
+    "enabled",
+    "user_id",
+    "access_token",
+    "refresh_token",
+    "cookie",
+    "browser_state",
+    "proxy",
+    "verify_ssl",
+    "cookie_file",
+    "token_file",
+    "referer_path",
+    "browser_profile",
+    "auto_refresh_cookie",
+    "login_selector",
+})
+
+
+def merge_clipboard_site(row: SiteRow, data: dict[str, Any]) -> SiteRow:
+    """把 collector/凭据 JSON 安全合并到现有行，并复用统一规范化规则。
+
+    未出现在剪贴板中的字段保持原值；只接受配置 schema 内的已知字段，避免把
+    任意 JSON 键带进 GUI 模型。runtime_id 属于当前 GUI 身份，合并后必须保持不变。
+    """
+    merged = row.to_legacy()
+    for key in _CLIPBOARD_SITE_FIELDS:
+        if key in data:
+            merged[key] = data[key]
+    # collector 使用 site_profile；旧剪贴板可能只给 type/provider。显式的新字段优先。
+    if "site_profile" in data:
+        merged["site_profile"] = data["site_profile"]
+    elif "type" in data:
+        merged["site_profile"] = data["type"]
+    elif "provider" in data:
+        merged["site_profile"] = data["provider"]
+    normalized = row_from_store(merged)
+    normalized.runtime_id = row.runtime_id
+    return normalized
+
+
 def cred_json(row: SiteRow) -> str | None:
     cred = {k: getattr(row, k) for k in CRED_FIELDS if getattr(row, k)}
     if not cred:
@@ -863,268 +903,19 @@ def detail_quota_usd(detail: dict[str, Any] | None) -> float | None:
     return _detail_quota_usd(detail)
 
 
-_FAILURE_LABELS = {
-    "need_login": ("🔐 登录失效", "🔐 失效"),
-    "need_verification": ("⚠ 需人机验证", "⚠ 验证"),
-    "need_config": ("⚙ 配置缺失", "⚙ 配置"),
-    "network_error": ("🌐 站点不可达", "🌐 不可达"),
-    "error": ("❌ 查询失败", "❌ 失败"),
-}
-_FAILURE_PREFIX = {
-    "need_login": "登录失效",
-    "need_verification": "需要验证",
-    "need_config": "配置缺失",
-    "network_error": "站点不可达/网络异常",
-    "error": "查询失败",
-}
+def _failure_meta(status: str):
+    meta = status_meta(status)
+    return meta if meta.failure_prefix else status_meta("error")
 
 
 def failure_label(status: str, *, compact: bool = False) -> str:
-    full, short = _FAILURE_LABELS.get((status or "error").strip().lower(), _FAILURE_LABELS["error"])
-    return short if compact else full
+    meta = _failure_meta(status)
+    return meta.compact_label if compact else meta.gui_label
 
 
 def failure_toast(status: str, message: str) -> str:
-    prefix = _FAILURE_PREFIX.get((status or "error").strip().lower(), "查询失败")
+    prefix = _failure_meta(status).failure_prefix
     return f"{prefix}：{message}" if message else prefix
-
-
-# ── 状态缓存（批量结果 + GUI 实时结果按 saved_at 合并）────────────────────────
-def _is_newer(candidate: Any, existing: Any) -> bool:
-    """比较两个时间戳的真实先后。
-
-    此前直接按字符串比较，但 CI 写 Asia/Shanghai、GUI 写用户本地时区，且都不带
-    时区偏移，字典序不等于时间顺序。解析失败时保守视为「不更新」。
-    """
-    left = time_utils.parse_timestamp(candidate)
-    right = time_utils.parse_timestamp(existing)
-    if left is None:
-        return False
-    if right is None:
-        return True
-    return left > right
-
-
-class StatusStore:
-    """站点状态缓存：内存字典 + 双文件（checkin_result / gui_status_cache）合并落盘。"""
-
-    def __init__(self, results_dir: Path | None = None):
-        self.results_dir = results_dir or accounts_store.RESULTS_DIR
-        self.entries: dict[str, dict[str, Any]] = {}
-        self.today = time_utils.business_date()
-
-    @staticmethod
-    def status_key(row: SiteRow) -> str:
-        base = accounts_store.normalize_base_url(row.base_url)
-        return f"{base}|{(row.name or '').strip()}"
-
-    @staticmethod
-    def task_key(row: SiteRow) -> str:
-        """任务互斥键：按**渠道**（base_url + 名称）唯一，不是按站点地址。
-
-        以前只用 base_url，于是同一地址下的多个账号共享一把锁：单独签到其中一个，
-        另外两个会被判「该站点已有任务运行中」而跳过，行状态也被一起点亮/清除，
-        看起来就是「三个同址渠道无法同时签到、状态被错误同步」。渠道是独立账号，
-        互斥与状态都必须按渠道区分，因此这里与 status_key 用同一套身份。
-        """
-        base = accounts_store.normalize_base_url(row.base_url)
-        name = (row.name or "").strip()
-        if base and name:
-            return f"{base}|{name}"
-        return base or name
-
-    @staticmethod
-    def site_group_key(row: SiteRow) -> str:
-        """批量执行的分组键：同 base_url 归一组，组内串行、组间并发。
-
-        与 task_key 分离：限流是**站点**维度的（同址账号并发容易被站点限流或撞上
-        同一份浏览器登录态），而互斥锁是**渠道**维度的。
-        """
-        return accounts_store.normalize_base_url(row.base_url) or (row.name or "").strip()
-
-    def get(self, key: str) -> dict[str, Any] | None:
-        return self.entries.get(key)
-
-    # -- 加载 --
-    def load(self) -> None:
-        """加载状态缓存；只接受属于业务时区「今天」的条目。
-
-        昨日的 checked_in/ok/status 如果继续加载，GUI 概览会把过期结果当成今日已完成
-        （实测跨日后仍显示「今日已签到」，直到手工刷新）。时间戳无法解析时同样视为
-        过期，避免旧格式数据造成错误结论。
-        """
-        self.entries = {}
-        self.today = time_utils.business_date()
-        self._load_batch_results()
-        self._merge_gui_cache()
-
-    def _is_today(self, entry: dict[str, Any]) -> bool:
-        stamp = str(entry.get("business_date") or "").strip()
-        if stamp:
-            return stamp == getattr(self, "today", time_utils.business_date())
-        return time_utils.business_date_of(entry.get("saved_at")) == getattr(
-            self, "today", time_utils.business_date()
-        )
-
-    def _load_batch_results(self) -> None:
-        path = self.results_dir / "checkin_result.json"
-        if not path.exists():
-            return
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8-sig"))
-            rows = payload.get("results", []) if isinstance(payload, dict) else []
-            saved_at = str(payload.get("generated_at") or "") if isinstance(payload, dict) else ""
-            business_day = str(payload.get("business_date") or "") if isinstance(payload, dict) else ""
-        except Exception:
-            return
-        if not self._is_today({"saved_at": saved_at, "business_date": business_day}):
-            return
-        for item in rows:
-            if not isinstance(item, dict):
-                continue
-            base = accounts_store.normalize_base_url(str(item.get("base_url") or ""))
-            name = str(item.get("site") or "")
-            if not base and not name:
-                continue
-            quota_usd = None
-            cq = str(item.get("current_quota") or "").lstrip("$")
-            try:
-                quota_usd = float(cq) if cq else None
-            except ValueError:
-                quota_usd = None
-            status = str(item.get("status") or "")
-            ok = status in ("success", "already_done")
-            self.entries[f"{base}|{name}"] = {
-                "quota_usd": quota_usd if ok else None,
-                "last_quota_usd": quota_usd,
-                "checked_in": True if ok else None,
-                "ok": ok,
-                "status": status or ("success" if ok else "error"),
-                "message": item.get("note") or item.get("message") or "",
-                "cached": True,
-                "saved_at": saved_at,
-                "business_date": business_day or time_utils.business_date_of(saved_at),
-            }
-
-    def _merge_gui_cache(self) -> None:
-        path = self.results_dir / "gui_status_cache.json"
-        if not path.exists():
-            return
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8-sig"))
-        except Exception:
-            return
-        entries = payload.get("entries") if isinstance(payload, dict) else None
-        if not isinstance(entries, dict):
-            return
-        for key, entry in entries.items():
-            if not isinstance(entry, dict):
-                continue
-            if not self._is_today(entry):
-                continue
-            existing = self.entries.get(key)
-            if existing is not None and not _is_newer(entry.get("saved_at"), existing.get("saved_at")):
-                continue
-            self.entries[key] = {
-                "quota_usd": entry.get("quota_usd"),
-                "last_quota_usd": (
-                    entry.get("last_quota_usd") if entry.get("last_quota_usd") is not None else entry.get("quota_usd")
-                ),
-                "checked_in": entry.get("checked_in"),
-                "ok": bool(entry.get("ok")),
-                "status": str(entry.get("status") or "error"),
-                "message": str(entry.get("message") or ""),
-                "cached": True,
-                "saved_at": str(entry.get("saved_at") or ""),
-                "business_date": str(entry.get("business_date") or "")
-                or time_utils.business_date_of(entry.get("saved_at")),
-            }
-
-    # -- 更新 --
-    def apply_query(self, key: str, result: dict[str, Any]) -> dict[str, Any]:
-        ok = bool(result.get("ok"))
-        status = str(result.get("status") or ("success" if ok else "error"))
-        message = result.get("message") or ("查询成功" if ok else "查询失败")
-        prev = self.entries.get(key) or {}
-        prev_quota = prev.get("quota_usd")
-        if prev_quota is None:
-            prev_quota = prev.get("last_quota_usd")
-        entry = {
-            "quota_usd": result.get("quota_usd") if ok else None,
-            "last_quota_usd": result.get("quota_usd") if ok else prev_quota,
-            "checked_in": result.get("checked_in") if ok else None,
-            "ok": ok,
-            "status": status,
-            "message": message,
-            "detail": result.get("detail"),
-            "cached": False,
-            "saved_at": time_utils.utc_iso(),
-            "business_date": time_utils.business_date(),
-        }
-        self.entries[key] = entry
-        self.save()
-        return entry
-
-    def apply_checkin(self, key: str, result: dict[str, Any]) -> dict[str, Any]:
-        status = str(result.get("status") or ("success" if result.get("ok") else "error"))
-        ok = status in ("success", "already_done") or bool(result.get("ok") and status == "unknown")
-        detail = result.get("detail") if isinstance(result.get("detail"), dict) else {}
-        quota_usd = detail_quota_usd(detail)
-        message = str(result.get("message") or status or "签到完成")
-        prev = self.entries.get(key) or {}
-        last_quota = (
-            quota_usd
-            if quota_usd is not None
-            else (prev.get("quota_usd") if prev.get("quota_usd") is not None else prev.get("last_quota_usd"))
-        )
-        entry = {
-            "quota_usd": quota_usd,
-            "last_quota_usd": last_quota,
-            "checked_in": True if ok else None,
-            "ok": ok,
-            "status": status,
-            "message": message,
-            "cached": False,
-            "saved_at": time_utils.utc_iso(),
-            "business_date": time_utils.business_date(),
-        }
-        self.entries[key] = entry
-        self.save()
-        return entry
-
-    # -- 落盘 --
-    def save(self) -> None:
-        path = self.results_dir / "gui_status_cache.json"
-        entries: dict[str, Any] = {}
-        today = getattr(self, "today", time_utils.business_date())
-        for key, status in self.entries.items():
-            if not isinstance(status, dict):
-                continue
-            if status.get("quota_usd") is None and status.get("last_quota_usd") is None and not status.get("status"):
-                continue
-            business_day = str(status.get("business_date") or "") or time_utils.business_date_of(
-                status.get("saved_at")
-            )
-            # 顺手剔除过期条目：否则昨日状态会一直留在文件里，下次启动又被过滤一遍。
-            if business_day and business_day != today:
-                continue
-            entries[key] = {
-                "quota_usd": status.get("quota_usd"),
-                "last_quota_usd": status.get("last_quota_usd"),
-                "checked_in": status.get("checked_in"),
-                "ok": bool(status.get("ok")),
-                "status": str(status.get("status") or ""),
-                "message": str(status.get("message") or ""),
-                "saved_at": str(status.get("saved_at") or ""),
-                "business_date": business_day,
-            }
-        try:
-            self.results_dir.mkdir(parents=True, exist_ok=True)
-            with accounts_store.file_lock(path):
-                accounts_store.atomic_write_text(path, json.dumps({"entries": entries}, ensure_ascii=False, indent=2))
-        except Exception:
-            # 持久化失败不影响 GUI 运行。
-            pass
 
 
 # ── 稳定任务身份 / 站点租约 ──────────────────────────────────────────────────

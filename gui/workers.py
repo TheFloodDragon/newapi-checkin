@@ -20,6 +20,8 @@ import accounts_store
 from . import core
 
 TaskCallback = Callable[[dict[str, Any]], None]
+StorageOperation = Callable[[], Any]
+StorageCallback = Callable[[Any, BaseException | None], None]
 
 
 def _task_context(action: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -113,6 +115,59 @@ class TaskRunner(QObject):
     def clear_pending(self) -> None:
         """清空尚未开始的排队任务；已在飞的任务无法安全中断。"""
         self._pool.clear()
+
+    def shutdown(self, wait_ms: int = 5000) -> bool:
+        """停止接收排队任务，并等待正在运行的 provider 调用收尾。"""
+        self._pool.clear()
+        return self._pool.waitForDone(wait_ms)
+
+
+class _StorageTask(QRunnable):
+    """串行存储队列中的一次文件操作。"""
+
+    def __init__(self, operation: StorageOperation, callback: StorageCallback | None, done_signal: Signal):
+        super().__init__()
+        self.operation = operation
+        self.callback = callback
+        self._done = done_signal
+
+    def run(self) -> None:
+        try:
+            result = self.operation()
+            error: BaseException | None = None
+        except BaseException as exc:  # noqa: BLE001 - 必须把写盘错误投递回主线程
+            result = None
+            error = exc
+        self._done.emit(self.callback, result, error)
+
+
+class StorageRunner(QObject):
+    """单线程写盘队列；回调总是在 GUI 主线程执行。"""
+
+    _done = Signal(object, object, object)
+
+    def __init__(self, parent: QObject | None = None):
+        super().__init__(parent)
+        self._pool = QThreadPool(self)
+        self._pool.setMaxThreadCount(1)
+        self._done.connect(self._dispatch)
+
+    def submit(self, operation: StorageOperation, callback: StorageCallback | None = None) -> None:
+        self._pool.start(_StorageTask(operation, callback, self._done))
+
+    def _dispatch(self, callback: object, result: object, error: object) -> None:
+        if callback is None:
+            if isinstance(error, BaseException):
+                core.bg_log("ERROR", "后台写盘失败", error=error)
+            return
+        try:
+            callback(result, error if isinstance(error, BaseException) else None)  # type: ignore[operator]
+        except Exception as exc:
+            core.bg_log("ERROR", "存储回调异常", error=exc)
+
+    def shutdown(self, wait_ms: int = 5000) -> bool:
+        """等待已提交写盘完成；不丢弃持久化任务。"""
+        return self._pool.waitForDone(wait_ms)
 
 
 class BrowserWorker(QThread):
