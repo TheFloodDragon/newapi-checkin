@@ -42,6 +42,7 @@ from ..base import (
     normalize_cookie,
     unwrap_data,
 )
+from . import sub2api_fork_routes as fork_routes
 from . import sub2api_protocol as protocol
 
 # 协议语义（响应解析 / 错误归类 / 端点表 / 词表）统一由 sub2api_protocol 提供；
@@ -118,8 +119,11 @@ class Sub2ApiClient(ProfileClient):
         # 缓存优先的惰性刷新：仅当接口返回登录失效时，才调用一次刷新出新 token。
         self._token_refresher = token_refresher
         self._refresh_used = False
-        # 签到端点探测结果缓存：(签到路径, 状态路径)。各 fork 端点不同（见
-        # CHECKIN_ENDPOINTS），首次探测成功后复用，避免每次都试错一遍。
+        # 路由差异由独立的 fork 路由模块选择；本客户端只消费通用端点序列。
+        self._checkin_endpoints = fork_routes.select_checkin_endpoints(
+            self.base_url,
+            CHECKIN_ENDPOINTS,
+        )
         self._checkin_endpoint: tuple[str, str | None] | None = None
         # 会话级 cookie jar：部分 Sub2API 站点（实测极速蹬）把会话绑定到网络/客户端
         # 指纹，服务端下发的 cookie 必须在后续请求带回，否则报
@@ -285,7 +289,7 @@ class Sub2ApiClient(ProfileClient):
         """待探测的签到端点；已探测出可用端点时只返回它。"""
         if self._checkin_endpoint is not None:
             return (self._checkin_endpoint,)
-        return CHECKIN_ENDPOINTS
+        return self._checkin_endpoints
 
     def _probe_status(self) -> tuple[str, Any] | None:
         """按端点表探测签到状态接口，返回 (状态路径, data)；全部不可用返回 None。
@@ -480,7 +484,7 @@ class Sub2ApiClient(ProfileClient):
                 "message": "标准 Sub2API 源码未提供签到接口，已完成登录态验证与余额查询",
                 "source": "standard-sub2api",
                 "checkin_error": {"status": exc.status, "message": exc.message},
-                "probed_endpoints": [path for path, _ in CHECKIN_ENDPOINTS],
+                "probed_endpoints": [path for path, _ in self._checkin_endpoints],
                 "user": user.raw,
             },
             extra={"unsupported_checkin": True, "standard_sub2api": True},

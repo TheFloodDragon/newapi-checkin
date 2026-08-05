@@ -524,15 +524,17 @@ def test_unconfirmed_checkin_confirmed_by_quota_growth_is_success(monkeypatch) -
 
 
 def test_jisudeng_endpoint_probed_and_cached(monkeypatch) -> None:
-    """极速蹬只有 /play/checkin（实站探测：/check-in 返回 404）。
-
-    实站证据（未认证探测 www.jisudeng.com）：
-      GET  /api/v1/play/checkin/status -> 401（存在，需鉴权）
-      POST /api/v1/play/checkin        -> 401（存在，需鉴权）
-      POST /api/v1/check-in            -> 404（不存在）
-      GET  /api/v1/check-in/status     -> 404（不存在）
-    """
-    client = _client()
+    """极速蹬只走 /play/checkin，不再先尝试不存在的 /check-in/status。"""
+    client = sub2api.Sub2ApiClient(
+        SiteConfig(
+            name="极速蹬",
+            base_url="https://www.jisudeng.com",
+            site_profile="sub2api",
+            auth_method="access_token",
+            access_token="token",
+        ),
+        AuthInfo(access_token="token"),
+    )
     calls: list[str] = []
 
     def fake_request(method: str, path: str, body=None, *, retry_non_idempotent: bool = False):
@@ -547,15 +549,21 @@ def test_jisudeng_endpoint_probed_and_cached(monkeypatch) -> None:
 
     monkeypatch.setattr(client, "request", fake_request)
 
+    status = client.fetch_status()
+    assert status.checked_in_today is False
+    assert calls == ["GET /play/checkin/status"]
+
+    calls.clear()
     reward = client.do_checkin()
     assert reward.quota_awarded == 0.25
     assert reward.checkin_unconfirmed is False
     assert client._checkin_endpoint == ("/play/checkin", "/play/checkin/status")
+    assert calls == ["POST /play/checkin"]
 
-    # 端点已缓存：第二次不再重试 /check-in
+    # 端点已缓存：第二次不再探测错误的通用路径。
     calls.clear()
     client.do_checkin()
-    assert all("/check-in" not in c or "/play" in c for c in calls)
+    assert calls == ["POST /play/checkin"]
 
 
 def test_unconfirmed_but_quota_grew_is_success(monkeypatch) -> None:
