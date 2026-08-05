@@ -17,6 +17,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -109,6 +110,15 @@ class TaskResult:
     duration: float = 0.0
     diagnostics: str = ""
     worker_protocol: bool = False
+
+
+@dataclass
+class RetryPlanItem:
+    """当前任务及其同名历史结果；同名重复项按出现顺序一一匹配。"""
+
+    task: CheckinTask
+    previous_summary: dict[str, Any] | None = None
+    carried_forward: bool = False
 
 
 def build_site_tasks() -> list[CheckinTask]:
@@ -271,6 +281,81 @@ def build_script_tasks() -> list[CheckinTask]:
 
 def discover_tasks() -> list[CheckinTask]:
     return build_site_tasks() + build_script_tasks()
+
+
+def is_completed_summary(summary: dict[str, Any] | None) -> bool:
+    """只有协议明确成功且 ``ok`` 严格为真时才可沿用。"""
+    return bool(
+        summary
+        and summary.get("ok") is True
+        and str(summary.get("status") or "") in OK_STATUSES
+    )
+
+
+def load_retry_history(
+    path: Path | None = None,
+    *,
+    business_day: str | None = None,
+) -> list[dict[str, Any]] | None:
+    """加锁读取当天可复用的完整结果；缺失、跨日或损坏均返回 ``None``。
+
+    历史状态不限制在当前枚举内：未知状态和协议错误仍是有效的“待重试”记录。
+    但匹配所需的 task/status/ok 必须类型正确，否则整份历史按无效处理并全量执行。
+    """
+    result_path = path or RESULT_JSON_PATH
+    try:
+        with accounts_store.file_lock(result_path):
+            if not result_path.exists():
+                return None
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeError):
+        return None
+
+    expected_day = business_day or time_utils.business_date()
+    if not isinstance(payload, dict) or payload.get("business_date") != expected_day:
+        return None
+    rows = payload.get("results")
+    if not isinstance(rows, list):
+        return None
+
+    history: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            return None
+        task_name = row.get("task")
+        if not isinstance(task_name, str) or not task_name.strip():
+            return None
+        if not isinstance(row.get("status"), str) or not isinstance(row.get("ok"), bool):
+            return None
+        history.append(row)
+    return history
+
+
+def build_retry_plan(
+    tasks: list[CheckinTask],
+    history: list[dict[str, Any]] | None = None,
+) -> list[RetryPlanItem]:
+    """按当前任务顺序规划执行；历史同名项用队列匹配，避免重复名称覆盖。"""
+    history_by_task: dict[str, deque[dict[str, Any]]] = defaultdict(deque)
+    for summary in history or []:
+        history_by_task[str(summary["task"])].append(summary)
+
+    plan: list[RetryPlanItem] = []
+    for task in tasks:
+        queue = history_by_task.get(task.name)
+        previous = queue.popleft() if queue else None
+        plan.append(
+            RetryPlanItem(
+                task=task,
+                previous_summary=previous,
+                carried_forward=is_completed_summary(previous),
+            )
+        )
+    return plan
+
+
+def retry_plan_tasks(plan: list[RetryPlanItem]) -> list[CheckinTask]:
+    return [item.task for item in plan if not item.carried_forward]
 
 
 def build_task_env(task: CheckinTask) -> dict[str, str]:
@@ -615,6 +700,56 @@ def task_result_to_summary(result: TaskResult) -> dict[str, Any]:
     }
 
 
+def merge_retry_results(
+    plan: list[RetryPlanItem],
+    executed_results: list[TaskResult],
+) -> list[dict[str, Any]]:
+    """把本轮执行结果放回计划位置，与沿用项合并成当前配置的完整结果。"""
+    result_iter = iter(executed_results)
+    merged: list[dict[str, Any]] = []
+
+    for item in plan:
+        if item.carried_forward:
+            if item.previous_summary is None:  # 防御不可达的不一致计划
+                raise ValueError(f"任务 {item.task.name!r} 缺少可沿用结果")
+            summary = dict(item.previous_summary)
+            summary["task"] = item.task.name
+            summary["carried_forward"] = True
+            summary["executed_this_run"] = False
+            summary["retried"] = False
+            # 重试成功是结果的历史属性：第三次运行沿用时仍保留行级标记。
+            summary["retry_succeeded"] = summary.get("retry_succeeded") is True
+            merged.append(summary)
+            continue
+
+        try:
+            result = next(result_iter)
+        except StopIteration as exc:
+            raise ValueError("本轮执行结果少于重试计划") from exc
+
+        summary = task_result_to_summary(result)
+        summary["task"] = item.task.name
+        summary["carried_forward"] = False
+        summary["executed_this_run"] = True
+        previous = item.previous_summary
+        retried = previous is not None
+        summary["retried"] = retried
+        if retried:
+            summary["previous_status"] = str(previous.get("status") or "")
+        else:
+            summary.pop("previous_status", None)
+        summary["retry_succeeded"] = bool(
+            retried and not is_completed_summary(previous) and is_completed_summary(summary)
+        )
+        merged.append(summary)
+
+    try:
+        next(result_iter)
+    except StopIteration:
+        return merged
+    raise ValueError("本轮执行结果多于重试计划")
+
+
 # 各阶段调用日志的前缀（子进程写 stderr，形如「[api_first:站点名] ...」）。
 # 这类行是排查「卡在哪一级凭据」的主要依据，因此始终打印；真正可能回显
 # Cookie/token 的完整原始输出仍只在 --verbose 或任务失败时才输出。
@@ -713,20 +848,41 @@ def run_tasks(tasks: list[CheckinTask], workers: int = 0, verbose: bool = False)
     )
 
 
+def result_run_counts(summaries: list[dict[str, Any]]) -> tuple[int, int, int]:
+    executed_count = sum(1 for item in summaries if item.get("executed_this_run") is True)
+    carried_count = sum(1 for item in summaries if item.get("carried_forward") is True)
+    retry_succeeded_count = sum(
+        1
+        for item in summaries
+        if item.get("executed_this_run") is True and item.get("retry_succeeded") is True
+    )
+    return executed_count, carried_count, retry_succeeded_count
+
+
+def build_result_payload(summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    failed_count = sum(1 for item in summaries if item.get("ok") is not True)
+    success_count = sum(1 for item in summaries if item.get("status") == "success")
+    already_done_count = sum(1 for item in summaries if item.get("status") == "already_done")
+    executed_count, carried_count, retry_succeeded_count = result_run_counts(summaries)
+    return sanitize_data(
+        {
+            "generated_at": time_utils.utc_iso(),
+            "business_date": time_utils.business_date(),
+            "total": len(summaries),
+            "success_count": success_count,
+            "already_done_count": already_done_count,
+            "failed_count": failed_count,
+            "executed_this_run_count": executed_count,
+            "carried_forward_count": carried_count,
+            "retry_succeeded_count": retry_succeeded_count,
+            "results": summaries,
+        }
+    )
+
+
 def write_result_file(summaries: list[dict[str, Any]]) -> None:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    failed_count = sum(1 for item in summaries if not item["ok"])
-    success_count = sum(1 for item in summaries if item["status"] == "success")
-    already_done_count = sum(1 for item in summaries if item["status"] == "already_done")
-    payload = sanitize_data({
-        "generated_at": time_utils.utc_iso(),
-        "business_date": time_utils.business_date(),
-        "total": len(summaries),
-        "success_count": success_count,
-        "already_done_count": already_done_count,
-        "failed_count": failed_count,
-        "results": summaries,
-    })
+    payload = build_result_payload(summaries)
     with accounts_store.file_lock(RESULT_JSON_PATH):
         accounts_store.atomic_write_text(
             RESULT_JSON_PATH,
@@ -734,10 +890,27 @@ def write_result_file(summaries: list[dict[str, Any]]) -> None:
         )
 
 
+def summary_run_label(summary: dict[str, Any]) -> str:
+    markers: list[str] = []
+    if summary.get("retry_succeeded") is True:
+        markers.append("🔁 重试成功")
+    elif summary.get("retried") is True:
+        markers.append("本轮重试")
+    if summary.get("carried_forward") is True:
+        markers.append("本轮跳过")
+    markers.append(str(summary.get("label") or summary.get("status") or "未知"))
+    return " / ".join(markers)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="执行所有签到任务")
     parser.add_argument("--workers", type=int, default=0, help="同时执行的最大任务数，默认最多 8 个")
     parser.add_argument("--verbose", action="store_true", help="打印每个任务的完整原始输出（已脱敏）；默认仅失败任务打印")
+    parser.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="沿用当天上次已完成结果，仅执行失败、新增或协议无效的任务",
+    )
     return parser.parse_args()
 
 
@@ -757,24 +930,57 @@ def main() -> int:
         write_result_file([])
         return 2
 
-    results = run_tasks(tasks, args.workers, verbose=args.verbose)
-    summaries = [task_result_to_summary(result) for result in results]
+    history: list[dict[str, Any]] | None = None
+    if getattr(args, "retry_failed", False):
+        history = load_retry_history()
+        if history is None:
+            print("当天没有可复用的有效结果，本轮执行全部任务。")
+        else:
+            print(f"已读取当天上次结果：{len(history)} 项。")
+
+    plan = build_retry_plan(tasks, history)
+    tasks_to_execute = retry_plan_tasks(plan)
+    carried_count = len(plan) - len(tasks_to_execute)
+    if carried_count:
+        print(f"沿用上次已完成结果：{carried_count} 项；本轮待执行：{len(tasks_to_execute)} 项。")
+    if tasks_to_execute:
+        results = run_tasks(tasks_to_execute, args.workers, verbose=args.verbose)
+    else:
+        print("当前任务均已完成，本轮无需启动子任务。")
+        results = []
+
+    summaries = merge_retry_results(plan, results)
     write_result_file(summaries)
 
-    max_name = max((len(item["site"]) for item in summaries), default=0)
-    max_status = max((len(item["label"]) for item in summaries), default=0)
+    display_rows = [
+        {
+            "site": value_to_text(item.get("site") or item.get("task") or "Unknown"),
+            "icon": value_to_text(item.get("icon")),
+            "status": summary_run_label(item),
+            "detail": value_to_text(item.get("note") or item.get("message")),
+        }
+        for item in summaries
+    ]
+    max_name = max((len(item["site"]) for item in display_rows), default=4)
+    max_status = max((len(item["status"]) for item in display_rows), default=4)
     max_name = max(max_name, 4)
     max_status = max(max_status, 4)
 
     print("\n总结：")
     print(f"  {'站点':<{max_name}} | 图标 | {'状态':<{max_status}} | 备注")
     print(f"  {'-' * max_name}-+-{'-' * 2}-+-{'-' * max_status}-+-{'-' * 24}")
-    for item in summaries:
-        detail = item["note"] or item["message"]
-        print(f"  {item['site']:<{max_name}} | {item['icon']} | {item['label']:<{max_status}} | {detail}")
+    for item in display_rows:
+        detail = mask_secrets(item["detail"])
+        print(f"  {item['site']:<{max_name}} | {item['icon']} | {item['status']:<{max_status}} | {detail}")
 
-    failed_count = sum(1 for item in summaries if not item["ok"])
-    print(f"\n结果文件：{RESULT_JSON_PATH}")
+    executed_count, carried_count, retry_succeeded_count = result_run_counts(summaries)
+    print(
+        f"\n本轮实际执行：{executed_count}；"
+        f"沿用上次完成：{carried_count}；"
+        f"本轮重试成功：{retry_succeeded_count}"
+    )
+    failed_count = sum(1 for item in summaries if item.get("ok") is not True)
+    print(f"结果文件：{RESULT_JSON_PATH}")
     return 0 if failed_count == 0 else 2
 
 

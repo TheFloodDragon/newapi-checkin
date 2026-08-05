@@ -4,6 +4,7 @@ run-name: 自动签到 - ${{ github.event_name }}
 on:
   schedule:
     - cron: '30 1 * * *'
+    - cron: '30 7 * * *'
   workflow_dispatch:
 
 concurrency:
@@ -131,9 +132,9 @@ jobs:
         run: |
           set +e
           if [ "${{ steps.detect_browser.outputs.need_browser }}" = "true" ]; then
-            xvfb-run -a --server-args="-screen 0 1920x1080x24" uv run python -u run__all_checkin.py
+            xvfb-run -a --server-args="-screen 0 1920x1080x24" uv run python -u run__all_checkin.py --retry-failed
           else
-            uv run python -u run__all_checkin.py
+            uv run python -u run__all_checkin.py --retry-failed
           fi
           code=$?
           set -e

@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -307,3 +308,206 @@ def test_print_result_does_not_duplicate_when_raw_shown(capsys) -> None:
 
     assert "原始输出：" in out
     assert "调用日志：" not in out
+
+
+# ── 同业务日失败重试与结果合并 ────────────────────────────────────────────────
+def _retry_task(name: str) -> runner.CheckinTask:
+    return runner.CheckinTask(name=name, command=[sys.executable, "noop.py"], site_key=name)
+
+
+def _history_summary(name: str, status: str, ok: bool) -> dict[str, object]:
+    labels = {
+        "success": ("成功", "✅"),
+        "already_done": ("已领取", "✅"),
+        "error": ("失败", "❌"),
+    }
+    label, icon = labels.get(status, (status, "❌"))
+    return {
+        "site": name,
+        "task": name,
+        "base_url": f"https://{name}.invalid",
+        "status": status,
+        "label": label,
+        "icon": icon,
+        "ok": ok,
+        "returncode": 0 if ok else 2,
+        "message": status,
+        "note": status,
+    }
+
+
+def _executed_result(name: str, status: str, *, returncode: int | None = None) -> runner.TaskResult:
+    ok = status in runner.OK_STATUSES
+    payload = {
+        "site": name,
+        "base_url": f"https://{name}.invalid",
+        "status": status,
+        "message": status,
+    }
+    return runner.TaskResult(
+        name=name,
+        returncode=(0 if ok else 2) if returncode is None else returncode,
+        output=json.dumps(payload, ensure_ascii=False),
+        worker_protocol=True,
+    )
+
+
+def test_first_retry_mode_run_executes_every_current_task() -> None:
+    tasks = [_retry_task("a"), _retry_task("b")]
+
+    plan = runner.build_retry_plan(tasks, None)
+    assert runner.retry_plan_tasks(plan) == tasks
+
+    merged = runner.merge_retry_results(
+        plan,
+        [_executed_result("a", "success"), _executed_result("b", "already_done")],
+    )
+    assert [row["task"] for row in merged] == ["a", "b"]
+    assert all(row["executed_this_run"] is True for row in merged)
+    assert all(row["carried_forward"] is False for row in merged)
+    assert all(row["retried"] is False for row in merged)
+
+
+def test_same_day_plan_skips_completed_retries_failures_and_keeps_current_order() -> None:
+    tasks = [_retry_task("a"), _retry_task("b"), _retry_task("new")]
+    # 历史顺序故意与当前配置不同，验证按 task 名匹配而非按位置拼接。
+    history = [
+        _history_summary("b", "already_done", True),
+        _history_summary("a", "error", False),
+    ]
+
+    plan = runner.build_retry_plan(tasks, history)
+    assert [task.name for task in runner.retry_plan_tasks(plan)] == ["a", "new"]
+
+    merged = runner.merge_retry_results(
+        plan,
+        [_executed_result("a", "success"), _executed_result("new", "error")],
+    )
+    assert [row["task"] for row in merged] == ["a", "b", "new"]
+    assert merged[0]["retried"] is True
+    assert merged[0]["previous_status"] == "error"
+    assert merged[0]["retry_succeeded"] is True
+    assert merged[1]["carried_forward"] is True
+    assert merged[1]["executed_this_run"] is False
+    assert merged[2]["retried"] is False
+    assert merged[2]["ok"] is False
+
+    payload = runner.build_result_payload(merged)
+    assert payload["executed_this_run_count"] == 2
+    assert payload["carried_forward_count"] == 1
+    assert payload["retry_succeeded_count"] == 1
+    assert payload["failed_count"] == 1
+
+
+def test_duplicate_task_names_are_matched_with_queues() -> None:
+    tasks = [_retry_task("same"), _retry_task("same")]
+    history = [
+        _history_summary("same", "success", True),
+        _history_summary("same", "error", False),
+    ]
+
+    plan = runner.build_retry_plan(tasks, history)
+
+    assert [item.carried_forward for item in plan] == [True, False]
+    assert len(runner.retry_plan_tasks(plan)) == 1
+    merged = runner.merge_retry_results(plan, [_executed_result("same", "success")])
+    assert merged[0]["carried_forward"] is True
+    assert merged[1]["retried"] is True
+    assert merged[1]["retry_succeeded"] is True
+
+
+def test_retry_success_marker_survives_a_third_carried_run() -> None:
+    task = _retry_task("retry-site")
+    retry_plan = runner.build_retry_plan(
+        [task],
+        [_history_summary("retry-site", "error", False)],
+    )
+    retried = runner.merge_retry_results(
+        retry_plan,
+        [_executed_result("retry-site", "success")],
+    )[0]
+
+    third_plan = runner.build_retry_plan([task], [retried])
+    third = runner.merge_retry_results(third_plan, [])[0]
+
+    assert third["retry_succeeded"] is True
+    assert third["carried_forward"] is True
+    assert third["executed_this_run"] is False
+    assert third["retried"] is False
+    assert "🔁 重试成功" in runner.summary_run_label(third)
+    assert "本轮跳过" in runner.summary_run_label(third)
+    assert runner.result_run_counts([third]) == (0, 1, 0)
+
+
+def test_retry_history_requires_current_business_day_and_valid_structure(tmp_path: Path) -> None:
+    result_path = tmp_path / "checkin_result.json"
+    today = "2026-07-29"
+    valid = {
+        "business_date": today,
+        "results": [_history_summary("a", "success", True)],
+    }
+    result_path.write_text(json.dumps(valid), encoding="utf-8")
+    assert runner.load_retry_history(result_path, business_day=today) == valid["results"]
+
+    valid["business_date"] = "2026-07-28"
+    result_path.write_text(json.dumps(valid), encoding="utf-8")
+    assert runner.load_retry_history(result_path, business_day=today) is None
+
+    result_path.write_text("{broken", encoding="utf-8")
+    assert runner.load_retry_history(result_path, business_day=today) is None
+
+    result_path.write_text(json.dumps({"business_date": today, "results": [{"task": "a"}]}), encoding="utf-8")
+    assert runner.load_retry_history(result_path, business_day=today) is None
+
+
+def test_invalid_retry_history_falls_back_to_full_execution(tmp_path: Path) -> None:
+    result_path = tmp_path / "checkin_result.json"
+    result_path.write_text("not-json", encoding="utf-8")
+    tasks = [_retry_task("a"), _retry_task("b")]
+
+    history = runner.load_retry_history(result_path, business_day="2026-07-29")
+    plan = runner.build_retry_plan(tasks, history)
+
+    assert history is None
+    assert runner.retry_plan_tasks(plan) == tasks
+
+
+def test_main_does_not_mask_a_failed_retry(monkeypatch, capsys) -> None:
+    task = _retry_task("still-bad")
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        runner,
+        "parse_args",
+        lambda: SimpleNamespace(workers=1, verbose=False, retry_failed=True),
+    )
+    monkeypatch.setattr(runner, "discover_tasks", lambda: [task])
+    monkeypatch.setattr(
+        runner,
+        "load_retry_history",
+        lambda: [_history_summary("still-bad", "error", False)],
+    )
+
+    def fake_run(tasks, workers, verbose=False):
+        captured["tasks"] = tasks
+        return [_executed_result("still-bad", "error")]
+
+    monkeypatch.setattr(runner, "run_tasks", fake_run)
+    monkeypatch.setattr(runner, "write_result_file", lambda rows: captured.setdefault("rows", rows))
+
+    assert runner.main() == 2
+    assert [item.name for item in captured["tasks"]] == ["still-bad"]
+    rows = captured["rows"]
+    assert rows[0]["retried"] is True
+    assert rows[0]["retry_succeeded"] is False
+    assert rows[0]["ok"] is False
+    assert "本轮重试" in capsys.readouterr().out
+
+
+def test_auto_checkin_workflow_runs_twice_with_retry_mode() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "auto_checkin.yml").read_text(encoding="utf-8")
+
+    assert workflow.count("cron: '30 1 * * *'") == 1
+    assert workflow.count("cron: '30 7 * * *'") == 1
+    assert workflow.count("run__all_checkin.py --retry-failed") == 2
+    assert "cancel-in-progress: false" in workflow

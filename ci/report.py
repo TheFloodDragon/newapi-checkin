@@ -24,6 +24,19 @@ def _cell(value: Any) -> str:
     return text.replace("|", "\\|").replace("\r", " ").replace("\n", " ")
 
 
+def _row_status(row: dict[str, Any]) -> str:
+    parts: list[str] = []
+    if row.get("retry_succeeded") is True:
+        parts.append("🔁 重试成功")
+    elif row.get("retried") is True:
+        parts.append("本轮重试")
+    if row.get("carried_forward") is True:
+        parts.append("本轮跳过")
+    base_status = f"{row.get('icon', '')} {row.get('label', 'Unknown')}".strip()
+    parts.append(base_status)
+    return _cell(" · ".join(part for part in parts if part))
+
+
 def build_report(payload: Any) -> str:
     md = f"# 签到报告\n\n**时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
     safe_payload = sanitize_data(payload)
@@ -32,16 +45,39 @@ def build_report(payload: Any) -> str:
         return md + "## 错误\n\n签到脚本未生成有效结果。\n"
 
     rows = [row for row in rows if isinstance(row, dict)]
-    ok = sum(1 for row in rows if row.get("ok"))
+    ok = sum(1 for row in rows if row.get("ok") is True)
     fail = len(rows) - ok
-    md += f"## 统计\n\n- 成功/已领取: {ok}\n- 失败: {fail}\n- 总计: {len(rows)}\n\n"
+    has_run_metadata = any(
+        "executed_this_run" in row or "carried_forward" in row
+        for row in rows
+    )
+    if has_run_metadata:
+        executed = sum(1 for row in rows if row.get("executed_this_run") is True)
+        carried = sum(1 for row in rows if row.get("carried_forward") is True)
+        retry_succeeded = sum(
+            1
+            for row in rows
+            if row.get("executed_this_run") is True and row.get("retry_succeeded") is True
+        )
+    else:
+        # 兼容升级前的结果文件：当时所有行都来自本轮执行。
+        executed = len(rows)
+        carried = 0
+        retry_succeeded = 0
+    md += (
+        f"## 统计\n\n"
+        f"- 成功/已领取: {ok}\n"
+        f"- 失败: {fail}\n"
+        f"- 总计: {len(rows)}\n"
+        f"- 本轮实际执行: {executed}\n"
+        f"- 沿用上次完成: {carried}\n"
+        f"- 本轮重试成功: {retry_succeeded}\n\n"
+    )
     md += "## 详细结果\n\n| 站点 | 状态 | 备注 |\n|------|------|------|\n"
     for row in rows:
         site = _cell(row.get("site", "Unknown"))
-        icon = _cell(row.get("icon", ""))
-        label = _cell(row.get("label", "Unknown"))
+        status = _row_status(row)
         note = _cell(row.get("note") or row.get("message", ""))
-        status = f"{icon} {label}".strip()
         md += f"| {site} | {status} | {note} |\n"
     return md
 

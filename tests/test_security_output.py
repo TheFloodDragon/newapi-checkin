@@ -109,3 +109,51 @@ def test_free_form_api_key_field_is_masked() -> None:
     text = mask_secrets('{"api_key": "FAKE_FREEFORM_KEY", "client_secret": "FAKE_FREEFORM_SECRET"}')
     assert "FAKE_FREEFORM_KEY" not in text
     assert "FAKE_FREEFORM_SECRET" not in text
+
+
+def test_markdown_report_shows_retry_execution_and_carried_counts() -> None:
+    markdown = report.build_report(
+        {
+            "results": [
+                {
+                    "site": "retried-now",
+                    "ok": True,
+                    "icon": "✅",
+                    "label": "成功",
+                    "note": "recovered",
+                    "executed_this_run": True,
+                    "carried_forward": False,
+                    "retried": True,
+                    "retry_succeeded": True,
+                },
+                {
+                    "site": "carried",
+                    "ok": True,
+                    "icon": "✅",
+                    "label": "已领取",
+                    "note": "cached",
+                    "executed_this_run": False,
+                    "carried_forward": True,
+                    "retried": False,
+                    "retry_succeeded": False,
+                },
+                {
+                    "site": "retried-before",
+                    "ok": True,
+                    "icon": "✅",
+                    "label": "成功",
+                    "note": "cached retry success",
+                    "executed_this_run": False,
+                    "carried_forward": True,
+                    "retried": False,
+                    "retry_succeeded": True,
+                },
+            ]
+        }
+    )
+
+    assert "- 本轮实际执行: 1" in markdown
+    assert "- 沿用上次完成: 2" in markdown
+    assert "- 本轮重试成功: 1" in markdown
+    assert markdown.count("🔁 重试成功") == 2
+    assert markdown.count("本轮跳过") == 2
