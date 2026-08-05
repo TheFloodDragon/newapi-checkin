@@ -300,6 +300,10 @@ class FakeHelpers:
     def __init__(self) -> None:
         self.goto_calls: list[tuple[str, dict[str, Any]]] = []
         self.screenshots: list[str] = []
+        self.logs: list[str] = []
+
+    def log(self, message: str) -> None:
+        self.logs.append(str(message))
 
     async def goto(self, url: str, **kwargs: Any) -> None:
         self.goto_calls.append((url, kwargs))
@@ -712,12 +716,14 @@ def test_password_login_fallback_clicks_turnstile_to_obtain_token(monkeypatch: A
     # 需点击 1 次才签发令牌。
     page.turnstile_clicks_needed = 1
 
-    result, _ = _run(page, {"button_wait_ms": 1, "poll_interval_ms": 20})
+    result, helpers = _run(page, {"button_wait_ms": 1, "poll_interval_ms": 20})
 
     assert result["status"] == "success"
-    # 确认确实发生了真实鼠标点击。
+    # 确认确实发生了真实鼠标点击，并记录了人工可观察的验证阶段。
     assert page.mouse.clicks
     assert page.login_requests[0][1:] == [email, password, "real-turnstile-token"]
+    assert any("持续等待 Cloudflare 令牌" in line for line in helpers.logs)
+    assert any("令牌已签发" in line for line in helpers.logs)
 
 
 def test_password_login_fallback_turnstile_timeout_is_need_verification(

@@ -21,39 +21,73 @@ from typing import Any
 # widget 左边缘到复选框中心的水平偏移（像素）。
 _CHECKBOX_X_OFFSET = 30
 
-# 点击复选框后留给 Cloudflare 的处理窗口（秒）。窗口内仍按 step 密集轮询令牌，
-# 所以这个值只决定「多久后才考虑重新点一次」，不会延后令牌的发现时机。
-_CLICK_SETTLE_SECONDS = 3.0
-
 # 没找到 widget 时的观察间隔（秒）。此时不该反复尝试点击：widget 可能尚未挂载，
 # 也可能已经变成「验证成功」态或正由人工操作，继续观察令牌即可。
 _RETRY_GAP_SECONDS = 1.0
 
-# 读取 input[name=cf-turnstile-response] 的当前值。
+# 读取页面中所有 Turnstile 响应字段的当前值。
+# 页面可能同时保留多个 widget 或旧字段；只读第一个字段会一直读到空值，
+# 即使人工已经在后续 widget 完成验证。
 _READ_TOKEN_JS = """() => {
-    const el = document.querySelector('input[name="cf-turnstile-response"]');
-    return el && typeof el.value === 'string' ? el.value : '';
+    const fields = Array.from(document.querySelectorAll(
+        'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]'
+    ));
+    for (const field of fields) {
+        const value = typeof field.value === 'string'
+            ? field.value
+            : String(field.textContent || '');
+        if (value.trim()) return value.trim();
+    }
+    return '';
 }"""
 
-# 定位可见的 Turnstile widget bounding box：优先 CF challenge iframe，
-# 退回 .turnstile-container / .turnstile-wrapper / 令牌 input 的容器。
+# 定位可见的 Turnstile widget bounding box。
+# 优先可见的 Cloudflare iframe，再退回 widget 容器/响应字段父容器；
+# 不能只取第一个 iframe，因为页面可能同时挂有隐藏的 challenge iframe。
 _FIND_BOX_JS = """() => {
-    const pick = (el) => {
-        if (!el) return null;
+    const visible = (el) => {
+        if (!el || !el.isConnected) return false;
+        const style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+            return false;
+        }
         const r = el.getBoundingClientRect();
-        if (r.width < 10 || r.height < 10) return null;
+        return r.width >= 10 && r.height >= 10;
+    };
+    const boxOf = (el) => {
+        if (!visible(el)) return null;
+        const r = el.getBoundingClientRect();
         return { x: r.x, y: r.y, width: r.width, height: r.height };
     };
-    const cf = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-    let box = pick(cf);
-    if (box) return box;
-    for (const sel of ['.turnstile-container', '.turnstile-wrapper',
-                        'input[name="cf-turnstile-response"]']) {
-        const el = document.querySelector(sel);
-        const b = pick(el && el.parentElement ? el.parentElement : el);
-        if (b) return b;
+    const candidates = [];
+    const add = (el, priority) => {
+        const box = boxOf(el);
+        if (box) candidates.push({ priority, box });
+    };
+
+    for (const iframe of document.querySelectorAll(
+        'iframe[src*="challenges.cloudflare.com"], iframe[title*="Cloudflare"]'
+    )) {
+        add(iframe, 0);
     }
-    return null;
+    for (const selector of [
+        '.cf-turnstile',
+        '.turnstile-container',
+        '.turnstile-wrapper',
+        '[data-sitekey]'
+    ]) {
+        for (const element of document.querySelectorAll(selector)) {
+            add(element, 1);
+        }
+    }
+    for (const field of document.querySelectorAll(
+        'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]'
+    )) {
+        add(field.parentElement || field, 2);
+    }
+
+    candidates.sort((left, right) => left.priority - right.priority);
+    return candidates.length ? candidates[0].box : null;
 }"""
 
 
@@ -105,23 +139,17 @@ async def solve(
     poll_interval_ms: int = 1000,
     log: Any = None,
 ) -> str:
-    """获取 Turnstile 令牌：尽快点一次复选框，然后密集轮询直到签发或超时。
+    """获取 Turnstile 令牌：立即尝试一次真实点击，然后持续观察到超时。
 
-    与旧实现的三处差异，都是实测踩出来的：
-
-    1. **首次点击不再等一轮**。旧实现先 read_token（必然为空）、再 sleep 一整个
-       轮询间隔，才发出第一次点击，白等约 1 秒。widget 就绪后越早点越好。
-    2. **令牌轮询与点击节奏解耦**。旧实现点击成功后固定 sleep 1.5–3 秒才再看一眼
-       令牌，人工在这期间完成验证也要等满整段；现在点击后按 250ms 粒度持续查，
-       令牌一出现立即返回 —— 这正是「人工完成后没有继续识别」的直接原因。
-    3. **不重复点已经点过的 widget**。Cloudflare 处理中再点会重置挑战，反而更慢。
-       只在等待窗口过完仍无令牌时才重试点击。
+    成功点击后不再重复点击。Cloudflare 在处理挑战时再次点击可能会重置验证，
+    也是人工完成后「明明点过却不算数」的主要竞态；此时应保持密集轮询，让页面自行
+    填入令牌。只有 widget 尚未挂载或点击明确失败时，才按短间隔重新定位。
 
     Args:
         page: Playwright/Camoufox Page。
         timeout_ms: 整体超时（毫秒）。
         poll_interval_ms: 令牌轮询粒度（毫秒），会被限制在 100–500 之间。
-        log: 可选日志回调，用于把「已点击/等待人工完成」写进签到日志。
+        log: 可选日志回调，用于把「已点击/等待人工/令牌已签发」写进签到日志。
 
     Returns:
         非空令牌字符串；超时未拿到返回 ""。
@@ -129,13 +157,16 @@ async def solve(
     import asyncio
 
     def _log(message: str) -> None:
-        if log:
-            log(message)
+        if callable(log):
+            try:
+                log(message)
+            except Exception:
+                pass
 
     loop = asyncio.get_running_loop()
     deadline = loop.time() + max(0, timeout_ms) / 1000
-    # 轮询粒度独立于调用方的 poll_interval_ms：太粗会让「人工刚点完」延迟数秒才
-    # 被发现，太细则空转。100–500ms 足够及时且开销可忽略。
+    # 轮询粒度独立于调用方的 poll_interval_ms：太粗会让人工刚完成后的令牌迟迟不被
+    # 发现，太细则空转。100–500ms 足够及时且开销可忽略。
     step = min(max(poll_interval_ms, 100), 500)
 
     async def _poll_until(window_end: float) -> str:
@@ -154,27 +185,23 @@ async def solve(
     if token:
         return token
 
-    clicks = 0
+    clicked = False
+    logged_waiting = False
     while loop.time() < deadline:
-        clicked = await click(page)
-        if clicked:
-            clicks += 1
-            if clicks == 1:
-                _log("已点击 Turnstile 复选框，等待 Cloudflare 签发令牌...")
-            # 点击后给 Cloudflare 一段处理窗口，但窗口内保持密集轮询：
-            # 人工帮忙点完或自动通过时都能立刻拿到令牌，不必等满整段。
-            window = min(loop.time() + _CLICK_SETTLE_SECONDS, deadline)
-        else:
-            # 找不到 widget（尚未挂载，或已被替换成「验证成功」态）：不点，
-            # 只继续观察。人工在有头模式下手动完成时走的正是这条路径。
-            if clicks == 0:
+        if not clicked:
+            clicked = await click(page)
+            if clicked:
+                _log("已点击 Turnstile 复选框，持续等待 Cloudflare 令牌（可人工完成验证）...")
+            elif not logged_waiting:
                 _log("未定位到 Turnstile 复选框，持续等待令牌（可人工完成验证）...")
-            window = min(loop.time() + _RETRY_GAP_SECONDS, deadline)
-        token = await _poll_until(window)
+                logged_waiting = True
+
+        # 成功点击后一直观察到总超时，不能用固定窗口再次点击重置 challenge。
+        window_end = deadline if clicked else min(loop.time() + _RETRY_GAP_SECONDS, deadline)
+        token = await _poll_until(window_end)
         if token:
-            if clicks:
-                _log("Turnstile 令牌已签发")
-            else:
-                _log("Turnstile 验证已完成（令牌由页面自行签发）")
+            _log("Turnstile 令牌已签发" if clicked else "Turnstile 验证已完成（令牌由页面自行签发）")
             return token
+        if clicked:
+            return ""
     return ""

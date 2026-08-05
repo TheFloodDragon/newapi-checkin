@@ -655,7 +655,10 @@ async def login_with_password(
     await dismiss_notice(page)
     log(helpers, "等待 Cloudflare Turnstile 令牌（必要时真实点击复选框）...")
     token = await turnstile.solve(
-        page, timeout_ms=opts.login_timeout_ms, poll_interval_ms=opts.poll_interval_ms
+        page,
+        timeout_ms=opts.login_timeout_ms,
+        poll_interval_ms=opts.poll_interval_ms,
+        log=lambda message: log(helpers, message),
     )
     if not token:
         log(helpers, "Turnstile 未在等待时间内签发令牌")
@@ -671,6 +674,13 @@ async def login_with_password(
             },
         )
 
+    # 人工完成 Turnstile 后页面可能还在同步表单状态；给前端一个很短的稳定窗口，
+    # 避免刚读到令牌就提交导致站点仍拿到旧表单值。令牌读取本身已是密集轮询，
+    # 这里只增加最多 250ms 的提交前缓冲。
+    try:
+        await page.wait_for_timeout(min(max(opts.poll_interval_ms, 50), 250))
+    except Exception:
+        pass
     result = await submit_login(page, origin, email, password, token)
     status = int((result or {}).get("status") or 0)
     if bool((result or {}).get("two_factor")):

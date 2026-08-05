@@ -80,11 +80,14 @@ class FakePage:
         html: str,
         *,
         clears_after_click: bool = True,
+        clear_after_waits: int | None = None,
         token: str = "real-turnstile-token",
     ) -> None:
         self._title = title
         self._html = html
         self._clears = clears_after_click
+        self._clear_after_waits = clear_after_waits
+        self._wait_count = 0
         self._issue = token
         self._token = ""
         self.mouse = FakeMouse()
@@ -112,6 +115,11 @@ class FakePage:
         return None
 
     async def wait_for_timeout(self, ms: int) -> None:
+        del ms
+        self._wait_count += 1
+        if self._clear_after_waits is not None and self._wait_count >= self._clear_after_waits:
+            self._title = "Dashboard"
+            self._html = "<html><body>ok</body></html>"
         await asyncio.sleep(0)
 
 
@@ -159,6 +167,23 @@ def test_no_challenge_page_is_passed_through_without_clicking(monkeypatch) -> No
     assert ok is True
     assert page.mouse.clicks == []
     assert logs == []
+
+
+def test_token_waits_for_async_page_clear(monkeypatch) -> None:
+    """人工/Cloudflare 回调先填令牌、页面稍后刷新时仍应算验证通过。"""
+    monkeypatch.setattr(bypass, "_check_camoufox", lambda: None)
+    page = FakePage(
+        "Just a moment...",
+        '<div class="turnstile-container"><input name="cf-turnstile-response"></div>',
+        clear_after_waits=2,
+    )
+    logs: list[str] = []
+
+    ok = asyncio.run(bypass.solve_cloudflare(page, log=logs.append, wait_seconds=1))
+
+    assert ok is True
+    assert page.mouse.clicks == [(130.0, 232.5)]
+    assert any("异步放行" in line for line in logs)
 
 
 def test_token_issued_but_page_still_blocked_is_not_success(monkeypatch) -> None:

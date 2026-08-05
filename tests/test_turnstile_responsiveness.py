@@ -80,6 +80,29 @@ class _FakeMouse:
         self.page.on_click()
 
 
+class _MultiFieldPage(FakePage):
+    """模拟第一个响应字段为空、后续字段已有令牌的页面。"""
+
+    async def evaluate(self, expr: str, arg=None):
+        if "cf-turnstile-response" in expr and "getBoundingClientRect" not in expr:
+            return "later-widget-token" if "querySelectorAll" in expr else ""
+        return await super().evaluate(expr, arg)
+
+
+class _SlowPollPage(FakePage):
+    """让轮询等待真实推进时间，用于验证长人工挑战不会被再次点击。"""
+
+    def __init__(self) -> None:
+        super().__init__(token_after_clicks=None, token_after_waits=15)
+
+    async def wait_for_timeout(self, ms: int) -> None:
+        self.waits.append(int(ms))
+        self.events.append(("wait", int(ms)))
+        if self._token_after_waits is not None and len(self.waits) >= self._token_after_waits:
+            self._token = self._issue
+        await asyncio.sleep(max(0, ms) / 1000)
+
+
 def _solve(page: FakePage, *, timeout_ms: int = 5000, log=None) -> str:
     return asyncio.run(turnstile.solve(page, timeout_ms=timeout_ms, poll_interval_ms=250, log=log))
 
@@ -149,3 +172,17 @@ def test_already_issued_token_short_circuits() -> None:
     assert _solve(page) == "pre-issued"
     assert page.clicks == 0
     assert page.waits == []
+
+
+def test_reads_non_empty_token_from_later_response_field() -> None:
+    page = _MultiFieldPage()
+
+    assert _solve(page) == "later-widget-token"
+    assert page.clicks == 0
+
+
+def test_long_manual_challenge_is_not_reset_by_a_second_click() -> None:
+    page = _SlowPollPage()
+
+    assert _solve(page, timeout_ms=5000) == "tk"
+    assert page.clicks == 1, "人工验证超过原处理窗口时也不能再次点击重置 challenge"
