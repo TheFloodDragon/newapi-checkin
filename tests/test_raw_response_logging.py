@@ -95,17 +95,17 @@ def test_unrelated_prefixes_are_still_filtered() -> None:
 def test_captcha_details_appear_in_note() -> None:
     note = runner.build_detail_note(
         "success", "签到成功",
-        {"checkin_source": "api+captcha", "captcha_dialect": "scene_captcha",
+        {"checkin_source": "api+captcha", "captcha_dialect": "string_captcha",
          "captcha_attempts": 2, "captcha_answer_exact": True},
     )
-    assert "验证码：scene_captcha，第 2 次通过" in note
+    assert "验证码：string_captcha，第 2 次通过" in note
     assert "接口签到 + 图形验证码" in note
 
 
 def test_uncertain_captcha_reading_is_flagged() -> None:
     note = runner.build_detail_note(
         "success", "签到成功",
-        {"captcha_dialect": "checkin_captcha", "captcha_attempts": 4,
+        {"captcha_dialect": "bitmap_code", "captcha_attempts": 4,
          "captcha_answer_exact": False},
     )
     assert "读数不可信" in note

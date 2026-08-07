@@ -5,8 +5,8 @@
 | 模块 | 目标站点 | 形态 | 是否接入签到链路 |
 |---|---|---|---|
 | `generator` + `preprocess` + `matcher` + `predictor` | randomtool.cn | 300×100，Arial Bold 40px，逐字符旋转 | 否，离线工具 |
-| `newapi_bitmap` | New API fork 的签到验证码（jianzhile 系） | 160×58，6×9 点阵 2 倍放大，按色分割 | 是，见 scripts/newapi_captcha.py |
-| `base64_captcha` | New API fork 的签到验证码（sheapi 系） | 120×40，Go base64Captcha 多字体混排 | 是，见 scripts/newapi_captcha.py |
+| `newapi_bitmap` | `bitmap_code` 固定5位点阵字符验证码 | 160×58，6×9 点阵 2 倍放大，按色分割 | 是，见 scripts/newapi_captcha.py |
+| `base64_captcha` | `string_captcha` 字符图片验证码 | 120×40，Go base64Captcha 多字体混排 | 是，见 scripts/newapi_captcha.py |
 
 三套刻意不共用模板：字体、尺寸、变形维度完全不同，实测把 randomtool 的 Arial
 模板用在 New API 点阵验证码上只有 58% 单字符 / 约 7% 整图准确率。

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""New API fork 的「图形验证码」识别（Go `mojocn/base64Captcha` DriverString 系）。
+"""`string_captcha` 字符图片验证码识别（Go base64Captcha DriverString）。
 
-这是本包收录的第三套验证码，与 randomtool.cn（`generator`/`matcher`）、New API 点阵
-签到码（`newapi_bitmap`）互不相干。目标站点实测：`www.sheapi.top`，接口
+这是本包收录的第三套验证码，与 randomtool.cn（`generator`/`matcher`）、固定5位点阵
+验证码（`newapi_bitmap`）互不相干。接口
 
     GET /api/captcha?scene=checkin → {captcha_id, image(dataURL), expires_in}
 

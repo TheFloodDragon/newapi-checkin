@@ -179,6 +179,38 @@ def test_script_error_still_persists_because_login_may_have_succeeded(tmp_path, 
     assert _entry(cache)["access_token"] == "ACCESS"
 
 
+def test_error_without_tokens_does_not_persist_logged_out_state(tmp_path, monkeypatch) -> None:
+    """未完成登录的 error/异常不能仅凭非空 storage_state 覆盖缓存。"""
+    cache = tmp_path / "token_cache.json"
+    monkeypatch.setattr(token_cache, "CACHE_PATH", cache)
+    logs: list[str] = []
+    asyncio.run(
+        script_runner._persist_session(
+            _site(), FakeContext(LOGGED_OUT_STATE), logs.append, status="error"
+        )
+    )
+    assert not cache.exists()
+    assert any("未检测到有效 token" in line for line in logs)
+
+
+def test_error_with_explicit_auth_verification_can_persist_cookie_state(
+    tmp_path, monkeypatch
+) -> None:
+    """脚本明确验证过认证时，即使没有 token，也允许保存 cookie/browser_state。"""
+    cache = tmp_path / "token_cache.json"
+    monkeypatch.setattr(token_cache, "CACHE_PATH", cache)
+    asyncio.run(
+        script_runner._persist_session(
+            _site(),
+            FakeContext(LOGGED_OUT_STATE),
+            lambda _m: None,
+            status="error",
+            auth_verified=True,
+        )
+    )
+    assert _entry(cache)["browser_state"]
+
+
 def test_success_statuses_persist_as_before(tmp_path, monkeypatch) -> None:
     """成功路径行为不变（含不带 status 的旧调用）。"""
     cache = tmp_path / "token_cache.json"

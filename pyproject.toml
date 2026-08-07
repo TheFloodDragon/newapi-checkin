@@ -6,6 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     "camoufox[geoip]==0.4.11",
     "numpy>=2.4.6",
+    "opencv-python-headless>=4.10,<5",
     "playwright-captcha==0.1.5",
 ]
 

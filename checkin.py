@@ -36,7 +36,7 @@ from pathlib import Path
 import accounts_store
 import providers
 from checkin_core.batch import run_serial_groups
-from checkin_core.enums import OK_STATUSES
+from checkin_core.enums import OK_STATUSES, VERIFICATION_MODE_VALUES
 from config import Timeouts
 from mask_utils import sanitize_data
 from providers.base import CheckinResult, SiteConfig
@@ -112,6 +112,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--script-timeout", type=int, default=Timeouts.BROWSER_SCRIPT_DEFAULT,
                         help=f"browser_script 超时秒数，默认 {Timeouts.BROWSER_SCRIPT_DEFAULT}")
     parser.add_argument("--api-variant", default="auto", choices=["auto", "legacy"], help="newapi+api 接口变体偏好：auto=challenge 优先，legacy=旧接口优先")
+    parser.add_argument(
+        "--verification-mode",
+        default="auto",
+        choices=VERIFICATION_MODE_VALUES,
+        help="newapi+api 验证机制偏好；auto 自动探测，其它值优先尝试后在不适用时回落自动分流",
+    )
     parser.add_argument("--token-file", default="", help="临时指定单站点凭证文件（newapi）：第一行 Cookie，第二行用户 ID，第三行 Access token")
     parser.add_argument("--cookie", default="", help="临时指定单站点 Cookie")
     parser.add_argument("--access-token", default="", help="临时指定单站点 Access token")
@@ -204,6 +210,7 @@ def _execute(args: argparse.Namespace) -> tuple[dict[str, object] | list[dict[st
             "script_args": script_args,
             "script_timeout": args.script_timeout,
             "api_variant": args.api_variant,
+            "verification_mode": args.verification_mode,
             "cookie": args.cookie or os.environ.get("CHECKIN_COOKIE", ""),
             "user_id": args.user_id or os.environ.get("CHECKIN_USER_ID", ""),
             "access_token": args.access_token or os.environ.get("CHECKIN_ACCESS_TOKEN", ""),

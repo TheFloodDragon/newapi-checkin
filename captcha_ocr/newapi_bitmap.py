@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""New API 签到图形验证码识别（jianzhile 系 fork）。
+"""`bitmap_code` 固定5位点阵字符验证码识别。
 
 与 randomtool.cn 那套（见 generator.py）是**完全不同的验证码**，因此单独成篇：
 

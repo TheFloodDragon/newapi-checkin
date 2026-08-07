@@ -160,7 +160,11 @@ def build_site_tasks() -> list[CheckinTask]:
         api_variant = str(site.get("api_variant") or "auto").strip().lower()
         if api_variant:
             command.extend(["--api-variant", api_variant])
-        # api 也可挂纯 HTTP 站点脚本（如 scripts/newapi_captcha.py）；此前只给
+        verification_mode = accounts_store.normalize_verification_mode(
+            site.get("verification_mode")
+        )
+        command.extend(["--verification-mode", verification_mode])
+        # api 也可挂自定义站点脚本；此前只给
         # browser_script 透传，导致本地 GUI 测试可用、批量运行与 CI 却静默丢失脚本。
         script = str(site.get("script") or "").strip()
         if checkin_action in {"api", "browser_script"} and script:
@@ -243,7 +247,14 @@ def build_site_tasks() -> list[CheckinTask]:
         if checkin_action == "browser_script":
             script_timeout = accounts_store.parse_script_timeout(site.get("script_timeout"), Timeouts.BROWSER_SCRIPT_DEFAULT)
             task_timeout = float(script_timeout) + Timeouts.BROWSER_STARTUP_OVERHEAD
-        elif auth_method in {"browser", "oauth"} or checkin_action == "relogin" or oauth_fallback_provider:
+        elif (
+            auth_method in {"browser", "oauth"}
+            or checkin_action == "relogin"
+            or oauth_fallback_provider
+            # New API 接口签到默认带内置验证路由；auto/turnstile 可能按需启动浏览器。
+            # 这里只放宽任务硬上限，不会让无需验证的站点实际启动浏览器或变慢。
+            or (site_profile == "newapi" and checkin_action == "api")
+        ):
             task_timeout = Timeouts.BROWSER_TASK
         else:
             task_timeout = Timeouts.HTTP_TASK

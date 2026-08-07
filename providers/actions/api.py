@@ -145,11 +145,10 @@ def _script_log(site: SiteConfig, message: str) -> None:
 
 
 def _script_checkin(site: SiteConfig, client: ProfileClient, turnstile: str) -> CheckinReward | None:
-    """把签到交给站点脚本；脚本不接管（或未配置脚本）时返回 None。
+    """把签到交给验证路由或自定义脚本；不接管时返回 None。
 
-    这是「站点私改玩法」的唯一入口：图形验证码这类只服务于个别 fork 的流程都写成
-    脚本（如 scripts/newapi_captcha.py），由用户在管理界面填脚本路径启用，
-    通用适配器不必为它们背分支。
+    New API + API 未配置自定义脚本时自动加载内置验证路由；显式脚本仍可覆盖它，
+    用于其它站点私改流程。通用适配器不必为每个 fork 背分支。
 
     脚本约定：``do_checkin(client, log=None) -> CheckinReward | None``
     —— 返回 None 表示「本站不需要我接管」，抛 ApiError 由下游按 classify 归类。
@@ -157,7 +156,10 @@ def _script_checkin(site: SiteConfig, client: ProfileClient, turnstile: str) -> 
     """
     script_path = str(getattr(site, "script", "") or "").strip()
     if not script_path:
-        return None
+        if site.site_profile == "newapi" and site.checkin_action == "api":
+            script_path = "scripts/newapi_verification.py"
+        else:
+            return None
     try:
         from browser import script_loader
 

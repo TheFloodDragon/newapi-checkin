@@ -26,6 +26,14 @@ class CheckinAction(StrEnum):
     BROWSER_SCRIPT = "browser_script"
 
 
+class VerificationMode(StrEnum):
+    AUTO = "auto"
+    TURNSTILE = "turnstile"
+    BITMAP_CODE = "bitmap_code"
+    STRING_CAPTCHA = "string_captcha"
+    CLICK_SHAPE = "click_shape"
+
+
 class ResultStatus(StrEnum):
     SUCCESS = "success"
     ALREADY_DONE = "already_done"
@@ -69,6 +77,7 @@ STATUS_META: dict[ResultStatus, StatusMeta] = {
 PROFILE_VALUES = tuple(item.value for item in SiteProfileName)
 AUTH_METHOD_VALUES = tuple(item.value for item in AuthMethod)
 ACTION_VALUES = tuple(item.value for item in CheckinAction)
+VERIFICATION_MODE_VALUES = tuple(item.value for item in VerificationMode)
 VALID_RESULT_STATUSES = frozenset(item.value for item in ResultStatus)
 OK_STATUSES = frozenset({ResultStatus.SUCCESS.value, ResultStatus.ALREADY_DONE.value})
 

@@ -297,6 +297,9 @@ class SiteConfig:
     # newapi + api 专用：接口变体偏好（auto=challenge 优先，legacy=旧接口优先）。
     # 仅影响首次尝试顺序，两种都会在失败时互为兜底；其它 profile 忽略。
     api_variant: str = "auto"
+    # newapi + api 的验证机制偏好。auto 自动探测；其它值仅表示优先，确认不适用时
+    # 仍回落自动分流。有限值由 checkin_core.enums.VerificationMode 维护。
+    verification_mode: str = "auto"
     # TLS 证书校验开关。默认开启；仅当站点证书过期/自签名导致 CERTIFICATE_VERIFY_FAILED
     # 时，才在配置里显式设为 false 作为应急兜底（跳过校验有中间人风险，谨慎使用）。
     verify_ssl: bool = True

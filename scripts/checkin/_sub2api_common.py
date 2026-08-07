@@ -707,7 +707,13 @@ async def login_with_password(
 
     log(helpers, "账密登录成功，已验证登录态")
     await mark_login_done(page, spec.login_reset_sentinel)
-    login_detail.update({"login_fallback": "password", "login_response_status": status})
+    login_detail.update(
+        {
+            "login_fallback": "password",
+            "login_response_status": status,
+            "auth_verified": True,
+        }
+    )
     return None
 
 
@@ -993,6 +999,7 @@ async def api_fallback(
     resolved_url: str,
     login_attempted: bool,
     do_login: Any,
+    extra_detail: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """SPA 未渲染签到按钮时的接口兜底（含一次账密登录重试）。
 
@@ -1008,6 +1015,7 @@ async def api_fallback(
         "target_url": resolved_url,
         "completion_signal": "api_fallback",
         "response_status": status,
+        **dict(extra_detail or {}),
     }
     # 签到接口通常回传 balance / reward_amount，透出去让 GUI 与汇总直接显示额度，
     # 免得「签到成功」却看不到到账多少（此前这些数字被丢弃）。
@@ -1028,6 +1036,7 @@ async def api_fallback(
             "target_url": resolved_url,
             "completion_signal": "api_fallback_after_login",
             "response_status": status,
+            **dict(extra_detail or {}),
         }
         retry_quota = (retry or {}).get("balance")
         retry_awarded = (retry or {}).get("reward")
@@ -1402,12 +1411,33 @@ async def run_checkin_flow(
             return failure
         await navigate_and_settle(page, helpers, start_target, opts)
         if await on_login_page(page):
+            # URL/密码框只是 SPA 路由表现，服务端 /auth/me 才是认证权威。
+            # 某些部署登录成功后不会立即离开 /login，但 localStorage token 已可正常
+            # 调签到接口；此时不能反向覆盖刚刚成立的 authenticated() 结论。
+            if await authenticated(page, origin):
+                log(helpers, "登录已由 /auth/me 验证，但页面路由仍显示登录页，直接使用有效 token 接口签到")
+                login_detail["login_route_stale"] = True
+                await persist_state(context, site)
+                return await api_fallback(
+                    page,
+                    helpers,
+                    spec,
+                    opts,
+                    origin=origin,
+                    resolved_url=resolved_url,
+                    login_attempted=True,
+                    do_login=do_login,
+                    extra_detail=login_detail,
+                )
             return helpers.need_login(
-                f"{spec.site_label}登录后仍停留在登录页，请检查凭据或稍后重试",
+                f"{spec.site_label}登录接口成功但认证复查未通过，请检查凭据或稍后重试",
                 {"target_url": resolved_url, "login_fallback": "redirect_failed", **login_detail},
             )
 
-    await persist_state(context, site)
+    if await authenticated(page, origin):
+        await persist_state(context, site)
+    else:
+        log(helpers, "当前页面未通过 /auth/me 认证复查，跳过脚本内登录态快照")
     control, early_result = await wait_for_checkin_control(
         page,
         helpers,
@@ -1428,6 +1458,7 @@ async def run_checkin_flow(
             resolved_url=resolved_url,
             login_attempted=login_attempted,
             do_login=do_login,
+            extra_detail=login_detail,
         )
     return await click_and_confirm(
         page,

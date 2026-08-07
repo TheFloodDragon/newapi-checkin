@@ -11,10 +11,9 @@
 认证头：New-Api-User + Authorization: Bearer / Cookie
 响应：{success, data}；额度为内部 quota（/500000 = $）。
 
-个别 fork 的签到要过图形验证码。那是**站点私改**（端点、字段名、图像形态都不统一），
-不属于通用适配器，已抽成自定义脚本 scripts/newapi_captcha.py：在管理界面把
-该站点的「脚本路径」填成它即可，签到方式保持 api。本模块只在签到被缺验证码拒绝时，
-把服务端原文换成一句可操作的提示。
+个别 fork 的签到带额外验证。内置验证路由会按 `verification_mode` 自动/优先分流
+Turnstile、点阵字符、base64Captcha 字符图和 GoCaptcha 点选；本模块只在公开配置
+漏报、签到接口再次拒绝时，把服务端原文换成可操作的机制配置提示。
 """
 
 from __future__ import annotations
@@ -80,10 +79,11 @@ CHALLENGE_NETWORK_PATTERNS = [
     "fetch failed", "econnreset", "etimedout", "enotfound", "econnrefused",
     "socket hang up", "network", "timeout",
 ]
-# 签到被拒是因为缺图形验证码。识别与提交逻辑不在本模块（见下面的脚本路径），
-# 这里只用来把服务端原文换成一句「怎么修」。
+# 内置验证路由漏判时，用服务端拒绝文案给出 verification_mode 配置指引。
 CAPTCHA_REQUIRED_PATTERNS = ["请输入验证码", "captcha is required", "验证码不能为空"]
-CAPTCHA_SCRIPT_HINT = "scripts/newapi_captcha.py"
+CAPTCHA_MODE_HINT = "bitmap_code / string_captcha / click_shape"
+TURNSTILE_MISSING_PATTERNS = ["turnstile token 为空", "turnstile token is empty", "turnstile 校验失败"]
+TURNSTILE_MODE_HINT = "turnstile"
 
 
 def _is_antibot_block(error: ApiError) -> bool:
@@ -200,16 +200,23 @@ class NewApiClient(ProfileClient):
             else:
                 data = self._challenge_with_fallback(turnstile)
         except ApiError as exc:
-            # 个别 fork 的签到要过图形验证码。那套逻辑（端点/字段名/识别器）已抽成
-            # 自定义脚本 scripts/newapi_captcha.py，由 api action 在调本方法
-            # 之前询问；能走到这里说明站点没配脚本，所以把「怎么修」直接写进消息，
-            # 而不是丢一句服务端原文让人去猜。
+            # 内置路由已先尝试公开配置；走到这里说明站点漏报了验证方式，给出机制配置
+            # 而不是让用户继续填写旧的内置脚本路径。
             if contains_any(exc.message, CAPTCHA_REQUIRED_PATTERNS):
                 raise ApiError(
-                    exc.status, exc.payload,
+                    exc.status,
+                    exc.payload,
                     f"站点签到需要图形验证码（服务端回执：{exc.message}）。"
-                    "请在管理界面把该站点的「脚本路径」填为 "
-                    f"{CAPTCHA_SCRIPT_HINT}（签到方式仍保持 api）。",
+                    "请在管理界面设置“验证方式”，可选 "
+                    f"{CAPTCHA_MODE_HINT}；不确定时保留 auto。",
+                ) from exc
+            if contains_any(exc.message, TURNSTILE_MISSING_PATTERNS):
+                raise ApiError(
+                    exc.status,
+                    exc.payload,
+                    f"站点签到需要 Cloudflare Turnstile 人机验证（服务端回执：{exc.message}）。"
+                    f"请把“验证方式”设为 {TURNSTILE_MODE_HINT}，"
+                    "或用 --turnstile 手动传入令牌。",
                 ) from exc
             raise
         return self._reward_from(data)

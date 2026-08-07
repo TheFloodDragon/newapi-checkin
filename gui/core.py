@@ -24,7 +24,13 @@ from typing import Any, Callable
 import accounts_store
 from checkin_core.auth import can_optional_oauth as _can_optional_oauth
 from checkin_core.auth import effective_auth as _effective_auth
-from checkin_core.enums import ACTION_VALUES, AUTH_METHOD_VALUES, PROFILE_VALUES, status_meta
+from checkin_core.enums import (
+    ACTION_VALUES,
+    AUTH_METHOD_VALUES,
+    PROFILE_VALUES,
+    VERIFICATION_MODE_VALUES,
+    status_meta,
+)
 from config import Timeouts as _Timeouts
 from mask_utils import is_sensitive_key, mask_secrets
 
@@ -46,6 +52,7 @@ CRED_FIELDS = ("user_id", "access_token", "refresh_token", "cookie")
 AUTH_METHODS = AUTH_METHOD_VALUES
 CHECKIN_ACTIONS = ACTION_VALUES
 API_VARIANTS = ("auto", "legacy")
+VERIFICATION_MODES = VERIFICATION_MODE_VALUES
 OAUTH_PROVIDERS = accounts_store.KNOWN_OAUTH_PROVIDERS
 DEFAULT_OAUTH_ACCOUNT = accounts_store.DEFAULT_OAUTH_ACCOUNT
 
@@ -64,6 +71,13 @@ ACTION_LABELS = {
 }
 OAUTH_PROVIDER_LABELS = {"linuxdo": "Linux.do", "github": "GitHub"}
 API_VARIANT_LABELS = {"auto": "自动 (challenge 优先)", "legacy": "旧版接口 (legacy)"}
+VERIFICATION_MODE_LABELS = {
+    "auto": "自动识别（推荐）",
+    "turnstile": "Cloudflare Turnstile",
+    "bitmap_code": "点阵字符验证码（固定5位）",
+    "string_captcha": "字符图片验证码（base64Captcha）",
+    "click_shape": "图形点选验证码（GoCaptcha）",
+}
 
 # 「脚本路径」在两种签到方式下挂的是不同钩子，提示必须区分：
 # - browser_script：脚本的 run(page, context, site, helpers) 在 Camoufox 里跑；
@@ -71,8 +85,8 @@ API_VARIANT_LABELS = {"auto": "自动 (challenge 优先)", "legacy": "旧版接�
 #                  （如 New API fork 的图形验证码），返回 None 则回落默认签到流程。
 SCRIPT_HINT_BROWSER = "仓库内相对路径；浏览器里执行 run()，例如 scripts/checkin/100xlabs.py"
 SCRIPT_PLACEHOLDER_BROWSER = "scripts/checkin/100xlabs.py"
-SCRIPT_HINT_API = "可留空。纯 HTTP 接管签到，用于图形验证码等私改流程；留空走默认签到"
-SCRIPT_PLACEHOLDER_API = "scripts/newapi_captcha.py（需要图形验证码时填）"
+SCRIPT_HINT_API = "可留空。仅用于覆盖内置验证路由或接入其它自定义 do_checkin 钩子"
+SCRIPT_PLACEHOLDER_API = "scripts/custom_checkin.py（仅自定义流程时填）"
 
 
 # ── 脱敏日志（敏感键规则统一由 mask_utils 维护）───────────────────────────────
@@ -183,6 +197,7 @@ class SiteRow:
     script_args_text: str = "{}"
     script_timeout: int = _SCRIPT_TIMEOUT_DEFAULT
     api_variant: str = "auto"
+    verification_mode: str = "auto"
     oauth_provider: str = "linuxdo"
     oauth_account: str = DEFAULT_OAUTH_ACCOUNT
     oauth_fallback_provider: str = ""
@@ -247,6 +262,9 @@ def row_from_store(raw: dict[str, Any]) -> SiteRow:
     api_variant = str(raw.get("api_variant") or "auto").strip().lower()
     if api_variant not in API_VARIANTS:
         api_variant = "auto"
+    verification_mode = accounts_store.normalize_verification_mode(
+        raw.get("verification_mode")
+    )
     script_args = accounts_store.normalize_script_args(raw.get("script_args"))
     # OAuth 流程的登录态统一存顶层 oauth_states，行内不携带站点级 state。
     keep_state = not (checkin_action == "relogin" or (checkin_action == "browser_script" and auth_method == "oauth"))
@@ -261,6 +279,7 @@ def row_from_store(raw: dict[str, Any]) -> SiteRow:
         script_args_text=json.dumps(script_args, ensure_ascii=False, indent=2) if script_args else "{}",
         script_timeout=accounts_store.parse_script_timeout(raw.get("script_timeout")),
         api_variant=api_variant,
+        verification_mode=verification_mode,
         oauth_provider=accounts_store.normalize_oauth_provider(raw.get("oauth_provider")) or "linuxdo",
         oauth_account=accounts_store.normalize_oauth_account(raw.get("oauth_account") or raw.get("oauth_account_id")),
         oauth_fallback_provider=accounts_store.normalize_oauth_provider(raw.get("oauth_fallback_provider")),
@@ -338,6 +357,9 @@ def task_params(
         "script_args": accounts_store.normalize_script_args(row.script_args),
         "script_timeout": accounts_store.parse_script_timeout(row.script_timeout),
         "api_variant": row.api_variant,
+        "verification_mode": accounts_store.normalize_verification_mode(
+            row.verification_mode
+        ),
         "cookie": row.cookie.strip(),
         "access_token": row.access_token.strip(),
         "refresh_token": row.refresh_token.strip(),
@@ -371,6 +393,7 @@ def task_params(
 @dataclass
 class FormPlan:
     show_variant: bool = False
+    show_verification: bool = False
     show_script: bool = False
     # script_args 目前只传给 browser_script 的 run()；api 钩子固定为
     # do_checkin(client, log)，显示参数框会让用户误以为它会被消费。
@@ -482,6 +505,7 @@ def build_form_plan(row: SiteRow, oauth_states: dict[str, Any]) -> FormPlan:
 
     plan = FormPlan(
         show_variant=row.type == "newapi" and action == "api",
+        show_verification=row.type == "newapi" and action == "api",
         show_script=is_script or allow_api_script,
         show_script_args=is_script,
         show_script_timeout=is_script,
@@ -715,6 +739,9 @@ def persist_accounts(rows: list[SiteRow]) -> list[dict[str, Any]]:
             acct["oauth_fallback_account"] = fallback_account
         if t == "newapi" and action == "api":
             acct["api_variant"] = row.api_variant if row.api_variant in API_VARIANTS else "auto"
+            acct["verification_mode"] = accounts_store.normalize_verification_mode(
+                row.verification_mode
+            )
         if row.proxy.strip():
             acct["proxy"] = row.proxy.strip()
         if not accounts_store.parse_enabled(row.verify_ssl, True):

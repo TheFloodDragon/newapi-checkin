@@ -29,7 +29,12 @@ from typing import Any, Iterable
 from urllib.parse import urlparse
 
 from checkin_core.auth import effective_auth, infer_auth_method
-from checkin_core.enums import ACTION_VALUES, AUTH_METHOD_VALUES, PROFILE_VALUES
+from checkin_core.enums import (
+    ACTION_VALUES,
+    AUTH_METHOD_VALUES,
+    PROFILE_VALUES,
+    VERIFICATION_MODE_VALUES,
+)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SITES_CONFIG_PATH = SCRIPT_DIR / "sites.json"
@@ -317,6 +322,7 @@ CONFIG_FIELDS = (
     "script_args",
     "script_timeout",
     "api_variant",
+    "verification_mode",
     "verify_ssl",
     # 旧字段（向后兼容输入）
     "type",
@@ -344,6 +350,17 @@ CONFIG_FIELDS = (
 KNOWN_PROFILES = PROFILE_VALUES
 KNOWN_AUTH_METHODS = AUTH_METHOD_VALUES
 KNOWN_ACTIONS = ACTION_VALUES
+KNOWN_VERIFICATION_MODES = VERIFICATION_MODE_VALUES
+
+_BUILTIN_VERIFICATION_SCRIPTS = {
+    "scripts/newapi_turnstile.py": "turnstile",
+    "scripts/newapi_captcha.py": "auto",
+}
+
+
+def normalize_verification_mode(value: Any) -> str:
+    mode = str(value or "auto").strip().lower().replace("-", "_")
+    return mode if mode in KNOWN_VERIFICATION_MODES else "auto"
 
 
 def _infer_auth_method(checkin_action: str, *, sub2api_browser: bool, has_token: bool) -> str:
@@ -429,6 +446,16 @@ def migrate_fields(entry: dict[str, Any]) -> dict[str, Any]:
 
     # action 对 auth 的硬约束由共享契约统一应用，避免 GUI 与 CLI 解释不一致。
     out["auth_method"] = effective_auth(out.get("checkin_action"), out.get("auth_method"))
+
+    # 内置验证脚本迁移为机制偏好。只迁移精确内置路径；其它自定义脚本继续优先执行。
+    if out.get("site_profile") == "newapi" and out.get("checkin_action") == "api":
+        script_path = str(out.get("script") or "").strip().replace("\\", "/")
+        explicit_mode = "verification_mode" in entry
+        if script_path in _BUILTIN_VERIFICATION_SCRIPTS:
+            if not explicit_mode:
+                out["verification_mode"] = _BUILTIN_VERIFICATION_SCRIPTS[script_path]
+            out.pop("script", None)
+        out["verification_mode"] = normalize_verification_mode(out.get("verification_mode"))
 
     # 统一：OAuth 登录 / relogin 站点补 oauth_provider + oauth_account
     if out.get("auth_method") == "oauth" or out.get("checkin_action") == "relogin":
@@ -610,6 +637,7 @@ def configured_site_from_mapping(
         script_args=normalize_script_args(row.get("script_args")),
         script_timeout=parse_script_timeout(row.get("script_timeout")),
         api_variant=str(row.get("api_variant") or "auto"),
+        verification_mode=normalize_verification_mode(row.get("verification_mode")),
         cookie=str(row.get("cookie") or ""),
         user_id=str(row.get("user_id") or row.get("new_api_user") or ""),
         access_token=access_token,
@@ -932,6 +960,7 @@ _PERSIST_ORDER = (
     "oauth_fallback_provider",
     "oauth_fallback_account",
     "api_variant",
+    "verification_mode",
     "enabled",
     "user_id",
     "access_token",
@@ -983,8 +1012,15 @@ def _account_to_persist(row: dict[str, Any]) -> dict[str, Any]:
                 if variant and variant != "auto":
                     out["api_variant"] = variant
             continue
+        if field == "verification_mode":
+            # 仅 newapi + api 且非默认 auto 时写入。
+            if row.get("site_profile") == "newapi" and row.get("checkin_action") == "api":
+                mode = normalize_verification_mode(row.get("verification_mode"))
+                if mode != "auto":
+                    out["verification_mode"] = mode
+            continue
         if field == "script":
-            # browser_script 必填；api 可选，用于 do_checkin(client, log) 纯 HTTP 钩子。
+            # browser_script 必填；api 可选，用于 do_checkin(client, log) 自定义钩子。
             if row.get("checkin_action") in {"api", "browser_script"}:
                 script = str(row.get("script") or "").strip()
                 if script:
@@ -1203,6 +1239,9 @@ def build_github_secret_payload(
             api_variant = str(row.get("api_variant") or "auto").strip().lower()
             if api_variant and api_variant != "auto":
                 out["api_variant"] = api_variant
+            verification_mode = normalize_verification_mode(row.get("verification_mode"))
+            if verification_mode != "auto":
+                out["verification_mode"] = verification_mode
 
         # 两种 action 都能挂脚本：api 只需路径，browser_script 还需参数与超时。
         if checkin_action in {"api", "browser_script"}:

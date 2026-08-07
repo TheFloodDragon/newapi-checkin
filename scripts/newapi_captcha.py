@@ -19,32 +19,41 @@
 背上一堆只服务于两三个站点的分支；抽成脚本后，新 fork 只需在这里加一行方言声明，
 或者干脆另写一个脚本，通用层完全不必改动。
 
-## 两套已知方言
+## 已知验证机制
 
-| | jianzhile 系 | sheapi 系 |
-|---|---|---|
-| 开关 | 签到状态里的 `captcha_enabled` | `/api/status` 的 `checkin_captcha_enabled` |
-| 取图 | `POST /api/user/checkin/captcha` | `GET /api/captcha?scene=checkin` |
-| 图片字段 | `captcha_image` | `image` |
-| 提交字段 | `captcha_answer` | `captcha_code` |
+| 配置值 | `bitmap_code` | `string_captcha` | `click_shape` |
+|---|---|---|---|
+| 开关 | 签到状态 `captcha_enabled` | `checkin_captcha_enabled` | `captcha_checkin_enabled` |
+| 类型 | 固定5位点阵字符 | base64Captcha DriverString | GoCaptcha 图形点选 |
+| 取挑战 | `POST /api/user/checkin/captcha` | `GET /api/captcha?scene=checkin` | `GET /api/go-captcha-data/click-shape` |
+| 验证 | `captcha_answer` | `captcha_code` | 按序点位换取 `captcha_token` |
 
-识别由 `captcha_ocr` 完成（按图像尺寸派发，两套生成器各一个识别器），逆向与验收
-记录见 docs/captcha_algorithm.md。
+字符图按尺寸派发给两套离线识别器；click_shape 使用 GoCaptcha 官方13形状模板、
+固定调色板与一对一全局匹配。
 """
 
 from __future__ import annotations
 
 import json
 import sys
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from providers.base import ApiError, CheckinReward, contains_any, unwrap_data  # noqa: E402
+from providers.base import (  # noqa: E402
+    ApiError,
+    CheckinReward,
+    USER_AGENT,
+    contains_any,
+    http_request,
+    unwrap_data,
+)
 
 
 @dataclass(frozen=True)
@@ -53,20 +62,26 @@ class CaptchaDialect:
 
     key: str
     endpoint: str                 # 取图端点（相对站点根）
-    method: str                   # jianzhile 系用 POST，sheapi 系用 GET
+    method: str                   # bitmap_code 用 POST，string_captcha 用 GET
     image_keys: tuple[str, ...]   # 响应里承载 dataURL 的字段名
     answer_key: str               # 提交签到时答案的字段名
 
 
 DIALECTS: tuple[CaptchaDialect, ...] = (
-    CaptchaDialect("checkin_captcha", "/api/user/checkin/captcha", "POST",
+    CaptchaDialect("bitmap_code", "/api/user/checkin/captcha", "POST",
                    ("captcha_image", "image"), "captcha_answer"),
-    CaptchaDialect("scene_captcha", "/api/captcha?scene=checkin", "GET",
+    CaptchaDialect("string_captcha", "/api/captcha?scene=checkin", "GET",
                    ("image", "captcha_image"), "captcha_code"),
 )
+DIALECT_BY_MODE = {dialect.key: dialect for dialect in DIALECTS}
 
 CHECKIN_PATH = "/api/user/checkin"
 STATUS_PATH = "/api/status"
+
+# GoCaptcha click-shape 方言（newapi 多功能 fork，例：api.vectorengine.ai）。
+GO_CAPTCHA_DATA_PATH = "/api/go-captcha-data/click-shape"
+GO_CAPTCHA_CHECK_PATH = "/api/go-captcha-check-data/click-shape"
+GO_CAPTCHA_MAX_ATTEMPTS = 4
 
 # 「这次不算」的回执：换一张重试，而不是判定站点不支持。
 RETRY_PATTERNS = ["验证码错误", "验证码已失效", "验证码不正确", "captcha", "刷新后重试", "已过期"]
@@ -150,15 +165,12 @@ def solve_image(data_url: str, log: Any = None) -> tuple[str, bool]:
 def captcha_required(client: Any, log: Any = None) -> bool:
     """站点签到是否需要图形验证码。
 
-    两套方言把开关放在不同地方：jianzhile 系写在签到状态里（`captcha_enabled`），
-    sheapi 系只在 `/api/status` 给 `checkin_captcha_enabled`。只看其中一处会漏判，
-    实测就是这样一路走到用错端点、报「Invalid URL」。
+    不同机制把开关放在不同位置：bitmap_code 写在签到状态的 `captcha_enabled`；
+    string_captcha / click_shape 通常写在 `/api/status` 的签到验证码开关。只看其中
+    一处会漏判并探测错误端点。
 
-    两处都读不到时返回 False —— 此时仍会在签到被拒后靠「验证码不能为空」兜底切进来。
-
-    判定过程要落日志：返回 False 时脚本会整体让位给默认流程，一行日志都不打的话
-    （实测 sheapi.top 就是如此）用户完全看不出「脚本到底有没有被调用、开关读到了
-    什么」，只能看到一句签到失败。
+    所有开关都读不到时返回 False，让位给默认签到流程。判定过程必须落日志，否则
+    用户无法区分「路由器未调用」与「公开配置没有声明验证」。
     """
     def _log(message: str) -> None:
         if log:
@@ -180,9 +192,20 @@ def captcha_required(client: Any, log: Any = None) -> bool:
         _log(f"读 {STATUS_PATH} 失败：{type(exc).__name__}: {exc}")
         options = None
     if isinstance(options, dict):
-        flag = options.get("checkin_captcha_enabled")
-        _log(f"{STATUS_PATH} 的 checkin_captcha_enabled={flag!r}")
-        if flag:
+        # 缓存给 do_checkin 选择 captcha_type，避免同一轮再请求一次 /api/status。
+        try:
+            setattr(client, "_captcha_status_options", options)
+        except Exception:
+            pass
+        # 不同实现的字段命名方向不一致：
+        # - string_captcha 常见：checkin_captcha_enabled
+        # - click_shape 常见：captcha_checkin_enabled
+        flags = {
+            "checkin_captcha_enabled": options.get("checkin_captcha_enabled"),
+            "captcha_checkin_enabled": options.get("captcha_checkin_enabled"),
+        }
+        _log(f"{STATUS_PATH} 的签到验证码开关={flags!r}，captcha_type={options.get('captcha_type')!r}")
+        if any(flags.values()):
             return True
     _log("两处开关均未标记需要验证码 → 让位给默认签到流程")
     return False
@@ -207,8 +230,14 @@ def _fetch_via(client: Any, dialect: CaptchaDialect) -> tuple[str, str]:
 class _Fetcher:
     """逐个方言试取图，记住命中的那个。"""
 
-    def __init__(self, client: Any, log: Any = None) -> None:
+    def __init__(
+        self,
+        client: Any,
+        log: Any = None,
+        dialects: tuple[CaptchaDialect, ...] = DIALECTS,
+    ) -> None:
         self.client = client
+        self.dialects = dialects
         self.dialect: CaptchaDialect | None = None
         self._log = log
 
@@ -222,7 +251,7 @@ class _Fetcher:
             return self.dialect, captcha_id, image
 
         errors: list[str] = []
-        for dialect in DIALECTS:
+        for dialect in self.dialects:
             try:
                 captcha_id, image = _fetch_via(self.client, dialect)
             except ApiError as exc:
@@ -248,6 +277,7 @@ def captcha_checkin(
     client: Any,
     log: Any = None,
     stats: dict[str, Any] | None = None,
+    mode: str = "auto",
 ) -> dict[str, Any] | None:
     """取图 → 离线识别 → 带答案提交，失败则换一张重试；返回签到接口的 data。
 
@@ -274,7 +304,9 @@ def captcha_checkin(
             "请执行 uv sync --extra dev 后重试，或在浏览器手动签到。",
         )
 
-    fetcher = _Fetcher(client, log=_log)
+    selected = DIALECT_BY_MODE.get(mode)
+    dialects = (selected,) if selected is not None else DIALECTS
+    fetcher = _Fetcher(client, log=_log, dialects=dialects)
     last_error: ApiError | None = None
     tried: list[str] = []
     for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -324,6 +356,157 @@ def captcha_checkin(
     )
 
 
+def _multipart(fields: dict[str, str]) -> tuple[bytes, str]:
+    boundary = f"----newapi-checkin-{uuid.uuid4().hex}"
+    chunks = []
+    for key, value in fields.items():
+        chunks.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{key}"\r\n\r\n'
+            f"{value}\r\n".encode()
+        )
+    chunks.append(f"--{boundary}--\r\n".encode())
+    return b"".join(chunks), boundary
+
+
+def _go_captcha_request(client: Any, fields: dict[str, str]) -> Any:
+    """提交 GoCaptcha multipart 验证；部分部署要求携带当前用户认证头。"""
+    body, boundary = _multipart(fields)
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json, text/plain, */*",
+        "Origin": client.base_url,
+        "Referer": getattr(client, "referer", client.base_url + "/"),
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+    }
+    auth = getattr(client, "auth", None)
+    if auth:
+        if getattr(auth, "new_api_user", ""):
+            headers["New-Api-User"] = str(auth.new_api_user)
+        if getattr(auth, "access_token", ""):
+            headers["Authorization"] = f"Bearer {auth.access_token}"
+        if getattr(auth, "cookie", ""):
+            headers["Cookie"] = str(auth.cookie)
+    return http_request(
+        client.base_url + GO_CAPTCHA_CHECK_PATH,
+        method="POST",
+        headers=headers,
+        body=body,
+        proxy=str(getattr(client.site, "proxy", "") or ""),
+        retry_non_idempotent=True,
+        verify_ssl=getattr(client.site, "verify_ssl", True),
+    )
+
+
+def click_shape_checkin(
+    client: Any, log: Any = None, stats: dict[str, Any] | None = None
+) -> Any:
+    """全自动完成 GoCaptcha click-shape，并用 captcha_token 签到。"""
+    from captcha_ocr.go_captcha_shape import available, solve_challenge
+
+    def _log(message: str) -> None:
+        if log:
+            log(message)
+
+    if not available():
+        raise ApiError(
+            None, None,
+            "站点签到使用 GoCaptcha click-shape，但当前环境缺少 "
+            "opencv-python-headless 或官方形状模板；请执行 uv sync 后重试。",
+        )
+
+    last_message = ""
+    for attempt in range(1, GO_CAPTCHA_MAX_ATTEMPTS + 1):
+        challenge = client.request("GET", GO_CAPTCHA_DATA_PATH)
+        if not isinstance(challenge, dict) or challenge.get("code") != 0:
+            raise ApiError(None, challenge, f"click-shape 挑战接口异常：{_brief(challenge)}")
+        captcha_key = str(challenge.get("captcha_key") or "")
+        image = str(challenge.get("image_base64") or "")
+        thumb = str(challenge.get("thumb_base64") or "")
+        if not captcha_key or not image or not thumb:
+            raise ApiError(None, challenge, "click-shape 挑战缺少 captcha_key / 图片")
+
+        try:
+            points = solve_challenge(image, thumb, log=_log)
+        except Exception as exc:
+            _log(f"第 {attempt}/{GO_CAPTCHA_MAX_ATTEMPTS} 张形状挑战识别失败：{exc}")
+            last_message = str(exc)
+            continue
+        point_text = ";".join(f"{x},{y}" for x, y in points)
+        _log(f"第 {attempt}/{GO_CAPTCHA_MAX_ATTEMPTS} 张形状挑战提交点位：{point_text}")
+        verified = _go_captcha_request(
+            client, {"key": captcha_key, "points": point_text}
+        )
+        if not isinstance(verified, dict) or verified.get("code") != 0:
+            last_message = str(
+                verified.get("message") if isinstance(verified, dict) else verified
+            )
+            _log(f"形状验证未通过：{_brief(verified)}，换一张重试")
+            continue
+        token = str(verified.get("token") or "")
+        if not token:
+            raise ApiError(None, verified, "click-shape 验证通过但未返回 token")
+
+        try:
+            data = unwrap_data(
+                client.request(
+                    "POST",
+                    f"{CHECKIN_PATH}?captcha_token={quote(token)}",
+                    retry_non_idempotent=True,
+                )
+            )
+        except ApiError as exc:
+            _log(f"captcha_token 签到被拒：{exc.message}；原始回执：{_brief(exc.payload)}")
+            if contains_any(exc.message, RETRY_PATTERNS + ["人机验证", "验证失败"]):
+                last_message = exc.message
+                continue
+            raise
+        if stats is not None:
+            stats.update(
+                captcha_dialect="click_shape",
+                captcha_attempts=attempt,
+                captcha_points=points,
+            )
+        return data
+
+    raise ApiError(
+        None, None,
+        f"click-shape 连续 {GO_CAPTCHA_MAX_ATTEMPTS} 次未通过"
+        + (f"；末次原因：{last_message}" if last_message else ""),
+    )
+
+
+def _status_options(client: Any) -> dict[str, Any]:
+    value = getattr(client, "_captcha_status_options", None)
+    return value if isinstance(value, dict) else {}
+
+
+def _reward_from_data(data: Any, stats: dict[str, Any]) -> CheckinReward:
+    if isinstance(data, dict):
+        return CheckinReward(
+            quota_awarded=data.get("quota_awarded"),
+            current_quota=data.get("quota"),
+            raw=data,
+            extra=stats,
+        )
+    return CheckinReward(raw=data, extra=stats)
+
+
+def mode_checkin(client: Any, mode: str, log: Any = None) -> CheckinReward | None:
+    """仅执行指定验证码机制；端点不适用时由调用方决定是否回落。"""
+    stats: dict[str, Any] = {
+        "checkin_source": "api+captcha",
+        "verification_mode": mode,
+    }
+    if mode == "click_shape":
+        data = click_shape_checkin(client, log=log, stats=stats)
+    elif mode in DIALECT_BY_MODE:
+        data = captcha_checkin(client, log=log, stats=stats, mode=mode)
+    else:
+        return None
+    return _reward_from_data(data, stats)
+
+
 def do_checkin(client: Any, log: Any = None) -> CheckinReward | None:
     """通用层钩子：接管 newapi 的签到请求。
 
@@ -339,16 +522,16 @@ def do_checkin(client: Any, log: Any = None) -> CheckinReward | None:
         return None
 
     _log("站点签到需要图形验证码，走离线识别流程")
-    stats: dict[str, Any] = {"checkin_source": "api+captcha"}
+    options = _status_options(client)
+    captcha_type = str(options.get("captcha_type") or "").strip().lower()
+    if captcha_type == "click-shape":
+        _log("检测到 click_shape，走 GoCaptcha 官方模板形状匹配")
+        return mode_checkin(client, "click_shape", log=log)
+
+    stats: dict[str, Any] = {
+        "checkin_source": "api+captcha",
+        "verification_mode": "auto",
+    }
     data = captcha_checkin(client, log=log, stats=stats)
     _log(f"验证码签到完成，站点原始返回：{_brief(data)}")
-    if isinstance(data, dict):
-        return CheckinReward(
-            quota_awarded=data.get("quota_awarded"),
-            current_quota=data.get("quota"),
-            raw=data,
-            # extra 会被 action 层合并进 detail，最终出现在批量汇总与结果 JSON 里。
-            # 只有日志时，「这次到底走了验证码流程吗、试了几次」在事后完全查不到。
-            extra=stats,
-        )
-    return CheckinReward(raw=data, extra=stats)
+    return _reward_from_data(data, stats)

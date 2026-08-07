@@ -175,7 +175,14 @@ def _normalize_result(raw: Any, *, script_file: Path) -> BrowserScriptResult:
 _UNAUTHENTICATED_STATUSES = frozenset({"need_login", "need_verification", "need_config"})
 
 
-async def _persist_session(site: Any, context: Any, log: Any, status: str = "") -> None:
+async def _persist_session(
+    site: Any,
+    context: Any,
+    log: Any,
+    status: str = "",
+    *,
+    auth_verified: bool = False,
+) -> None:
     """脚本结束时把登录态与 token 写进运行期缓存（用真实 SiteConfig 算 basis）。
 
     为什么不能在脚本里做：脚本拿到的是脱敏的 ScriptSiteView，没有 access_token /
@@ -215,6 +222,10 @@ async def _persist_session(site: Any, context: Any, log: Any, status: str = "") 
     site_base = str(getattr(site, "base_url", "") or "")
     access = session.storage_access_token(storage_state, base_url=site_base)
     refresh = session.storage_refresh_token(storage_state, base_url=site_base)
+    status_key = str(status or "").strip().lower()
+    if status_key in {"", "error"} and not auth_verified and not access and not refresh:
+        log("脚本异常/失败且未检测到有效 token，跳过续存登出态快照")
+        return
     if not encoded and not access and not refresh:
         return
     try:
@@ -273,10 +284,15 @@ async def run_browser_script(
     # error（脚本异常/超时）仍然续存 —— 登录可能已经成功，只是签到那步失败了，
     # 这份快照下次还能省一次登录。
     outcome_status = ""
+    outcome_auth_verified = False
 
     def _record(result: BrowserScriptResult) -> BrowserScriptResult:
-        nonlocal outcome_status
+        nonlocal outcome_status, outcome_auth_verified
         outcome_status = result.status
+        detail = result.detail if isinstance(result.detail, dict) else {}
+        outcome_auth_verified = result.status in {"success", "already_done"} or bool(
+            detail.get("auth_verified")
+        )
         return result
 
     try:
@@ -337,20 +353,28 @@ async def run_browser_script(
         if screenshot:
             detail["screenshot"] = screenshot
         log(f"脚本执行超时（{timeout}s）")
-        return BrowserScriptResult("error", f"浏览器脚本执行超时（{timeout}s）", detail)
+        return _record(
+            BrowserScriptResult("error", f"浏览器脚本执行超时（{timeout}s）", detail)
+        )
     except BrowserScriptError as exc:
-        return BrowserScriptResult("need_config", str(exc), {"checkin_source": "browser_script"})
+        return _record(
+            BrowserScriptResult(
+                "need_config", str(exc), {"checkin_source": "browser_script"}
+            )
+        )
     except Exception as exc:
         if session._is_driver_closed_error(exc):
-            return BrowserScriptResult(
-                "error",
-                "浏览器驱动已关闭或页面脚本触发 Playwright Firefox 兼容问题，请重试。",
-                {
-                    "checkin_source": "browser_script",
-                    "script": str(script_file.relative_to(REPO_ROOT)).replace("\\", "/"),
-                    "driver_crashed": True,
-                    "error": str(exc),
-                },
+            return _record(
+                BrowserScriptResult(
+                    "error",
+                    "浏览器驱动已关闭或页面脚本触发 Playwright Firefox 兼容问题，请重试。",
+                    {
+                        "checkin_source": "browser_script",
+                        "script": str(script_file.relative_to(REPO_ROOT)).replace("\\", "/"),
+                        "driver_crashed": True,
+                        "error": str(exc),
+                    },
+                )
             )
         screenshot = ""
         if page is not None:
@@ -367,8 +391,16 @@ async def run_browser_script(
         }
         if screenshot:
             detail["screenshot"] = screenshot
-        return BrowserScriptResult("error", f"浏览器脚本异常：{exc}", detail)
+        return _record(
+            BrowserScriptResult("error", f"浏览器脚本异常：{exc}", detail)
+        )
     finally:
-        await _persist_session(site, context, log, status=outcome_status)
+        await _persist_session(
+            site,
+            context,
+            log,
+            status=outcome_status,
+            auth_verified=outcome_auth_verified,
+        )
         await runtime_loop.safe_close_page(page)
         await runtime_loop.safe_close_browser(browser)

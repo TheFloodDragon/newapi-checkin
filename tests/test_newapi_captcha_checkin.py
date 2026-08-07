@@ -348,11 +348,11 @@ def test_captcha_failure_is_classified_as_need_verification() -> None:
     assert client.classify(ApiError(401, None, "token 验证失败")) == "need_login"
 
 
-# ── 没配脚本却撞上验证码：报错要说清怎么修 ───────────────────────────────────
-def test_missing_script_yields_actionable_hint() -> None:
-    """旧行为只把服务端原文丢出来，用户无从知道要去填脚本路径。"""
+# ── 自动路由漏判验证码：报错要说清怎么修 ─────────────────────────────────────
+def test_missing_detection_yields_actionable_hint() -> None:
+    """公开配置漏报时应提示 verification_mode，而不是要求填写内置脚本。"""
     client = FakeClient([ApiError(None, None, "图形验证码不能为空")], api_variant="legacy")
     with pytest.raises(ApiError) as exc:
         client.do_checkin()
-    assert NA.CAPTCHA_SCRIPT_HINT in exc.value.message
+    assert NA.CAPTCHA_MODE_HINT in exc.value.message
     assert "图形验证码不能为空" in exc.value.message, "服务端原文要保留，便于核对"

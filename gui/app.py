@@ -482,6 +482,20 @@ class App(QMainWindow):
             self.variant_combo.addItem(core.API_VARIANT_LABELS.get(m, m), m)
         self.variant_wrap.layout().addWidget(self.variant_combo)
 
+        self.verification_wrap = self._field(
+            site_layout,
+            "验证方式",
+            "未选择时自动识别；选择后优先该机制，不适用时回落自动分流",
+        )
+        self.verification_combo = w.NoWheelComboBox()
+        self.verification_combo.setObjectName("input")
+        self.verification_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        for mode in core.VERIFICATION_MODES:
+            self.verification_combo.addItem(
+                core.VERIFICATION_MODE_LABELS.get(mode, mode), mode
+            )
+        self.verification_wrap.layout().addWidget(self.verification_combo)
+
         self.script_wrap = self._field(site_layout, "脚本路径", core.SCRIPT_HINT_BROWSER)
         self.script_edit = QLineEdit()
         self.script_edit.setObjectName("input")
@@ -646,6 +660,7 @@ class App(QMainWindow):
         if self.oauth_account_combo.lineEdit():
             self.oauth_account_combo.lineEdit().editingFinished.connect(self._on_combo_changed)
         self.variant_combo.currentIndexChanged.connect(self._on_combo_changed)
+        self.verification_combo.currentIndexChanged.connect(self._on_combo_changed)
         self.script_edit.textChanged.connect(self._flush)
         self.script_args_edit.textChanged.connect(self._flush)
         self.script_timeout_edit.textChanged.connect(self._flush)
@@ -913,6 +928,9 @@ class App(QMainWindow):
         self._set_combo_value(self.auth_combo, row.auth_method, "cookie")
         self._set_combo_value(self.action_combo, row.checkin_action, "api")
         self._set_combo_value(self.variant_combo, row.api_variant, "auto")
+        self._set_combo_value(
+            self.verification_combo, row.verification_mode, "auto"
+        )
         self._set_combo_value(self.oauth_provider_combo, row.oauth_provider, "linuxdo")
         self._refresh_oauth_account_choices(row.oauth_account or core.DEFAULT_OAUTH_ACCOUNT)
         self._refresh_oauth_fallback_choices(row.oauth_fallback_provider, row.oauth_fallback_account)
@@ -947,6 +965,7 @@ class App(QMainWindow):
         self._set_combo_value(self.auth_combo, "cookie", "cookie")
         self._set_combo_value(self.action_combo, "api", "api")
         self._set_combo_value(self.variant_combo, "auto", "auto")
+        self._set_combo_value(self.verification_combo, "auto", "auto")
         self._set_combo_value(self.oauth_provider_combo, "linuxdo", "linuxdo")
         self._refresh_oauth_account_choices(core.DEFAULT_OAUTH_ACCOUNT)
         self._refresh_oauth_fallback_choices()
@@ -988,6 +1007,9 @@ class App(QMainWindow):
             pass
         row.script_timeout = accounts_store.parse_script_timeout(self.script_timeout_edit.text().strip())
         row.api_variant = self._combo_value(self.variant_combo, core.API_VARIANTS, "auto")
+        row.verification_mode = self._combo_value(
+            self.verification_combo, core.VERIFICATION_MODES, "auto"
+        )
         row.oauth_provider = self._combo_value(self.oauth_provider_combo, core.OAUTH_PROVIDERS, "linuxdo")
         row.oauth_account = self._current_oauth_account()
         fallback_provider, fallback_account = self._current_oauth_fallback()
@@ -1175,6 +1197,7 @@ class App(QMainWindow):
     def _apply_form_plan(self, row: core.SiteRow | None) -> None:
         plan = core.build_form_plan(row, self.oauth_states) if row is not None else core.FormPlan()
         self.variant_wrap.setVisible(plan.show_variant)
+        self.verification_wrap.setVisible(plan.show_verification)
         self.script_wrap.setVisible(plan.show_script)
         self.script_args_wrap.setVisible(plan.show_script_args)
         self.script_timeout_wrap.setVisible(plan.show_script_timeout)

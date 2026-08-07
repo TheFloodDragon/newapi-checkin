@@ -58,6 +58,17 @@ def test_row_from_store_infers_auth_from_token() -> None:
     assert row2.auth_method == "cookie"
 
 
+def test_row_from_store_verification_mode() -> None:
+    row = core.row_from_store(
+        {
+            "name": "s",
+            "base_url": "https://a.com",
+            "verification_mode": "click-shape",
+        }
+    )
+    assert row.verification_mode == "click_shape"
+
+
 def test_row_from_store_script_args_text() -> None:
     row = core.row_from_store(
         {"name": "s", "base_url": "https://a.com", "script_args": {"k": "v"}, "checkin_action": "browser_script",
@@ -77,6 +88,7 @@ def test_task_params_oauth_pulls_shared_state() -> None:
     assert params["browser_state"] == "STATE-X"
     assert params["fallback_uid"] == params["user_id"] == ""
     assert params["verify_ssl"] is True
+    assert params["verification_mode"] == "auto"
 
 
 def test_task_params_browser_keeps_row_state_and_fallback_gating() -> None:
@@ -133,10 +145,11 @@ def test_form_plan_browser_script_browser_auth() -> None:
     assert plan.oauth_status.startswith("可选 OAuth：")
 
 
-def test_form_plan_newapi_api_variant_visible() -> None:
+def test_form_plan_newapi_api_controls_visible() -> None:
     row = core.SiteRow(name="s", base_url="https://a.com")
     plan = core.build_form_plan(row, {})
     assert plan.show_variant
+    assert plan.show_verification
     assert not plan.show_state_box
 
 
@@ -209,15 +222,22 @@ def test_persist_accounts_shapes() -> None:
             checkin_action="browser_script", script="scripts/x.py", script_args_text='{"a": 1}',
             browser_state="ST", verify_ssl=False,
         ),
-        core.SiteRow(name="api-script", base_url="https://b.com", checkin_action="api",
-                     script="scripts/newapi_captcha.py", script_args_text='{"ignored": true}'),
+        core.SiteRow(
+            name="api-script",
+            base_url="https://b.com",
+            checkin_action="api",
+            script="scripts/custom_captcha.py",
+            script_args_text='{"ignored": true}',
+            verification_mode="string_captcha",
+        ),
         core.SiteRow(name="relogin-site", base_url="https://c.com", checkin_action="relogin", auth_method="cookie"),
     ]
     accts = core.persist_accounts(rows)
     first, api_script, relogin = accts
     assert first["script"] == "scripts/x.py" and first["script_args"] == {"a": 1}
     assert first["browser_state"] == "ST" and first["verify_ssl"] is False
-    assert api_script["script"] == "scripts/newapi_captcha.py"
+    assert api_script["script"] == "scripts/custom_captcha.py"
+    assert api_script["verification_mode"] == "string_captcha"
     assert "script_args" not in api_script and "script_timeout" not in api_script
     # relogin：auth 矫正为 oauth、不落 browser_state、带 oauth 字段、无 api_variant
     assert relogin["auth_method"] == "oauth"

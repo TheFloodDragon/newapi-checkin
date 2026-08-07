@@ -7,7 +7,7 @@ bench            在真实样本上跑准确率与延迟（验收用）
 build-templates  重建模板库（改了窗口/角度参数后必须执行）
 stats            查看真实样本库构成
 
-base64-build     重建 base64Captcha 系模板库（sheapi 的签到验证码）
+base64-build     重建 string_captcha（base64Captcha）模板库
 base64-bench     在 tests/data 的真实样本上评测 base64Captcha 识别器
 """
 

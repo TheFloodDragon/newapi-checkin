@@ -132,7 +132,7 @@ def test_save_accounts_preserves_api_script_without_browser_only_fields(tmp_path
                 "site_profile": "newapi",
                 "auth_method": "access_token",
                 "checkin_action": "api",
-                "script": "scripts/newapi_captcha.py",
+                "script": "scripts/custom_captcha.py",
                 "script_args": {"ignored": True},
                 "script_timeout": 99,
                 "enabled": True,
@@ -141,7 +141,7 @@ def test_save_accounts_preserves_api_script_without_browser_only_fields(tmp_path
         path=path,
     )
     saved = json.loads(path.read_text(encoding="utf-8"))["accounts"][0]
-    assert saved["script"] == "scripts/newapi_captcha.py"
+    assert saved["script"] == "scripts/custom_captcha.py"
     assert "script_args" not in saved
     assert "script_timeout" not in saved
 
@@ -170,7 +170,7 @@ def test_export_keeps_api_script_without_browser_only_fields() -> None:
                 "site_profile": "newapi",
                 "auth_method": "access_token",
                 "checkin_action": "api",
-                "script": "scripts/newapi_captcha.py",
+                "script": "scripts/custom_captcha.py",
                 "script_args": {"ignored": True},
                 "script_timeout": 99,
                 "access_token": "at",
@@ -180,7 +180,7 @@ def test_export_keeps_api_script_without_browser_only_fields() -> None:
         ]
     )
     exported = payload["accounts"][0]
-    assert exported["script"] == "scripts/newapi_captcha.py"
+    assert exported["script"] == "scripts/custom_captcha.py"
     assert "script_args" not in exported
     assert "script_timeout" not in exported
 
@@ -277,3 +277,69 @@ def test_export_omits_default_runtime_options() -> None:
     assert "verify_ssl" not in exported
     assert "referer_path" not in exported
     assert "auto_refresh_cookie" not in exported
+
+
+def test_verification_mode_persists_only_when_non_default(tmp_path: Path) -> None:
+    path = tmp_path / "ACCOUNTS.json"
+    accounts_store.save_accounts(
+        [
+            {
+                "name": "auto",
+                "base_url": "https://auto.invalid",
+                "site_profile": "newapi",
+                "auth_method": "access_token",
+                "checkin_action": "api",
+                "verification_mode": "auto",
+            },
+            {
+                "name": "shape",
+                "base_url": "https://shape.invalid",
+                "site_profile": "newapi",
+                "auth_method": "access_token",
+                "checkin_action": "api",
+                "verification_mode": "click_shape",
+            },
+        ],
+        path=path,
+    )
+    saved = json.loads(path.read_text(encoding="utf-8"))["accounts"]
+    assert "verification_mode" not in saved[0]
+    assert saved[1]["verification_mode"] == "click_shape"
+
+
+def test_builtin_verification_scripts_migrate_to_mode() -> None:
+    turnstile = accounts_store.migrate_fields(
+        {
+            "site_profile": "newapi",
+            "auth_method": "access_token",
+            "checkin_action": "api",
+            "script": "scripts/newapi_turnstile.py",
+        }
+    )
+    assert turnstile["verification_mode"] == "turnstile"
+    assert "script" not in turnstile
+
+    captcha = accounts_store.migrate_fields(
+        {
+            "site_profile": "newapi",
+            "auth_method": "access_token",
+            "checkin_action": "api",
+            "script": "scripts/newapi_captcha.py",
+        }
+    )
+    assert captcha["verification_mode"] == "auto"
+    assert "script" not in captcha
+
+
+def test_custom_api_script_is_not_migrated() -> None:
+    row = accounts_store.migrate_fields(
+        {
+            "site_profile": "newapi",
+            "auth_method": "access_token",
+            "checkin_action": "api",
+            "script": "scripts/custom_captcha.py",
+            "verification_mode": "string_captcha",
+        }
+    )
+    assert row["script"] == "scripts/custom_captcha.py"
+    assert row["verification_mode"] == "string_captcha"

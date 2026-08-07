@@ -24,7 +24,8 @@
 | 场景 | 推荐配置 | 是否启动浏览器 |
 |---|---|---:|
 | 站点有稳定签到接口，已有 Token / Cookie | `access_token` 或 `cookie` + `api` | 否 |
-| New API fork 的签到要求图形验证码 | `access_token` + `api` + `scripts/newapi_captcha.py` | 否 |
+| New API 签到要求字符/点选验证码 | `access_token` + `api`，验证方式留空自动识别 | click_shape 不需要浏览器 |
+| New API 签到要求 Cloudflare Turnstile | `access_token` + `api`，可选 `verification_mode=turnstile` | 需要，仅用于取令牌 |
 | New API 接口被阿里云 WAF 拦截 | `browser` + `api` | 需要，用于过 WAF 和导出 Cookie |
 | 站点没有签到接口，只需保活和监控额度 | `access_token` / `cookie` + `visit` | 否 |
 | 额度在第三方 OAuth 登录回调时发放 | `oauth` + `relogin` | 需要 |
@@ -200,7 +201,7 @@ uv run python manage_accounts.py
       "site_profile": "newapi",
       "auth_method": "access_token",
       "checkin_action": "api",
-      "script": "scripts/newapi_captcha.py",
+      "verification_mode": "auto",
       "user_id": "10002",
       "access_token": "<access_token>",
       "enabled": true
@@ -295,23 +296,46 @@ def do_checkin(client, log=None):
     ...
 ```
 
-当前内置脚本：
+New API + API 签到默认启用内置验证路由，不需要填写脚本路径。`verification_mode`
+可省略（等同 `auto`）；指定后优先该机制，确认不适用时再回落自动探测：
 
 ```json
 {
   "checkin_action": "api",
-  "script": "scripts/newapi_captcha.py"
+  "verification_mode": "click_shape"
 }
 ```
 
-`scripts/newapi_captcha.py` 支持两类已知 New API fork 验证码方言：
+| 配置值 | 验证机制 |
+|---|---|
+| `auto` | 自动识别（默认，不落盘） |
+| `turnstile` | Cloudflare Turnstile |
+| `bitmap_code` | 固定5位、160×58、无抗锯齿点阵字符验证码 |
+| `string_captcha` | Go base64Captcha DriverString 字符图片验证码 |
+| `click_shape` | GoCaptcha 按顺序点选形状 |
 
-- `POST /api/user/checkin/captcha` + `captcha_answer`；
-- `GET /api/captcha?scene=checkin` + `captcha_code`。
+`bitmap_code` 使用 `POST /api/user/checkin/captcha` + `captcha_answer`；
+`string_captcha` 使用 `GET /api/captcha?scene=checkin` + `captcha_code`；
+`click_shape` 通过 GoCaptcha 挑战换取 `captcha_token`。点选识别使用官方13形状模板、
+固定调色板和主图/thumb 同形同角约束做一对一全局匹配，失败会自动换图。
+`captcha_checkin_enabled` 与 `checkin_captcha_enabled` 两种开关命名均支持。
 
-脚本按图片尺寸选择离线识别器。读数不够可信时会重新取图，避免把一次性 `captcha_id` 浪费在硬猜上。详细算法和验收记录见 [`docs/captcha_algorithm.md`](docs/captcha_algorithm.md)。
+> 字符验证码识别需要 Pillow（`uv sync --extra dev`）；click_shape 的 OpenCV 与模板已包含在常规依赖中。显式自定义 `script` 仍高于内置路由。
 
-> 使用该脚本需要 Pillow：执行 `uv sync --extra dev`。
+Turnstile 令牌必须由浏览器执行 Cloudflare JS 签发，纯 HTTP 拿不到。
+
+流程为「浏览器取令牌 + HTTP 签到」的混合式：Camoufox 在站点 origin 下打开最小承载页，
+渲染 Turnstile widget（sitekey 取自 `/api/status`），用经 A/B 验证的最短人类化鼠标轨迹
+点击复选框，拿到令牌后立即由 HTTP 层提交 `POST /api/user/checkin?turnstile=…`。
+全程自动，只消费 Cloudflare 正常签发的令牌，不伪造、不绕过。
+
+- 站点启用 Turnstile 时走浏览器令牌流程；
+- `turnstile_check=false` 但 `captcha_checkin_enabled=true` 时自动委派给
+  `newapi_captcha.py`，不会裸签后才报「请先完成人机验证」；
+- 今日已签到会在读状态阶段就短路，不会为此启动浏览器；
+- Cloudflare 的 `600xxx` 属可重试错误，脚本会 `reset` widget 后重试；连续失败则按
+  可重试错误上报，交由调度层下次再试；
+- 出口 IP 信誉过低时可为该站点配置住宅代理。
 
 ### 5.3 `visit`：访问保活与额度监控
 
@@ -377,7 +401,9 @@ def run_http_extras(client, log=None):
 
 | 路径 | 类型 | 用途 |
 |---|---|---|
-| `scripts/newapi_captcha.py` | API 脚本 | New API fork 图形验证码签到 |
+| `scripts/newapi_verification.py` | 内置 API 路由 | 按 `verification_mode` 自动/优先分流验证机制 |
+| `scripts/newapi_captcha.py` | 验证后端/兼容脚本 | bitmap_code、string_captcha、click_shape |
+| `scripts/newapi_turnstile.py` | 验证后端/兼容脚本 | Cloudflare Turnstile 浏览器取令牌 |
 | `scripts/checkin/100xlabs.py` | 浏览器脚本 | 100xLabs 系页面签到与登录处理 |
 | `scripts/checkin/jisudeng.py` | 浏览器脚本 + HTTP extras | 极速蹬签到、登录态刷新和每日答题 |
 
@@ -661,7 +687,9 @@ browser/
   script_helpers.py       # 脚本 helper
 captcha_ocr/              # CAPTCHA 识别器与模板
 scripts/
-  newapi_captcha.py       # API 图形验证码脚本
+  newapi_verification.py  # New API 内置验证路由
+  newapi_captcha.py       # 字符/图形点选验证后端
+  newapi_turnstile.py     # Turnstile 浏览器取令牌后端
   checkin/                # 浏览器站点脚本
 ci/                       # 浏览器检测、代理与报告
 gui/                      # PySide6 管理界面

@@ -159,6 +159,7 @@ class FakePage:
         turnstile_token: str = "",
         form_available: bool = True,
         login_result: dict[str, Any] | None = None,
+        login_route_stale: bool = False,
         api_checkin_result: dict[str, Any] | None = None,
         api_checkin_result_after_login: dict[str, Any] | None = None,
         status_result: dict[str, Any] | None = None,
@@ -192,6 +193,7 @@ class FakePage:
             "two_factor": False,
             "message": "",
         }
+        self.login_route_stale = login_route_stale
         self.login_requests: list[list[Any]] = []
         self.prepared_login: list[str] = []
         # Turnstile 真实鼠标点击相关。
@@ -231,9 +233,10 @@ class FakePage:
             self.login_requests.append(arg)
             if self.login_result.get("ok"):
                 self.authenticated = True
-                self.has_password_field = False
                 self._login_succeeded = True
-                self.url = "https://example.invalid/check-in"
+                if not self.login_route_stale:
+                    self.has_password_field = False
+                    self.url = "https://example.invalid/check-in"
             return self.login_result
         if "__x100_login_reset" in expression:
             # sentinel 的开/关不改变认证态，只是控制 init script 是否清理。
@@ -693,6 +696,37 @@ def test_password_login_fallback_signs_in_then_checks_in(monkeypatch: Any) -> No
     rendered = repr(result)
     assert email not in rendered
     assert password not in rendered
+
+
+def test_verified_login_with_stale_login_route_uses_api_checkin(monkeypatch: Any) -> None:
+    """auth/me 已验证成功时，残留 /login URL 不得反向误判为 need_login。"""
+    monkeypatch.setenv("X100LABS_EMAIL", "user@example.test")
+    monkeypatch.setenv("X100LABS_PASSWORD", "not-a-real-password")
+    page = FakePage(
+        [],
+        url="https://example.invalid/login?redirect=/check-in",
+        authenticated=False,
+        has_password_field=True,
+        turnstile_token="real-turnstile-token",
+        login_result={"ok": True, "status": 200, "two_factor": False, "message": ""},
+        login_route_stale=True,
+        api_checkin_result_after_login={
+            "ok": True,
+            "status": 200,
+            "already": False,
+            "code": "0",
+            "message": "",
+        },
+    )
+
+    result, helpers = _run(page, {"button_wait_ms": 1, "poll_interval_ms": 20})
+
+    assert result["status"] == "success"
+    assert result["detail"]["auth_verified"] is True
+    assert result["detail"]["login_route_stale"] is True
+    assert result["detail"]["completion_signal"] == "api_fallback"
+    assert any("页面路由仍显示登录页" in line for line in helpers.logs)
+    assert page.api_checkin_requests == 1
 
 
 def test_password_login_fallback_clicks_turnstile_to_obtain_token(monkeypatch: Any) -> None:
