@@ -193,22 +193,22 @@ def test_error_without_tokens_does_not_persist_logged_out_state(tmp_path, monkey
     assert any("未检测到有效 token" in line for line in logs)
 
 
-def test_error_with_explicit_auth_verification_can_persist_cookie_state(
-    tmp_path, monkeypatch
-) -> None:
-    """脚本明确验证过认证时，即使没有 token，也允许保存 cookie/browser_state。"""
+def test_verified_login_persists_even_when_checkin_fails(tmp_path, monkeypatch) -> None:
+    """登录成功但签到失败：登录态必须保存，保存与否只取决于登录结果。"""
     cache = tmp_path / "token_cache.json"
     monkeypatch.setattr(token_cache, "CACHE_PATH", cache)
-    asyncio.run(
-        script_runner._persist_session(
-            _site(),
-            FakeContext(LOGGED_OUT_STATE),
-            lambda _m: None,
-            status="error",
-            auth_verified=True,
+    for status in ("need_verification", "need_config", "need_login", "error"):
+        cache.unlink(missing_ok=True)
+        asyncio.run(
+            script_runner._persist_session(
+                _site(),
+                FakeContext(LOGGED_OUT_STATE),
+                lambda _m: None,
+                status=status,
+                auth_verified=True,
+            )
         )
-    )
-    assert _entry(cache)["browser_state"]
+        assert _entry(cache)["browser_state"], f"status={status} 登录已验证应续存"
 
 
 def test_success_statuses_persist_as_before(tmp_path, monkeypatch) -> None:

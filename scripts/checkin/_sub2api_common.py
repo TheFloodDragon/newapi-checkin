@@ -1057,6 +1057,9 @@ async def api_fallback(
             "button_wait_ms": opts.button_wait_ms,
             "response_status": status,
             "screenshot": screenshot,
+            # 带上登录诊断（含 auth_verified）：本站签到入口失效不代表登录失败，
+            # 已验证的登录态不该因为这个结论被丢弃。
+            **dict(extra_detail or {}),
         },
     )
 
@@ -1435,6 +1438,9 @@ async def run_checkin_flow(
             )
 
     if await authenticated(page, origin):
+        # 登录态成立就立刻续存，并让 runner 知道本次认证已验证：后续签到即使失败
+        # （验证码、风控、异常），这份登录态也不该被当成登出态丢掉。
+        login_detail["auth_verified"] = True
         await persist_state(context, site)
     else:
         log(helpers, "当前页面未通过 /auth/me 认证复查，跳过脚本内登录态快照")

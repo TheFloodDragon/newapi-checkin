@@ -368,6 +368,25 @@ def _emit_success(page: FakePage, element: FakeElement) -> None:
     page.emit_response(200)
 
 
+def test_default_start_path_is_dedicated_checkin_page() -> None:
+    """站点已把签到从 /dashboard 移到独立签到页；默认入口必须是它。"""
+    assert SCRIPT.SPEC.default_start_path == "/check-in"
+    page = FakePage([FakeElement("签到", role="button", on_click=_emit_success)])
+    _result, helpers = _run(page)
+    assert helpers.goto_calls[0][0] == "/check-in"
+
+
+def test_verified_login_marks_auth_verified_for_persistence() -> None:
+    """登录态成立即标记 auth_verified，让 runner 在签到失败时也保存登录态。"""
+    page = FakePage(
+        [],
+        api_checkin_result={"ok": False, "status": 500, "already": False, "code": "", "message": ""},
+    )
+    result, _helpers = _run(page, {"button_wait_ms": 1, "poll_interval_ms": 20})
+    assert result["status"] == "need_config"
+    assert result["detail"]["auth_verified"] is True
+
+
 def test_page_auth_operations_share_one_refresh_state_machine() -> None:
     scripts = (
         SCRIPT.common._AUTHENTICATED_JS,

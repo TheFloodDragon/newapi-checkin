@@ -170,8 +170,8 @@ def _normalize_result(raw: Any, *, script_file: Path) -> BrowserScriptResult:
     return BrowserScriptResult(status, message, detail)
 
 
-# 明确表示「这次没登录成功」的脚本结论：这类结果下浏览器里的 storage_state
-# 是登出态，续存它会毁掉上次还能用的缓存登录态。
+# 明确表示「这次没登录成功」的脚本结论。仅当脚本没有给出任何登录成功证据时才据此
+# 拒绝续存：登录成功而签到失败（如验证码没过）时，登录态仍必须保存。
 _UNAUTHENTICATED_STATUSES = frozenset({"need_login", "need_verification", "need_config"})
 
 
@@ -194,17 +194,21 @@ async def _persist_session(
     启用 Turnstile 后纯 HTTP 无法登录（服务端校验，实测 TURNSTILE_VERIFICATION_FAILED），
     只有这两个值能让下次运行走纯 HTTP、完全不启动浏览器。
 
-    status 是脚本结论，用来挡掉「没登录成功却把登出态写进缓存」：本函数在 finally
-    里调用，以前无条件执行。save_site_tokens 只更新非空字段，所以 token 不会被写空，
-    但 browser_state 每次都非空 —— Turnstile 没过、账密登录被拒时，浏览器里是干净的
-    登出态，续存它会覆盖上次还能用的登录态，下次运行只能从零再登一次（表现为「登录
-    失败之后就再也复用不上缓存」）。
+    status 是脚本结论，auth_verified 表示脚本本次确实验证过登录态（服务端认证复查
+    通过，或结论本身已蕴含已登录）。判定顺序是「先看是否登录成功，再看签到结论」：
+    登录态该不该保存只取决于登录是否完成，与签到是否完成无关。否则登录成功但签到
+    因验证码/风控失败时，刚拿到的登录态会被当成登出态丢掉，下次又要从零登一次。
+
+    反向同样成立：没有任何认证证据时不写缓存。save_site_tokens 只更新非空字段，
+    token 不会被写空，但 browser_state 每次都非空 —— Turnstile 没过、账密被拒时
+    浏览器里是干净的登出态，续存它会覆盖上次还能用的登录态。
 
     任何失败都静默忽略：缓存写不进去只是下次要多开一次浏览器，不该影响本次结果。
     """
     if context is None:
         return
-    if str(status or "").strip().lower() in _UNAUTHENTICATED_STATUSES:
+    status_key = str(status or "").strip().lower()
+    if not auth_verified and status_key in _UNAUTHENTICATED_STATUSES:
         log(f"脚本结论为 {status}（未完成登录），跳过续存登录态以保留上次可用的缓存")
         return
     try:
@@ -222,9 +226,8 @@ async def _persist_session(
     site_base = str(getattr(site, "base_url", "") or "")
     access = session.storage_access_token(storage_state, base_url=site_base)
     refresh = session.storage_refresh_token(storage_state, base_url=site_base)
-    status_key = str(status or "").strip().lower()
-    if status_key in {"", "error"} and not auth_verified and not access and not refresh:
-        log("脚本异常/失败且未检测到有效 token，跳过续存登出态快照")
+    if not auth_verified and not access and not refresh:
+        log("未检测到有效 token，且脚本未验证登录态，跳过续存登出态快照")
         return
     if not encoded and not access and not refresh:
         return
@@ -279,10 +282,9 @@ async def run_browser_script(
     browser = None
     page = None
     context = None
-    # 记录最终结论供 finally 判断是否该续存登录态：need_login / need_verification
-    # 这类结果意味着浏览器里是登出态，写进缓存会覆盖上次还能用的登录态。
-    # error（脚本异常/超时）仍然续存 —— 登录可能已经成功，只是签到那步失败了，
-    # 这份快照下次还能省一次登录。
+    # 记录最终结论与「本次是否确认登录成功」，供 finally 决定是否续存登录态。
+    # 判定以登录结果为准而非签到结果：登录成功后即便签到失败（验证码、风控、异常），
+    # 这份登录态仍应保存；反之没有任何登录证据时一律不写，避免覆盖上次可用缓存。
     outcome_status = ""
     outcome_auth_verified = False
 
