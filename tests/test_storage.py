@@ -121,6 +121,64 @@ def test_site_config_factory_normalizes_legacy_fields() -> None:
     assert site.auto_refresh_cookie is False
 
 
+def test_api_variant_defaults_to_legacy() -> None:
+    """未配置时默认 legacy：实测在用站点的 challenge 端点与 WASM 均 404，
+    challenge 优先只会白启一个 Node 子进程再回落。"""
+    site = accounts_store.site_config_from_mapping(
+        {
+            "name": "d",
+            "base_url": "https://d.invalid",
+            "site_profile": "newapi",
+            "checkin_action": "api",
+        }
+    )
+    assert site.api_variant == "legacy"
+    assert accounts_store.normalize_api_variant("") == "legacy"
+    assert accounts_store.normalize_api_variant("nonsense") == "legacy"
+    # auto 仍是合法选项，显式选择必须被尊重。
+    assert accounts_store.normalize_api_variant("auto") == "auto"
+
+
+def test_legacy_challenge_mode_migrates_to_auto() -> None:
+    """旧配置显式写过 checkin_mode=challenge 时保留 challenge 优先，不被新默认覆盖。"""
+    challenge = accounts_store.migrate_fields(
+        {"type": "newapi", "checkin_mode": "challenge", "access_token": "t"}
+    )
+    assert challenge["api_variant"] == "auto"
+    # 未指定 checkin_mode 的旧账号跟随新默认。
+    blank = accounts_store.migrate_fields({"type": "newapi", "access_token": "t"})
+    assert blank["api_variant"] == "legacy"
+
+
+def test_explicit_auto_variant_survives_save(tmp_path: Path) -> None:
+    """默认值不落盘，但显式选的 auto 必须落盘，否则保存一次就丢掉 challenge 偏好。"""
+    path = tmp_path / "ACCOUNTS.json"
+    accounts_store.save_accounts(
+        [
+            {
+                "name": "default",
+                "base_url": "https://a.invalid",
+                "site_profile": "newapi",
+                "auth_method": "access_token",
+                "checkin_action": "api",
+                "api_variant": "legacy",
+            },
+            {
+                "name": "challenge-first",
+                "base_url": "https://b.invalid",
+                "site_profile": "newapi",
+                "auth_method": "access_token",
+                "checkin_action": "api",
+                "api_variant": "auto",
+            },
+        ],
+        path=path,
+    )
+    saved = json.loads(path.read_text(encoding="utf-8"))["accounts"]
+    assert "api_variant" not in saved[0], "默认 legacy 不写盘"
+    assert saved[1]["api_variant"] == "auto"
+
+
 def test_save_accounts_preserves_api_script_without_browser_only_fields(tmp_path: Path) -> None:
     """api 脚本保存时只保留路径；参数与超时属于 browser_script，不应混入。"""
     path = tmp_path / "ACCOUNTS.json"

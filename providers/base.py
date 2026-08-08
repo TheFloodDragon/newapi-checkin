@@ -68,6 +68,7 @@ from config import Timeouts as _Timeouts  # noqa: E402
 # base_url 归一化唯一实现在 accounts_store（最底层模块，避免反向循环导入）；
 # 这里 re-export 供 profiles/actions 继续从 providers.base 引用。
 from accounts_store import normalize_base_url  # noqa: E402, F401
+from checkin_core.enums import DEFAULT_API_VARIANT  # noqa: E402
 
 RETRY_MAX_ATTEMPTS = _RetryConfig.MAX_ATTEMPTS   # 含首次在内的总尝试次数
 RETRY_BACKOFF_BASE = _RetryConfig.BACKOFF_BASE   # 退避基数（秒）：第 n 次失败后等待约 base * 2**n
@@ -296,7 +297,8 @@ class SiteConfig:
     auto_refresh_cookie: bool = True
     # newapi + api 专用：接口变体偏好（auto=challenge 优先，legacy=旧接口优先）。
     # 仅影响首次尝试顺序，两种都会在失败时互为兜底；其它 profile 忽略。
-    api_variant: str = "auto"
+    # 默认 legacy，理由见 checkin_core.enums.DEFAULT_API_VARIANT。
+    api_variant: str = DEFAULT_API_VARIANT
     # newapi + api 的验证机制偏好。auto 自动探测；其它值仅表示优先，确认不适用时
     # 仍回落自动分流。有限值由 checkin_core.enums.VerificationMode 维护。
     verification_mode: str = "auto"

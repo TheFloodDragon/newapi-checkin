@@ -28,6 +28,8 @@ from typing import Any
 
 from config import Timeouts
 
+from accounts_store import normalize_api_variant
+
 from ..base import (
     USER_AGENT,
     ApiError,
@@ -187,12 +189,12 @@ class NewApiClient(ProfileClient):
         return UserInfo(quota_raw=quota, username=username, raw=data)
 
     def do_checkin(self, turnstile: str = "") -> CheckinReward:
-        variant = (self.site.api_variant or "auto").strip().lower()
+        variant = normalize_api_variant(self.site.api_variant)
         # 明确记录走了哪条接口变体：challenge 与 legacy 的失败原因完全不同，
         # 汇总里只有一句「签到失败」时无法判断该往哪个方向查。
         self._log_stage(
             "开始接口签到（api_variant="
-            + f"{variant or 'auto'}，{'challenge 优先' if variant != 'legacy' else 'legacy 优先'}）"
+            + f"{variant}，{'legacy 优先' if variant == 'legacy' else 'challenge 优先'}）"
         )
         try:
             if variant == "legacy":

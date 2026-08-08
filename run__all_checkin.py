@@ -157,9 +157,8 @@ def build_site_tasks() -> list[CheckinTask]:
             "--checkin-action", checkin_action,
             "--worker",
         ]
-        api_variant = str(site.get("api_variant") or "auto").strip().lower()
-        if api_variant:
-            command.extend(["--api-variant", api_variant])
+        api_variant = accounts_store.normalize_api_variant(site.get("api_variant"))
+        command.extend(["--api-variant", api_variant])
         verification_mode = accounts_store.normalize_verification_mode(
             site.get("verification_mode")
         )

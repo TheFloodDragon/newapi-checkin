@@ -45,7 +45,7 @@
 - 使用 GUI：安装 `gui` extra
 - 使用图形验证码脚本或运行测试：安装 `dev` extra（其中包含 Pillow）
 - 使用浏览器流程：下载 Camoufox 浏览器
-- 使用 New API challenge 流程：本机需要 Node.js；未安装时应安装 Node.js，或把对应站点显式设为 `api_variant=legacy`
+- 仅当把站点显式设为 `api_variant=auto`（challenge 优先）时才需要 Node.js；默认的 `legacy` 不需要
 
 ### 2.2 安装
 
@@ -165,7 +165,7 @@ uv run python manage_accounts.py
 | `access_token` | Bearer Token；Sub2API 浏览器流程也会优先使用它走纯 API |
 | `refresh_token` | Sub2API 长效续期凭据 |
 | `cookie` | `auth_method=cookie` 时使用 |
-| `api_variant` | New API API 流程：`auto` 或 `legacy` |
+| `api_variant` | New API API 流程：`legacy`（默认）或 `auto` |
 | `script` | 仓库内相对 Python 脚本路径 |
 | `script_args` | 仅 `browser_script` 的脚本参数对象 |
 | `script_timeout` | 仅 `browser_script` 的运行超时 |
@@ -274,10 +274,15 @@ uv run python manage_accounts.py
 
 New API：
 
+- `api_variant=legacy`（默认）：legacy 优先，仅在站点明确提示流程已升级时回退 challenge；
 - `api_variant=auto`：challenge 优先，仅在端点不支持或特定网络失败时回退 legacy；
-- `api_variant=legacy`：legacy 优先，仅在站点明确提示流程已升级时回退 challenge；
 - 登录失败、验证码错误和普通业务拒绝不会被当作“换一种接口再试”；
 - challenge 使用 `checkin_challenge.js` 和 Node.js 执行 WASM PoW。
+
+默认取 `legacy` 是因为实测当前在用的 New API 站点均未部署 challenge：
+`/api/user/checkin/challenge` 与 `/static/wasm/checkin-vm-v4.wasm` 全部返回 404。
+此时 challenge 优先只会每站白启一个 Node 子进程（约 1.2s）再回落。若站点确实启用了
+新版流程，legacy 被拒时会自动切 challenge，也可显式设为 `auto` 让它优先。
 
 Sub2API：
 

@@ -927,7 +927,7 @@ class App(QMainWindow):
         self._set_type_value(row.type)
         self._set_combo_value(self.auth_combo, row.auth_method, "cookie")
         self._set_combo_value(self.action_combo, row.checkin_action, "api")
-        self._set_combo_value(self.variant_combo, row.api_variant, "auto")
+        self._set_combo_value(self.variant_combo, row.api_variant, core.DEFAULT_API_VARIANT)
         self._set_combo_value(
             self.verification_combo, row.verification_mode, "auto"
         )
@@ -964,7 +964,9 @@ class App(QMainWindow):
         self._set_type_value("newapi")
         self._set_combo_value(self.auth_combo, "cookie", "cookie")
         self._set_combo_value(self.action_combo, "api", "api")
-        self._set_combo_value(self.variant_combo, "auto", "auto")
+        self._set_combo_value(
+            self.variant_combo, core.DEFAULT_API_VARIANT, core.DEFAULT_API_VARIANT
+        )
         self._set_combo_value(self.verification_combo, "auto", "auto")
         self._set_combo_value(self.oauth_provider_combo, "linuxdo", "linuxdo")
         self._refresh_oauth_account_choices(core.DEFAULT_OAUTH_ACCOUNT)
@@ -1006,7 +1008,9 @@ class App(QMainWindow):
         except json.JSONDecodeError:
             pass
         row.script_timeout = accounts_store.parse_script_timeout(self.script_timeout_edit.text().strip())
-        row.api_variant = self._combo_value(self.variant_combo, core.API_VARIANTS, "auto")
+        row.api_variant = self._combo_value(
+            self.variant_combo, core.API_VARIANTS, core.DEFAULT_API_VARIANT
+        )
         row.verification_mode = self._combo_value(
             self.verification_combo, core.VERIFICATION_MODES, "auto"
         )

@@ -26,7 +26,9 @@ from checkin_core.auth import can_optional_oauth as _can_optional_oauth
 from checkin_core.auth import effective_auth as _effective_auth
 from checkin_core.enums import (
     ACTION_VALUES,
+    API_VARIANT_VALUES,
     AUTH_METHOD_VALUES,
+    DEFAULT_API_VARIANT,
     PROFILE_VALUES,
     VERIFICATION_MODE_VALUES,
     status_meta,
@@ -51,7 +53,7 @@ TYPES = PROFILE_VALUES
 CRED_FIELDS = ("user_id", "access_token", "refresh_token", "cookie")
 AUTH_METHODS = AUTH_METHOD_VALUES
 CHECKIN_ACTIONS = ACTION_VALUES
-API_VARIANTS = ("auto", "legacy")
+API_VARIANTS = API_VARIANT_VALUES
 VERIFICATION_MODES = VERIFICATION_MODE_VALUES
 OAUTH_PROVIDERS = accounts_store.KNOWN_OAUTH_PROVIDERS
 DEFAULT_OAUTH_ACCOUNT = accounts_store.DEFAULT_OAUTH_ACCOUNT
@@ -70,7 +72,10 @@ ACTION_LABELS = {
     "browser_script": "自定义浏览器脚本",
 }
 OAUTH_PROVIDER_LABELS = {"linuxdo": "Linux.do", "github": "GitHub"}
-API_VARIANT_LABELS = {"auto": "自动 (challenge 优先)", "legacy": "旧版接口 (legacy)"}
+API_VARIANT_LABELS = {
+    "legacy": "旧版接口 legacy（推荐）",
+    "auto": "challenge 优先（需 Node.js）",
+}
 VERIFICATION_MODE_LABELS = {
     "auto": "自动识别（推荐）",
     "turnstile": "Cloudflare Turnstile",
@@ -196,7 +201,7 @@ class SiteRow:
     script_args: dict[str, Any] = field(default_factory=dict)
     script_args_text: str = "{}"
     script_timeout: int = _SCRIPT_TIMEOUT_DEFAULT
-    api_variant: str = "auto"
+    api_variant: str = DEFAULT_API_VARIANT
     verification_mode: str = "auto"
     oauth_provider: str = "linuxdo"
     oauth_account: str = DEFAULT_OAUTH_ACCOUNT
@@ -259,9 +264,7 @@ def row_from_store(raw: dict[str, Any]) -> SiteRow:
     if checkin_action not in CHECKIN_ACTIONS:
         checkin_action = "api"
     auth_method = effective_auth(checkin_action, auth_method)
-    api_variant = str(raw.get("api_variant") or "auto").strip().lower()
-    if api_variant not in API_VARIANTS:
-        api_variant = "auto"
+    api_variant = accounts_store.normalize_api_variant(raw.get("api_variant"))
     verification_mode = accounts_store.normalize_verification_mode(
         raw.get("verification_mode")
     )
@@ -583,7 +586,7 @@ def _snapshot_row(row: SiteRow) -> dict[str, Any]:
         "script": row.script.strip(),
         "script_args_text": row.script_args_text,
         "script_timeout": accounts_store.parse_script_timeout(row.script_timeout),
-        "api_variant": row.api_variant if row.api_variant in API_VARIANTS else "auto",
+        "api_variant": accounts_store.normalize_api_variant(row.api_variant),
         "oauth_provider": accounts_store.normalize_oauth_provider(row.oauth_provider) or "linuxdo",
         "oauth_account": accounts_store.normalize_oauth_account(row.oauth_account),
         "oauth_fallback_provider": fallback_provider,
@@ -738,7 +741,7 @@ def persist_accounts(rows: list[SiteRow]) -> list[dict[str, Any]]:
             acct["oauth_fallback_provider"] = fallback_provider
             acct["oauth_fallback_account"] = fallback_account
         if t == "newapi" and action == "api":
-            acct["api_variant"] = row.api_variant if row.api_variant in API_VARIANTS else "auto"
+            acct["api_variant"] = accounts_store.normalize_api_variant(row.api_variant)
             acct["verification_mode"] = accounts_store.normalize_verification_mode(
                 row.verification_mode
             )

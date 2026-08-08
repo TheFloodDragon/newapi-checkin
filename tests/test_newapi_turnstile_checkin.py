@@ -160,6 +160,36 @@ def test_turnstile_failure_is_classified_as_need_verification() -> None:
     assert client.classify(ApiError(401, None, "token 验证失败")) == "need_login"
 
 
+def test_default_variant_skips_node_challenge(monkeypatch: pytest.MonkeyPatch) -> None:
+    """默认 legacy 不该启动 Node challenge 子进程（每站约 1.2s 且必然 404）。"""
+    client = FakeClient([_ok({"quota_awarded": 7})])
+
+    def _boom() -> Any:
+        raise AssertionError("默认路径不应调用 challenge")
+
+    monkeypatch.setattr(client, "_challenge_checkin", _boom)
+    assert client.site.api_variant == "legacy"
+    assert client.do_checkin().quota_awarded == 7
+
+
+def test_legacy_still_falls_back_to_challenge(monkeypatch: pytest.MonkeyPatch) -> None:
+    """站点提示流程已升级时，legacy 必须自动切 challenge —— 这是保留该模式的意义。"""
+    client = FakeClient([ApiError(None, None, "签到接口已升级，请使用新版流程")])
+    monkeypatch.setattr(
+        client, "_challenge_checkin", lambda: {"quota_awarded": 99}
+    )
+    assert client.do_checkin().quota_awarded == 99
+
+
+def test_explicit_auto_tries_challenge_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    """显式选 auto 仍按 challenge 优先，改默认不等于删能力。"""
+    client = FakeClient([], api_variant="auto")
+    monkeypatch.setattr(
+        client, "_challenge_checkin", lambda: {"quota_awarded": 5}
+    )
+    assert client.do_checkin().quota_awarded == 5
+
+
 def test_missing_detection_yields_actionable_hint() -> None:
     """公开配置漏报时应提示 turnstile 机制，而不是要求填写内置脚本。"""
     client = FakeClient(

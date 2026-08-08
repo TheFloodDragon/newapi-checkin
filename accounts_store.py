@@ -31,7 +31,9 @@ from urllib.parse import urlparse
 from checkin_core.auth import effective_auth, infer_auth_method
 from checkin_core.enums import (
     ACTION_VALUES,
+    API_VARIANT_VALUES,
     AUTH_METHOD_VALUES,
+    DEFAULT_API_VARIANT,
     PROFILE_VALUES,
     VERIFICATION_MODE_VALUES,
 )
@@ -350,12 +352,19 @@ CONFIG_FIELDS = (
 KNOWN_PROFILES = PROFILE_VALUES
 KNOWN_AUTH_METHODS = AUTH_METHOD_VALUES
 KNOWN_ACTIONS = ACTION_VALUES
+KNOWN_API_VARIANTS = API_VARIANT_VALUES
 KNOWN_VERIFICATION_MODES = VERIFICATION_MODE_VALUES
 
 _BUILTIN_VERIFICATION_SCRIPTS = {
     "scripts/newapi_turnstile.py": "turnstile",
     "scripts/newapi_captcha.py": "auto",
 }
+
+
+def normalize_api_variant(value: Any) -> str:
+    """把外部 api_variant 收敛为有限值；空值/未知值回落默认（legacy）。"""
+    variant = str(value or "").strip().lower()
+    return variant if variant in KNOWN_API_VARIANTS else DEFAULT_API_VARIANT
 
 
 def normalize_verification_mode(value: Any) -> str:
@@ -412,7 +421,7 @@ def migrate_fields(entry: dict[str, Any]) -> dict[str, Any]:
         old_mode = str(out.get("checkin_mode") or out.get("mode") or "").strip().lower()
 
         sub2api_browser = False
-        api_variant = "auto"
+        api_variant = DEFAULT_API_VARIANT
         if old_type == "sub2api":
             profile = "sub2api"
             action = "api"
@@ -426,7 +435,9 @@ def migrate_fields(entry: dict[str, Any]) -> dict[str, Any]:
                 action = "visit"
             else:  # legacy / challenge / 空
                 action = "api"
-                api_variant = "legacy" if old_mode == "legacy" else "auto"
+                # 显式配过 challenge 的旧账号保留 challenge 优先（迁成 auto），
+                # 不被新默认覆盖；legacy 与未指定都用默认。
+                api_variant = "auto" if old_mode == "challenge" else DEFAULT_API_VARIANT
 
         auth = _infer_auth_method(action, sub2api_browser=sub2api_browser, has_token=has_token)
         # browser 登录方式但无 state 且有 token：退回 access_token（避免必然失败）
@@ -636,7 +647,7 @@ def configured_site_from_mapping(
         script=str(row.get("script") or ""),
         script_args=normalize_script_args(row.get("script_args")),
         script_timeout=parse_script_timeout(row.get("script_timeout")),
-        api_variant=str(row.get("api_variant") or "auto"),
+        api_variant=normalize_api_variant(row.get("api_variant")),
         verification_mode=normalize_verification_mode(row.get("verification_mode")),
         cookie=str(row.get("cookie") or ""),
         user_id=str(row.get("user_id") or row.get("new_api_user") or ""),
@@ -1006,10 +1017,11 @@ def _account_to_persist(row: dict[str, Any]) -> dict[str, Any]:
             out["enabled"] = bool(row.get("enabled", True))
             continue
         if field == "api_variant":
-            # 仅 newapi + api 且非默认 auto 时写入
+            # 仅 newapi + api 且非默认值时写入。显式选了非默认的 auto 必须落盘，
+            # 否则保存一次就会丢掉用户的 challenge 优先偏好。
             if row.get("site_profile") == "newapi" and row.get("checkin_action") == "api":
-                variant = str(row.get("api_variant") or "auto").strip().lower()
-                if variant and variant != "auto":
+                variant = normalize_api_variant(row.get("api_variant"))
+                if variant != DEFAULT_API_VARIANT:
                     out["api_variant"] = variant
             continue
         if field == "verification_mode":
@@ -1236,8 +1248,8 @@ def build_github_secret_payload(
         }
 
         if site_profile == "newapi" and checkin_action == "api":
-            api_variant = str(row.get("api_variant") or "auto").strip().lower()
-            if api_variant and api_variant != "auto":
+            api_variant = normalize_api_variant(row.get("api_variant"))
+            if api_variant != DEFAULT_API_VARIANT:
                 out["api_variant"] = api_variant
             verification_mode = normalize_verification_mode(row.get("verification_mode"))
             if verification_mode != "auto":

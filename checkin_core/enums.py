@@ -26,6 +26,13 @@ class CheckinAction(StrEnum):
     BROWSER_SCRIPT = "browser_script"
 
 
+class ApiVariant(StrEnum):
+    """newapi + api 的接口变体偏好；两者互为兜底，只决定先试哪条。"""
+
+    AUTO = "auto"
+    LEGACY = "legacy"
+
+
 class VerificationMode(StrEnum):
     AUTO = "auto"
     TURNSTILE = "turnstile"
@@ -77,6 +84,12 @@ STATUS_META: dict[ResultStatus, StatusMeta] = {
 PROFILE_VALUES = tuple(item.value for item in SiteProfileName)
 AUTH_METHOD_VALUES = tuple(item.value for item in AuthMethod)
 ACTION_VALUES = tuple(item.value for item in CheckinAction)
+API_VARIANT_VALUES = tuple(item.value for item in ApiVariant)
+# 默认先走 legacy：实测全部在用站点的 /api/user/checkin/challenge 与
+# /static/wasm/checkin-vm-v4.wasm 均返回 404，challenge 优先只会白启一个 Node
+# 子进程（实测每站约 1.2s）再回落。legacy 失败且站点明确提示流程已升级时，
+# 仍会自动切 challenge，因此上游若恢复该协议无需改配置。
+DEFAULT_API_VARIANT = ApiVariant.LEGACY.value
 VERIFICATION_MODE_VALUES = tuple(item.value for item in VerificationMode)
 VALID_RESULT_STATUSES = frozenset(item.value for item in ResultStatus)
 OK_STATUSES = frozenset({ResultStatus.SUCCESS.value, ResultStatus.ALREADY_DONE.value})
