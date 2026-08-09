@@ -293,13 +293,28 @@ def discover_tasks() -> list[CheckinTask]:
     return build_site_tasks() + build_script_tasks()
 
 
-def is_completed_summary(summary: dict[str, Any] | None) -> bool:
-    """只有协议明确成功且 ``ok`` 严格为真时才可沿用。"""
-    return bool(
-        summary
-        and summary.get("ok") is True
-        and str(summary.get("status") or "") in OK_STATUSES
-    )
+def is_completed_summary(
+    summary: dict[str, Any] | None,
+    *,
+    business_day: str | None = None,
+) -> bool:
+    """只有协议明确成功、``ok`` 严格为真，且业务日属于今天时才可沿用。
+
+    条目级业务日是文件级 business_date 之外的第二道防线：文件头只有一个日期，一旦
+    因任何原因（时钟调整、手工改缓存、未来新增的写入路径）与条目实际归属不一致，
+    整份历史都会被当成今天的，昨天的完成结果就会顶替今天的签到。逐条校验后即使文件
+    头错标也只放行真正属于今天的条目。
+
+    无条目级戳的旧文件按放行处理，由文件头日期兜底，保持向后兼容。
+    """
+    if not summary or summary.get("ok") is not True:
+        return False
+    if str(summary.get("status") or "") not in OK_STATUSES:
+        return False
+    stamp = str(summary.get("business_date") or "").strip()
+    if stamp and business_day and stamp != business_day:
+        return False
+    return True
 
 
 def load_retry_history(
@@ -344,6 +359,8 @@ def load_retry_history(
 def build_retry_plan(
     tasks: list[CheckinTask],
     history: list[dict[str, Any]] | None = None,
+    *,
+    business_day: str | None = None,
 ) -> list[RetryPlanItem]:
     """按当前任务顺序规划执行；历史同名项用队列匹配，避免重复名称覆盖。"""
     history_by_task: dict[str, deque[dict[str, Any]]] = defaultdict(deque)
@@ -358,7 +375,7 @@ def build_retry_plan(
             RetryPlanItem(
                 task=task,
                 previous_summary=previous,
-                carried_forward=is_completed_summary(previous),
+                carried_forward=is_completed_summary(previous, business_day=business_day),
             )
         )
     return plan
@@ -713,10 +730,13 @@ def task_result_to_summary(result: TaskResult) -> dict[str, Any]:
 def merge_retry_results(
     plan: list[RetryPlanItem],
     executed_results: list[TaskResult],
+    *,
+    business_day: str | None = None,
 ) -> list[dict[str, Any]]:
     """把本轮执行结果放回计划位置，与沿用项合并成当前配置的完整结果。"""
     result_iter = iter(executed_results)
     merged: list[dict[str, Any]] = []
+    today = business_day or time_utils.business_date()
 
     for item in plan:
         if item.carried_forward:
@@ -729,6 +749,8 @@ def merge_retry_results(
             summary["retried"] = False
             # 重试成功是结果的历史属性：第三次运行沿用时仍保留行级标记。
             summary["retry_succeeded"] = summary.get("retry_succeeded") is True
+            # 沿用项保留它原本归属的业务日；缺失时按今天补，供下一轮逐条校验。
+            summary["business_date"] = str(summary.get("business_date") or "") or today
             merged.append(summary)
             continue
 
@@ -741,6 +763,8 @@ def merge_retry_results(
         summary["task"] = item.task.name
         summary["carried_forward"] = False
         summary["executed_this_run"] = True
+        # 本轮真实执行的条目归属本轮业务日。
+        summary["business_date"] = today
         previous = item.previous_summary
         retried = previous is not None
         summary["retried"] = retried
@@ -749,7 +773,9 @@ def merge_retry_results(
         else:
             summary.pop("previous_status", None)
         summary["retry_succeeded"] = bool(
-            retried and not is_completed_summary(previous) and is_completed_summary(summary)
+            retried
+            and not is_completed_summary(previous, business_day=today)
+            and is_completed_summary(summary, business_day=today)
         )
         merged.append(summary)
 
@@ -869,7 +895,18 @@ def result_run_counts(summaries: list[dict[str, Any]]) -> tuple[int, int, int]:
     return executed_count, carried_count, retry_succeeded_count
 
 
-def build_result_payload(summaries: list[dict[str, Any]]) -> dict[str, Any]:
+def build_result_payload(
+    summaries: list[dict[str, Any]],
+    *,
+    business_day: str | None = None,
+) -> dict[str, Any]:
+    """组装结果文件。
+
+    business_day 应传运行**开始**时的业务日（UTC+8）。写盘发生在全部任务跑完之后，
+    若在这里重新取「现在」，读历史与写结果就是两次独立的时间求值；一旦两者落在不同
+    业务日，写出的文件头日期与其中结果的实际归属不符，下一轮沿用判定就会被误导。
+    传入定格值可消除这个不一致。
+    """
     failed_count = sum(1 for item in summaries if item.get("ok") is not True)
     success_count = sum(1 for item in summaries if item.get("status") == "success")
     already_done_count = sum(1 for item in summaries if item.get("status") == "already_done")
@@ -877,7 +914,7 @@ def build_result_payload(summaries: list[dict[str, Any]]) -> dict[str, Any]:
     return sanitize_data(
         {
             "generated_at": time_utils.utc_iso(),
-            "business_date": time_utils.business_date(),
+            "business_date": business_day or time_utils.business_date(),
             "total": len(summaries),
             "success_count": success_count,
             "already_done_count": already_done_count,
@@ -890,9 +927,13 @@ def build_result_payload(summaries: list[dict[str, Any]]) -> dict[str, Any]:
     )
 
 
-def write_result_file(summaries: list[dict[str, Any]]) -> None:
+def write_result_file(
+    summaries: list[dict[str, Any]],
+    *,
+    business_day: str | None = None,
+) -> None:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    payload = build_result_payload(summaries)
+    payload = build_result_payload(summaries, business_day=business_day)
     with accounts_store.file_lock(RESULT_JSON_PATH):
         accounts_store.atomic_write_text(
             RESULT_JSON_PATH,
@@ -935,20 +976,25 @@ def main() -> int:
         print(f"读取任务失败：{exc}")
         return 2
 
+    # 业务日（UTC+8）在这里定格一次，读历史、合并结果、写盘共用同一个值。
+    # 分别取「现在」等于对同一轮运行做多次时间求值，跑得久时可能落在不同业务日，
+    # 使写出的日期与结果实际归属不符，进而误导下一轮的沿用判定。
+    business_day = time_utils.business_date()
+
     if not tasks:
         print("未找到需要执行的签到任务。")
-        write_result_file([])
+        write_result_file([], business_day=business_day)
         return 2
 
     history: list[dict[str, Any]] | None = None
     if getattr(args, "retry_failed", False):
-        history = load_retry_history()
+        history = load_retry_history(business_day=business_day)
         if history is None:
             print("当天没有可复用的有效结果，本轮执行全部任务。")
         else:
             print(f"已读取当天上次结果：{len(history)} 项。")
 
-    plan = build_retry_plan(tasks, history)
+    plan = build_retry_plan(tasks, history, business_day=business_day)
     tasks_to_execute = retry_plan_tasks(plan)
     carried_count = len(plan) - len(tasks_to_execute)
     if carried_count:
@@ -959,8 +1005,8 @@ def main() -> int:
         print("当前任务均已完成，本轮无需启动子任务。")
         results = []
 
-    summaries = merge_retry_results(plan, results)
-    write_result_file(summaries)
+    summaries = merge_retry_results(plan, results, business_day=business_day)
+    write_result_file(summaries, business_day=business_day)
 
     display_rows = [
         {

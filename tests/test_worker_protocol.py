@@ -460,6 +460,50 @@ def test_retry_history_requires_current_business_day_and_valid_structure(tmp_pat
     assert runner.load_retry_history(result_path, business_day=today) is None
 
 
+def test_cross_day_items_are_not_carried_even_if_header_says_today() -> None:
+    """文件头 business_date 与条目实际归属不一致时（时钟调整、手工改缓存等），
+    昨天的完成结果不得顶替今天的签到；条目级业务日必须逐条拦下。"""
+    today, yesterday = "2026-08-09", "2026-08-08"
+    tasks = [_retry_task("a"), _retry_task("b")]
+    history = [
+        dict(_history_summary("a", "success", True), business_date=yesterday),
+        dict(_history_summary("b", "already_done", True), business_date=today),
+    ]
+
+    plan = runner.build_retry_plan(tasks, history, business_day=today)
+
+    # 昨天的条目必须重新执行，今天的仍可沿用。
+    assert [item.carried_forward for item in plan] == [False, True]
+    assert runner.retry_plan_tasks(plan) == [tasks[0]]
+
+
+def test_result_file_stamps_run_start_business_day() -> None:
+    """写盘在任务跑完之后发生，必须采用运行开始时定格的业务日，而非重取「现在」。"""
+    summaries = [dict(_history_summary("a", "success", True), business_date="2026-08-08")]
+    payload = runner.build_result_payload(summaries, business_day="2026-08-08")
+    assert payload["business_date"] == "2026-08-08"
+
+
+def test_executed_items_get_current_business_day_stamp() -> None:
+    """本轮真实执行的条目归属本轮业务日，供下一轮逐条校验。"""
+    plan = runner.build_retry_plan([_retry_task("a")], None, business_day="2026-08-09")
+    merged = runner.merge_retry_results(
+        plan, [_executed_result("a", "success")], business_day="2026-08-09"
+    )
+    assert merged[0]["business_date"] == "2026-08-09"
+
+
+def test_completed_summary_rejects_stale_business_day() -> None:
+    stale = dict(_history_summary("a", "success", True), business_date="2026-08-08")
+    fresh = dict(_history_summary("a", "success", True), business_date="2026-08-09")
+    assert runner.is_completed_summary(stale, business_day="2026-08-09") is False
+    assert runner.is_completed_summary(fresh, business_day="2026-08-09") is True
+    # 旧文件没有条目级戳：由文件头的日期校验兜底，保持向后兼容。
+    assert runner.is_completed_summary(
+        _history_summary("a", "success", True), business_day="2026-08-09"
+    ) is True
+
+
 def test_invalid_retry_history_falls_back_to_full_execution(tmp_path: Path) -> None:
     result_path = tmp_path / "checkin_result.json"
     result_path.write_text("not-json", encoding="utf-8")
@@ -485,7 +529,7 @@ def test_main_does_not_mask_a_failed_retry(monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         runner,
         "load_retry_history",
-        lambda: [_history_summary("still-bad", "error", False)],
+        lambda **_kwargs: [_history_summary("still-bad", "error", False)],
     )
 
     def fake_run(tasks, workers, verbose=False):
@@ -493,7 +537,11 @@ def test_main_does_not_mask_a_failed_retry(monkeypatch, capsys) -> None:
         return [_executed_result("still-bad", "error")]
 
     monkeypatch.setattr(runner, "run_tasks", fake_run)
-    monkeypatch.setattr(runner, "write_result_file", lambda rows: captured.setdefault("rows", rows))
+    monkeypatch.setattr(
+        runner,
+        "write_result_file",
+        lambda rows, **_kwargs: captured.setdefault("rows", rows),
+    )
 
     assert runner.main() == 2
     assert [item.name for item in captured["tasks"]] == ["still-bad"]
@@ -509,5 +557,20 @@ def test_auto_checkin_workflow_runs_twice_with_retry_mode() -> None:
 
     assert workflow.count("cron: '30 1 * * *'") == 1
     assert workflow.count("cron: '30 7 * * *'") == 1
-    assert workflow.count("run__all_checkin.py --retry-failed") == 2
+    # 两条执行分支（浏览器 / 纯 HTTP）都必须走同一个重试开关变量，
+    # 否则勾选全量签到时只有一条分支生效。
+    assert workflow.count("run__all_checkin.py $RETRY_FLAG") == 2
+    assert 'RETRY_FLAG="--retry-failed"' in workflow
     assert "cancel-in-progress: false" in workflow
+
+
+def test_manual_dispatch_can_force_full_checkin() -> None:
+    """定时触发必须保持沿用当天结果；仅手动勾选 run_all 时才全量执行。"""
+    workflow = (ROOT / ".github" / "workflows" / "auto_checkin.yml").read_text(encoding="utf-8")
+
+    assert "run_all:" in workflow
+    assert "type: boolean" in workflow
+    assert "default: false" in workflow, "默认不得改变定时任务行为"
+    assert "RUN_ALL: ${{ inputs.run_all }}" in workflow
+    # 只有显式 true 才清空重试开关；定时触发时该变量为空串，走沿用分支。
+    assert 'if [ "$RUN_ALL" = "true" ]' in workflow

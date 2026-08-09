@@ -6,6 +6,12 @@ on:
     - cron: '30 1 * * *'
     - cron: '30 7 * * *'
   workflow_dispatch:
+    inputs:
+      run_all:
+        description: '忽略当天已完成结果，强制执行全部签到'
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   group: auto-checkin
@@ -129,12 +135,22 @@ jobs:
 
       - name: 执行签到
         id: checkin
+        env:
+          # 仅手动触发且勾选 run_all 时为 true；定时触发该值为空，保持沿用当天已完成结果。
+          RUN_ALL: ${{ inputs.run_all }}
         run: |
           set +e
-          if [ "${{ steps.detect_browser.outputs.need_browser }}" = "true" ]; then
-            xvfb-run -a --server-args="-screen 0 1920x1080x24" uv run python -u run__all_checkin.py --retry-failed
+          if [ "$RUN_ALL" = "true" ]; then
+            RETRY_FLAG=""
+            echo "本次为手动全量签到：忽略当天已完成结果"
           else
-            uv run python -u run__all_checkin.py --retry-failed
+            RETRY_FLAG="--retry-failed"
+            echo "本次沿用当天已完成结果，仅执行失败或新增任务"
+          fi
+          if [ "${{ steps.detect_browser.outputs.need_browser }}" = "true" ]; then
+            xvfb-run -a --server-args="-screen 0 1920x1080x24" uv run python -u run__all_checkin.py $RETRY_FLAG
+          else
+            uv run python -u run__all_checkin.py $RETRY_FLAG
           fi
           code=$?
           set -e
