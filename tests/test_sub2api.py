@@ -56,6 +56,40 @@ def test_expired_cached_token_refreshes_once_and_retries(monkeypatch) -> None:
     assert auth_headers == ["Bearer old-token", "Bearer fresh-token"]
 
 
+def test_extra_headers_survive_token_refresh_retry(monkeypatch) -> None:
+    site = SiteConfig(
+        name="sub2api-lottery",
+        base_url="https://sub2api.invalid",
+        site_profile="sub2api",
+        auth_method="browser",
+        access_token="old-token",
+    )
+    seen: list[dict[str, str]] = []
+    client = sub2api.Sub2ApiClient(
+        site,
+        AuthInfo(access_token="old-token"),
+        token_refresher=lambda: "fresh-token",
+    )
+
+    def fake_http_request(url, *, method, headers, body, proxy, retry_non_idempotent, verify_ssl, **_kwargs):
+        seen.append(dict(headers))
+        if len(seen) == 1:
+            raise ApiError(401, {"code": "TOKEN_EXPIRED"}, "Token has expired")
+        return {"code": 0, "data": {"outcome": "win"}}
+
+    monkeypatch.setattr(sub2api, "http_request", fake_http_request)
+
+    client.request(
+        "POST",
+        "/lottery/pools/normal/draw",
+        {},
+        extra_headers={"Idempotency-Key": "daily-key"},
+    )
+
+    assert [headers["Idempotency-Key"] for headers in seen] == ["daily-key", "daily-key"]
+    assert [headers["Authorization"] for headers in seen] == ["Bearer old-token", "Bearer fresh-token"]
+
+
 def test_fetch_status_reads_checkin_extension(monkeypatch) -> None:
     client = _client()
     monkeypatch.setattr(

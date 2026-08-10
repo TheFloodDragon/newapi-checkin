@@ -220,7 +220,15 @@ class Sub2ApiClient(ProfileClient):
             headers["Cookie"] = self.cookie
         return headers
 
-    def request(self, method: str, path: str, body: dict | None = None, *, retry_non_idempotent: bool = False) -> Any:
+    def request(
+        self,
+        method: str,
+        path: str,
+        body: dict | None = None,
+        *,
+        retry_non_idempotent: bool = False,
+        extra_headers: dict[str, str] | None = None,
+    ) -> Any:
         url = self.base_url + API_PREFIX + path
 
         raw_body: bytes | None = None
@@ -231,6 +239,8 @@ class Sub2ApiClient(ProfileClient):
             headers = self._headers()
             if raw_body is not None:
                 headers["Content-Type"] = "application/json"
+            if extra_headers:
+                headers.update({str(key): str(value) for key, value in extra_headers.items()})
             try:
                 payload = http_request(
                     url,

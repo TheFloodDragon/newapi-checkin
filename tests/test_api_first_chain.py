@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from browser import script_loader
 from providers.actions import browser_script
 from providers.base import ApiError, CheckinReward, SiteConfig, StatusInfo, UserInfo
 
@@ -127,6 +128,59 @@ def test_stage1_token_already_checked_in_returns_without_login(monkeypatch) -> N
     assert result.detail["quota_is_usd"] is True
     assert profile.login_calls == 0
     assert client.checkin_calls == 0
+
+
+def test_explicit_http_hook_runs_before_profile_default(monkeypatch) -> None:
+    client = FakeClient(status=StatusInfo(checked_in_today=False))
+    profile = FakeProfile({"old": client})
+
+    class Hooks:
+        run_http_extras = None
+
+        @staticmethod
+        def do_checkin(_client: Any, log: Any = None) -> CheckinReward:
+            if log:
+                log("执行幸运轮盘 HTTP 钩子")
+            return CheckinReward(
+                extra={"result_message": "抽奖成功：尝鲜套餐（30 天）", "lottery_outcome": "win"}
+            )
+
+    monkeypatch.setattr(script_loader, "load_script_hooks", lambda _path: Hooks())
+
+    result = browser_script._try_api_checkin(_site(script="scripts/checkin/vcnovb_lottery.py"), profile)
+
+    assert result is not None and result.status == "success"
+    assert result.message == "抽奖成功：尝鲜套餐（30 天）"
+    assert result.detail["lottery_outcome"] == "win"
+    assert client.checkin_calls == 0
+
+
+def test_password_stage_also_runs_explicit_http_hook(monkeypatch) -> None:
+    _no_persist(monkeypatch)
+    fresh = FakeClient(status=StatusInfo(checked_in_today=False))
+    profile = FakeProfile({"new": fresh}, login_result={"access_token": "new", "refresh_token": "rt"})
+
+    class Hooks:
+        run_http_extras = None
+
+        @staticmethod
+        def do_checkin(_client: Any, log: Any = None) -> CheckinReward:
+            return CheckinReward(already_done=True, extra={"result_message": "今日已抽取：1元余额（+$1.00）"})
+
+    monkeypatch.setattr(script_loader, "load_script_hooks", lambda _path: Hooks())
+    site = _site(
+        script="scripts/checkin/vcnovb_lottery.py",
+        access_token="",
+        script_args={"email": "a@b.c", "password": "pw"},
+    )
+
+    result = browser_script._try_api_checkin(site, profile)
+
+    assert result is not None and result.status == "already_done"
+    assert result.message == "今日已抽取：1元余额（+$1.00）"
+    assert result.detail["api_stage"] == "password"
+    assert profile.login_calls == 1
+    assert fresh.checkin_calls == 0
 
 
 def test_status_error_classification_comes_from_client() -> None:

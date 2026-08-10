@@ -318,13 +318,18 @@ def _try_api_checkin(site: SiteConfig, profile: SiteProfile) -> CheckinResult | 
         result = run_http_flow(
             site,
             client,
-            allow_site_hook=False,
+            # browser_script 也可以显式声明纯 HTTP do_checkin 钩子。没有该钩子的
+            # 既有脚本仍会回落 profile 默认签到，不会把 run() 浏览器入口误当 HTTP。
+            allow_site_hook=True,
             observer=observe,
         )
         if not isinstance(result.detail, dict):
             result.detail = {} if result.detail is None else {"checkin_detail": result.detail}
         result.detail.setdefault("api_first", True)
         result.detail.setdefault("api_stage", stage)
+        result_message = str(result.detail.get("result_message") or "").strip()
+        if result_message and result.status in {"success", "already_done"}:
+            result.message = result_message
         if result.detail.get("unsupported_checkin"):
             _api_log(site, f"[{stage}] 站点无可用签到端点，交给浏览器脚本")
             return None
