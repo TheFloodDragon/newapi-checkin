@@ -201,6 +201,70 @@ def test_browser_auth_error_status_and_detail_are_preserved(query: bool) -> None
     assert profile.build_calls == 0
 
 
+# ── checkin_action=api 也要尊重脚本的自管 HTTP 流程声明 ──────────────────────
+def _owns_flow_hooks(reward: CheckinReward):
+    class Hooks:
+        owns_http_flow = True
+        run_http_extras = None
+
+        @staticmethod
+        def do_checkin(_client, log=None):
+            if log:
+                log("脚本自管流程执行完毕")
+            return reward
+
+    return Hooks()
+
+
+def test_api_action_skips_profile_probes_when_script_owns_flow(monkeypatch) -> None:
+    """站点把签到搬到私改端点时，通用层不得再探测被禁用的 profile 端点。
+
+    实测 SOTA Model 的 /api/user/checkin 固定回「签到功能未启用」，多探一次只会
+    制造噪声失败日志，还会让状态机拿着错误状态做后续判断。
+    """
+    from browser import script_loader
+
+    reward = CheckinReward(
+        quota_awarded=150_000_000,
+        current_quota=685_000_000,
+        extra={"result_message": "签到成功，获得 $300.00"},
+    )
+    monkeypatch.setattr(script_loader, "load_script_hooks", lambda _path: _owns_flow_hooks(reward))
+    client = FakeClient()
+    site = _site("access_token")
+    site.script = "scripts/checkin/sotamodel_agent.py"
+
+    result = api.run_action(site, FakeProfile(client))
+
+    assert result.status == "success"
+    # 脚本给出的站点语义消息要覆盖通用文案（两条链路共用同一处实现）。
+    assert result.message == "签到成功，获得 $300.00"
+    assert client.status_calls == 0
+    assert client.user_calls == 0
+    assert client.checkin_calls == 0
+
+
+def test_api_action_still_probes_when_script_does_not_own_flow(monkeypatch) -> None:
+    """未声明自管流程的站点行为完全不变，仍走通用状态查询与签到。"""
+    from browser import script_loader
+
+    class Hooks:
+        owns_http_flow = False
+        run_http_extras = None
+        do_checkin = None
+
+    monkeypatch.setattr(script_loader, "load_script_hooks", lambda _path: Hooks())
+    client = FakeClient()
+    site = _site("access_token")
+    site.script = "scripts/checkin/sotamodel_agent.py"
+
+    result = api.run_action(site, FakeProfile(client))
+
+    assert result.status == "success"
+    assert client.status_calls == 1
+    assert client.checkin_calls == 1
+
+
 def test_refreshed_access_token_only_writes_runtime_cache(monkeypatch) -> None:
     site = _site("browser")
 

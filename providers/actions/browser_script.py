@@ -21,7 +21,7 @@ from ..base import (
     normalize_access_token,
     normalize_base_url,
 )
-from .api import run_http_flow
+from .api import run_http_flow, script_owns_http_flow
 
 
 def _load_runner():
@@ -56,18 +56,8 @@ def _script_handles_oauth(site: SiteConfig) -> bool:
     return bool(value)
 
 
-def _script_owns_http_flow(site: SiteConfig) -> bool:
-    """脚本是否声明自行完成状态查询、签到和结果确认。"""
-    script_path = str(getattr(site, "script", "") or "").strip()
-    if not script_path:
-        return False
-    try:
-        from browser import script_loader
-
-        hooks = script_loader.load_script_hooks(script_path)
-    except Exception:
-        return False
-    return bool(getattr(hooks, "owns_http_flow", False) and hooks.do_checkin is not None)
+# 「脚本是否自管 HTTP 流程」的唯一实现在 api action（两条链路共用同一判定）。
+_script_owns_http_flow = script_owns_http_flow
 
 
 def _script_credentials(site: SiteConfig) -> tuple[str, str]:
@@ -354,9 +344,7 @@ def _try_api_checkin(site: SiteConfig, profile: SiteProfile) -> CheckinResult | 
             result.detail = {} if result.detail is None else {"checkin_detail": result.detail}
         result.detail.setdefault("api_first", True)
         result.detail.setdefault("api_stage", stage)
-        result_message = str(result.detail.get("result_message") or "").strip()
-        if result_message and result.status in {"success", "already_done"}:
-            result.message = result_message
+        # 脚本 result_message 的覆盖已由 run_http_flow 统一处理，这里不再重复一份。
         if result.detail.get("unsupported_checkin"):
             _api_log(site, f"[{stage}] 站点无可用签到端点，交给浏览器脚本")
             return None

@@ -144,6 +144,24 @@ def _script_log(site: SiteConfig, message: str) -> None:
     print(f"[api:{site.name}] {mask_secrets(str(message))}", file=sys.stderr, flush=True)
 
 
+def script_owns_http_flow(site: SiteConfig) -> bool:
+    """站点脚本是否声明自行完成状态查询、签到与结果确认（唯一实现）。
+
+    api 与 browser_script 两条链路共用本判定：否则「是否跳过通用 Profile 探测」会各
+    按一套规则演化，出现同一个脚本在一条链路上仍被叠加无意义端点探测的偏差。
+    """
+    script_path = str(getattr(site, "script", "") or "").strip()
+    if not script_path:
+        return False
+    try:
+        from browser import script_loader
+
+        hooks = script_loader.load_script_hooks(script_path)
+    except Exception:  # noqa: BLE001 - 配置写错不该让签到直接失败，按未声明处理
+        return False
+    return bool(getattr(hooks, "owns_http_flow", False) and hooks.do_checkin is not None)
+
+
 def _script_checkin(site: SiteConfig, client: ProfileClient, turnstile: str) -> CheckinReward | None:
     """把签到交给验证路由或自定义脚本；不接管时返回 None。
 
@@ -173,6 +191,20 @@ def _script_checkin(site: SiteConfig, client: ProfileClient, turnstile: str) -> 
     return reward if isinstance(reward, CheckinReward) else None
 
 
+def _apply_script_message(result: CheckinResult) -> CheckinResult:
+    """签到成立时，用站点脚本给出的 result_message 覆盖通用文案。
+
+    自管流程的脚本掌握站点语义（奖励档位、入账状态、抽奖结果），通用状态机只会拼
+    「签到成功。」这类无信息量的句子。两条链路都在这里统一取用，避免各写一份。
+    """
+    if result.status not in {"success", "already_done"} or not isinstance(result.detail, dict):
+        return result
+    message = str(result.detail.get("result_message") or "").strip()
+    if message:
+        result.message = message
+    return result
+
+
 def run_http_flow(
     site: SiteConfig,
     client: ProfileClient,
@@ -182,7 +214,29 @@ def run_http_flow(
     observer: Callable[[str, Any], None] | None = None,
     skip_profile_probes: bool = False,
 ) -> CheckinResult:
-    """执行唯一的 HTTP 签到状态机；供 api 与 browser_script API-first 复用。
+    """执行唯一的 HTTP 签到状态机；供 api 与 browser_script API-first 复用。"""
+    return _apply_script_message(
+        _http_flow(
+            site,
+            client,
+            turnstile,
+            allow_site_hook=allow_site_hook,
+            observer=observer,
+            skip_profile_probes=skip_profile_probes,
+        )
+    )
+
+
+def _http_flow(
+    site: SiteConfig,
+    client: ProfileClient,
+    turnstile: str = "",
+    *,
+    allow_site_hook: bool = True,
+    observer: Callable[[str, Any], None] | None = None,
+    skip_profile_probes: bool = False,
+) -> CheckinResult:
+    """HTTP 签到状态机本体。
 
     结果里的 base_url 以站点配置为准（client 的 base_url 仅作补充）：两条链路都按
     站点身份汇总结果，而 profile 客户端不保证暴露该属性。
@@ -349,7 +403,13 @@ def run_action(site: SiteConfig, profile: SiteProfile, turnstile: str = "") -> C
         client = build_http_client(site, profile)
     except BrowserAuthError as exc:
         return CheckinResult(site.name, site.base_url, exc.status, exc.message, detail=exc.detail)
-    return run_http_flow(site, client, turnstile)
+    # 脚本自管流程时不先探测 profile 的标准端点：这类站点往往已把签到搬到私改端点
+    # （实测 SOTA Model 的 /api/user/checkin 固定回「签到功能未启用」），多探一次
+    # 只会制造噪声失败日志，还会让状态机拿错误状态做后续判断。
+    owns_flow = script_owns_http_flow(site)
+    if owns_flow:
+        _script_log(site, "站点脚本接管 HTTP 状态与签到，跳过通用 Profile 端点探测")
+    return run_http_flow(site, client, turnstile, skip_profile_probes=owns_flow)
 
 
 def query_action(site: SiteConfig, profile: SiteProfile) -> QueryStatus:
