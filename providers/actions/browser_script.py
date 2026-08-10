@@ -47,6 +47,29 @@ def _script_can_self_login(site: SiteConfig) -> bool:
     return False
 
 
+def _script_handles_oauth(site: SiteConfig) -> bool:
+    """脚本是否声明自行处理 OAuth，而不是使用运行器的单层 OAuth 预处理。"""
+    args = site.script_args if isinstance(site.script_args, dict) else {}
+    value = args.get("script_handles_oauth", False)
+    if isinstance(value, str):
+        return value.strip().casefold() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _script_owns_http_flow(site: SiteConfig) -> bool:
+    """脚本是否声明自行完成状态查询、签到和结果确认。"""
+    script_path = str(getattr(site, "script", "") or "").strip()
+    if not script_path:
+        return False
+    try:
+        from browser import script_loader
+
+        hooks = script_loader.load_script_hooks(script_path)
+    except Exception:
+        return False
+    return bool(getattr(hooks, "owns_http_flow", False) and hooks.do_checkin is not None)
+
+
 def _script_credentials(site: SiteConfig) -> tuple[str, str]:
     """取脚本可用的账密（script_args 优先，回退环境变量）。"""
     args = site.script_args if isinstance(site.script_args, dict) else {}
@@ -285,6 +308,7 @@ def _try_api_checkin(site: SiteConfig, profile: SiteProfile) -> CheckinResult | 
         return None
     # 结果里的 base_url 由 run_http_flow 按站点配置统一填写，这里不再各自拼一份。
     token = normalize_access_token(getattr(site, "access_token", "") or "")
+    script_owns_http_flow = _script_owns_http_flow(site)
 
     from ..base import AuthInfo
 
@@ -315,6 +339,8 @@ def _try_api_checkin(site: SiteConfig, profile: SiteProfile) -> CheckinResult | 
             elif event == "checkin_error":
                 _api_log(site, f"[{stage}] 签到接口失败：{_describe_failure(payload)}")
 
+        if script_owns_http_flow:
+            _api_log(site, f"[{stage}] 站点脚本接管 HTTP 状态与签到，跳过 Sub2API 标准端点探测")
         result = run_http_flow(
             site,
             client,
@@ -322,6 +348,7 @@ def _try_api_checkin(site: SiteConfig, profile: SiteProfile) -> CheckinResult | 
             # 既有脚本仍会回落 profile 默认签到，不会把 run() 浏览器入口误当 HTTP。
             allow_site_hook=True,
             observer=observe,
+            skip_profile_probes=script_owns_http_flow,
         )
         if not isinstance(result.detail, dict):
             result.detail = {} if result.detail is None else {"checkin_detail": result.detail}
@@ -415,6 +442,7 @@ def run_action(site: SiteConfig, profile: SiteProfile, turnstile: str = "") -> C
         return api_result
 
     auth_method = (site.auth_method or "").strip().lower()
+    script_handles_oauth = _script_handles_oauth(site)
     fallback_provider = accounts_store.normalize_oauth_provider(
         getattr(site, "oauth_fallback_provider", "")
     )
@@ -436,7 +464,11 @@ def run_action(site: SiteConfig, profile: SiteProfile, turnstile: str = "") -> C
             "oauth_provider": oauth_provider,
             "oauth_account": oauth_account,
         }
-        initial_oauth_provider = oauth_provider
+        if script_handles_oauth:
+            detail["script_handles_oauth"] = True
+        # 双层 SSO 等特殊流程需要共享 provider storage state，但不能让运行器提前
+        # 按单层 OAuth 规则触发；此时由脚本的 run() 完成完整登录链路。
+        initial_oauth_provider = "" if script_handles_oauth else oauth_provider
     elif auth_method == "browser":
         state_text = site.browser_state
         detail = {"checkin_source": "browser_script", "auth_method": auth_method}
@@ -453,7 +485,7 @@ def run_action(site: SiteConfig, profile: SiteProfile, turnstile: str = "") -> C
     use_fallback_first = not str(state_text or "").strip() and bool(fallback_provider)
     if use_fallback_first:
         state_text = fallback_state
-        initial_oauth_provider = fallback_provider
+        initial_oauth_provider = "" if script_handles_oauth else fallback_provider
         detail.update({
             "oauth_fallback_used": True,
             "oauth_provider": fallback_provider,
@@ -502,7 +534,7 @@ def run_action(site: SiteConfig, profile: SiteProfile, turnstile: str = "") -> C
             and fallback_state.strip()
             and initial_oauth_provider != fallback_provider
         ):
-            result = _run(fallback_state, fallback_provider)
+            result = _run(fallback_state, "" if script_handles_oauth else fallback_provider)
             detail.update({
                 "oauth_fallback_used": True,
                 "oauth_provider": fallback_provider,

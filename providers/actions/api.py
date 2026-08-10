@@ -180,6 +180,7 @@ def run_http_flow(
     *,
     allow_site_hook: bool = True,
     observer: Callable[[str, Any], None] | None = None,
+    skip_profile_probes: bool = False,
 ) -> CheckinResult:
     """执行唯一的 HTTP 签到状态机；供 api 与 browser_script API-first 复用。
 
@@ -191,29 +192,33 @@ def run_http_flow(
     def notify(event: str, payload: Any = None) -> None:
         if observer is not None:
             observer(event, payload)
-    # 1) 读签到状态
-    try:
-        status = client.fetch_status()
-        notify("status", status)
-    except ApiError as exc:
-        notify("status_error", exc)
-        if exc.transient:
-            return CheckinResult(
-                site.name,
-                base_url,
-                "network_error",
-                f"签到状态查询暂时失败：{exc.message}",
-                detail=exc.payload,
-            )
-        kind = client.classify(exc)
-        if kind == "already_done":
-            return CheckinResult(site.name, base_url, "already_done", exc.message, detail=exc.payload)
-        if kind == "need_login":
-            return CheckinResult(site.name, base_url, "need_login", _need_login_message(site), detail=exc.payload)
-        if kind == "need_verification":
-            return CheckinResult(site.name, base_url, "need_verification", exc.message, detail=exc.payload)
-        # 状态接口失败不致命：继续尝试签到
+    # 1) 读签到状态。声明 OWNS_HTTP_FLOW 的脚本会自行查询状态、执行签到并确认
+    # 结果；此时不能先拿 profile 去猜一整套 /api/v1/*，否则只会制造无意义 404。
+    if skip_profile_probes:
         status = StatusInfo()
+    else:
+        try:
+            status = client.fetch_status()
+            notify("status", status)
+        except ApiError as exc:
+            notify("status_error", exc)
+            if exc.transient:
+                return CheckinResult(
+                    site.name,
+                    base_url,
+                    "network_error",
+                    f"签到状态查询暂时失败：{exc.message}",
+                    detail=exc.payload,
+                )
+            kind = client.classify(exc)
+            if kind == "already_done":
+                return CheckinResult(site.name, base_url, "already_done", exc.message, detail=exc.payload)
+            if kind == "need_login":
+                return CheckinResult(site.name, base_url, "need_login", _need_login_message(site), detail=exc.payload)
+            if kind == "need_verification":
+                return CheckinResult(site.name, base_url, "need_verification", exc.message, detail=exc.payload)
+            # 状态接口失败不致命：继续尝试签到
+            status = StatusInfo()
 
     # 2) 今日已签到
     # 状态对象按 StatusInfo 契约读取，但用 getattr 兜底：站点脚本与 profile 可返回
@@ -229,7 +234,8 @@ def run_http_flow(
             detail["current_quota"] = status_quota
             detail["quota_is_usd"] = True
         result = CheckinResult(site.name, base_url, "already_done", "今日已签到。", detail=detail)
-        _inject_current_quota(client, detail)
+        if not skip_profile_probes:
+            _inject_current_quota(client, detail)
         return result
 
     # 3) 需要人机验证（Cloudflare Turnstile 或图形验证码）但未提供
@@ -245,7 +251,11 @@ def run_http_flow(
     # 先记下签到前余额：部分 fork 的签到接口不返回奖励字段，只能靠前后余额差
     # 判断是否真的到账（避免把「HTTP 200 但未发放」误报成成功）。状态接口已给出
     # 余额时直接复用，省一次请求。
-    quota_before = status_quota if status_quota is not None else _read_quota(client)
+    quota_before = (
+        None
+        if skip_profile_probes
+        else status_quota if status_quota is not None else _read_quota(client)
+    )
     try:
         notify("checkin_start")
         # 站点脚本优先：它可能实现了该 fork 私改的签到流程（如图形验证码）。
@@ -278,7 +288,8 @@ def run_http_flow(
         return CheckinResult(site.name, base_url, "already_done", "今日已签到。", detail=detail)
 
     detail = _build_detail(client, reward)
-    _inject_current_quota(client, detail)
+    if not skip_profile_probes:
+        _inject_current_quota(client, detail)
     if detail.get("unsupported_checkin"):
         return CheckinResult(site.name, base_url, "success", "站点未提供签到接口，已完成余额查询。", detail=detail)
     # 只有确实拿到非零金额才写进消息：站点签到成功但不回具体金额时常给 0，
@@ -294,6 +305,15 @@ def run_http_flow(
     # （站点静默拒绝/端点非签到接口），导致「显示成功但额度没到账」。
     # 此时用签到前后的余额差与状态接口做交叉验证，拿不到证据就不谎报成功。
     if reward.checkin_unconfirmed:
+        if skip_profile_probes:
+            detail["checkin_unconfirmed"] = True
+            return CheckinResult(
+                site.name,
+                base_url,
+                "error",
+                "站点脚本未能确认签到结果；为避免误报，未继续调用通用 Profile 探测接口。",
+                detail=detail,
+            )
         confirmed_quota = _quota_increased(client, quota_before, detail)
         if confirmed_quota is not None:
             # _quota_increased 返回的 delta **已经是美元**（内部走过 quota_to_usd）。

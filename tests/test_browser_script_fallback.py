@@ -52,6 +52,27 @@ def test_browser_script_prefers_site_state_without_eager_oauth(monkeypatch) -> N
     assert not result.detail.get("oauth_fallback_used")
 
 
+def test_script_handles_oauth_keeps_shared_state_without_pretrigger(monkeypatch) -> None:
+    runner = FakeRunner(["success"])
+    _install(monkeypatch, runner)
+    site = _site()
+    site.auth_method = "oauth"
+    site.browser_state = ""
+    site.oauth_fallback_provider = ""
+    site.oauth_fallback_account = ""
+    site.oauth_provider = "linuxdo"
+    site.oauth_account = "default"
+    site.script_args = {"script_handles_oauth": True}
+
+    result = browser_script.run_action(site, SimpleNamespace())
+
+    assert result.status == "success"
+    assert len(runner.calls) == 1
+    assert runner.calls[0]["browser_state_text"] == "oauth-state"
+    assert runner.calls[0]["oauth_provider"] == ""
+    assert result.detail["script_handles_oauth"] is True
+
+
 def test_browser_script_retries_once_with_oauth_on_need_login(monkeypatch) -> None:
     runner = FakeRunner(["need_login", "success"])
     _install(monkeypatch, runner)

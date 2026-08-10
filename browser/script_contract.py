@@ -17,6 +17,7 @@ class LoadedSiteScript:
     run: BrowserRunHook | None = None
     do_checkin: HttpCheckinHook | None = None
     run_http_extras: HttpExtrasHook | None = None
+    owns_http_flow: bool = False
 
     @classmethod
     def from_module(cls, module: ModuleType) -> LoadedSiteScript:
@@ -29,6 +30,7 @@ class LoadedSiteScript:
             run=optional_hook("run"),
             do_checkin=optional_hook("do_checkin"),
             run_http_extras=optional_hook("run_http_extras"),
+            owns_http_flow=bool(getattr(module, "OWNS_HTTP_FLOW", False)),
         )
 
     def require_browser_run(self) -> BrowserRunHook:

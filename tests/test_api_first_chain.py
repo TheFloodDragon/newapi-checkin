@@ -30,9 +30,11 @@ class FakeClient:
         self._reward = reward or CheckinReward(quota_awarded=0.5)
         self._user_quota = user_quota
         self.checkin_calls = 0
+        self.status_calls = 0
         self.user_calls = 0
 
     def fetch_status(self) -> Any:
+        self.status_calls += 1
         if self._status_error is not None:
             raise self._status_error
         return self._status
@@ -152,6 +154,35 @@ def test_explicit_http_hook_runs_before_profile_default(monkeypatch) -> None:
     assert result is not None and result.status == "success"
     assert result.message == "抽奖成功：尝鲜套餐（30 天）"
     assert result.detail["lottery_outcome"] == "win"
+    assert client.checkin_calls == 0
+
+
+def test_http_flow_owner_skips_profile_status_and_quota_probes(monkeypatch) -> None:
+    client = FakeClient(status=StatusInfo(checked_in_today=False))
+    profile = FakeProfile({"old": client})
+
+    class Hooks:
+        owns_http_flow = True
+        run_http_extras = None
+
+        @staticmethod
+        def do_checkin(_client: Any, log: Any = None) -> CheckinReward:
+            return CheckinReward(
+                already_done=True,
+                extra={"result_message": "今日已签到，获得 $5.42（已入账）"},
+            )
+
+    monkeypatch.setattr(script_loader, "load_script_hooks", lambda _path: Hooks())
+
+    result = browser_script._try_api_checkin(
+        _site(script="scripts/checkin/fengwind_welfare.py"),
+        profile,
+    )
+
+    assert result is not None and result.status == "already_done"
+    assert result.message == "今日已签到，获得 $5.42（已入账）"
+    assert client.status_calls == 0
+    assert client.user_calls == 0
     assert client.checkin_calls == 0
 
 

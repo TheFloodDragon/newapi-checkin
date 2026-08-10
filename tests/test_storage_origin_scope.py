@@ -74,6 +74,24 @@ def test_no_base_url_keeps_legacy_first_match_behavior() -> None:
     assert session.storage_item(state, "refresh_token") == "RT_FROM_A"
 
 
+def test_welfare_token_is_not_a_generic_cache_key() -> None:
+    state = {
+        "origins": [
+            {
+                "origin": "https://api-welfalre.fengwind.com",
+                "localStorage": [{"name": "welfare_token", "value": "SITE_ONLY_TOKEN"}],
+            },
+            {
+                "origin": "https://api.fengwind.com",
+                "localStorage": [{"name": "auth_token", "value": "GENERIC_TOKEN"}],
+            },
+        ]
+    }
+
+    assert session.storage_access_token(state, base_url="https://api-welfalre.fengwind.com") == ""
+    assert session.storage_access_token(state, base_url="https://api.fengwind.com") == "GENERIC_TOKEN"
+
+
 def test_refresh_token_backfill_ignores_other_origins() -> None:
     """存量登录态回填不得把别站 refresh_token 写进本站配置。"""
     from browser.state import encode_state
