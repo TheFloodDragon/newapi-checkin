@@ -268,6 +268,55 @@ def test_parse_clipboard_site_variants() -> None:
     assert err
 
 
+def test_parse_clipboard_extracts_tokens_from_localstorage_json() -> None:
+    payload = {
+        "channel-status-auto-refresh": '{"enabled":true}',
+        "auth_token": "eyJ.test.\n signature",
+        "refresh_token": "rt_keep",
+        "auth_user": '{"id":19653}',
+    }
+
+    data, err = core.parse_clipboard_site(json.dumps(payload))
+
+    assert err == ""
+    assert data["access_token"] == "eyJ.test.signature"
+    assert data["refresh_token"] == "rt_keep"
+
+
+def test_parse_clipboard_recursively_extracts_aliases_from_nested_json_strings() -> None:
+    nested = json.dumps({"AUTH-TOKEN": " access.value ", "rtToken": "rt_nested"})
+    payload = {"storage": [{"localStorage": nested}]}
+
+    data, err = core.parse_clipboard_site(json.dumps(payload))
+
+    assert err == ""
+    assert data["access_token"] == "access.value"
+    assert data["refresh_token"] == "rt_nested"
+
+
+def test_parse_clipboard_keeps_explicit_standard_tokens_over_aliases() -> None:
+    payload = {
+        "access_token": "explicit_access",
+        "refresh_token": "explicit_refresh",
+        "nested": {"auth_token": "fallback_access", "rt_token": "fallback_refresh"},
+    }
+
+    data, err = core.parse_clipboard_site(json.dumps(payload))
+
+    assert err == ""
+    assert data["access_token"] == "explicit_access"
+    assert data["refresh_token"] == "explicit_refresh"
+
+
+def test_parse_clipboard_extracts_tokens_when_json_root_is_encoded_string() -> None:
+    text = json.dumps(json.dumps({"authToken": "access", "rt_token": "refresh"}))
+
+    data, err = core.parse_clipboard_site(text)
+
+    assert err == ""
+    assert data == {"access_token": "access", "refresh_token": "refresh"}
+
+
 def test_merge_clipboard_site_consumes_collector_three_dimensions() -> None:
     original = core.SiteRow(
         name="old",

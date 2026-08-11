@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from dataclasses import dataclass, field
 from typing import Any
@@ -290,11 +291,21 @@ async def authenticated(page: Any, origin: str) -> bool:
     若 localStorage 存在 refresh_token 则先调 /api/v1/auth/refresh 刷新再重试。
     只有 refresh 也失败才判定未登录，避免把「仅 access_token 过期、会话仍有效」
     误判为需要账号密码重新登录。
+
+    登录后 SPA 可能同时发生路由跳转，page.evaluate 会因 execution context destroyed
+    瞬时失败。不能把一次 evaluate 异常直接等价为认证失败，短暂重试后才下结论。
     """
-    try:
-        return bool(await page.evaluate(_AUTHENTICATED_JS, origin))
-    except Exception:
-        return False
+    for attempt in range(3):
+        try:
+            return bool(await page.evaluate(_AUTHENTICATED_JS, origin))
+        except Exception:
+            if attempt >= 2:
+                break
+            try:
+                await page.wait_for_timeout(200)
+            except Exception:
+                break
+    return False
 
 
 _DISMISS_NOTICE_JS = """() => {
@@ -352,6 +363,7 @@ async def fill_login_form(page: Any, email: str, password: str) -> bool:
 
 
 _SUBMIT_LOGIN_JS = """async ([baseUrl, email, password, turnstileToken]) => {
+    const stashKey = __SUB2API_STASH_KEY__;
     const shortMessage = (v) => String(v || '').replace(/[\\r\\n]/g, ' ').slice(0, 160);
     try {
         const response = await fetch(baseUrl + '/api/v1/auth/login', {
@@ -377,6 +389,19 @@ _SUBMIT_LOGIN_JS = """async ([baseUrl, email, password, turnstileToken]) => {
             const expiresIn = Number(payload && payload.expires_in);
             if (Number.isFinite(expiresIn) && expiresIn > 0) {
                 localStorage.setItem('token_expires_at', String(Date.now() + expiresIn * 1000));
+            } else {
+                // 站点没回 expires_in 时，上一轮的过期时间戳会残留在 localStorage 里，
+                // preflight init script 下次导航就会把这份新 token 当过期货清掉。
+                localStorage.removeItem('token_expires_at');
+            }
+            // 另存一份到前端不认识的暗格：站点 401 拦截器会清掉上面这几个键。
+            if (stashKey) {
+                const saved = {};
+                for (const key of ['auth_token', 'refresh_token', 'auth_user', 'token_expires_at']) {
+                    const value = localStorage.getItem(key);
+                    if (typeof value === 'string' && value) saved[key] = value;
+                }
+                localStorage.setItem(stashKey, JSON.stringify(saved));
             }
         }
         const message = raw && typeof raw === 'object'
@@ -405,10 +430,17 @@ async def submit_login(
     email: str,
     password: str,
     turnstile_token: str,
+    stash_key: str = "",
 ) -> dict[str, Any] | None:
-    """调用站点公开登录接口，写入返回的 token，只回传非敏感诊断。"""
+    """调用站点公开登录接口，写入返回的 token，只回传非敏感诊断。
+
+    token 同时另存进浏览器内的暗格（stash_key），Python 侧不接触任何 token 明文。
+    """
     try:
-        result = await page.evaluate(_SUBMIT_LOGIN_JS, [origin, email, password, turnstile_token])
+        script = _SUBMIT_LOGIN_JS.replace(
+            "__SUB2API_STASH_KEY__", json.dumps(stash_key, ensure_ascii=True)
+        )
+        result = await page.evaluate(script, [origin, email, password, turnstile_token])
         return result if isinstance(result, dict) else None
     except Exception:
         return None
@@ -459,7 +491,18 @@ async def persist_state(context: Any, site: Any) -> None:
 
 # ── init script（导航前注入，破解路由守卫互踢）──────────────────────────────
 
-def preflight_init_script() -> str:
+def session_stash_key(sentinel: str) -> str:
+    """登录态暗格键名：站点前端登出时只清 AUTH_KEYS，不会碰这个键。
+
+    Sub2API 前端的 axios 响应拦截器一旦收到 401（refresh 也失败时同样走这条路），
+    会 removeItem auth_token / refresh_token / auth_user / token_expires_at 并
+    `window.location.href = '/login'`。账密登录刚拿到的 token 就是这样被前端清掉的。
+    把同一份登录态另存一份到前端不认识的键里，导航时即可原样恢复。
+    """
+    return f"{sentinel}_session" if sentinel else ""
+
+
+def preflight_init_script(stash_key: str = "") -> str:
     """token 已过期时在 document_start 清空 auth 键，避免 /login↔/dashboard 互踢。
 
     根因：token 过期但 localStorage 残留 auth_user 时，/dashboard 守卫判「未登录」
@@ -467,8 +510,12 @@ def preflight_init_script() -> str:
     跳转，且跳转期间页面执行上下文反复销毁、evaluate 全部失效。对策是在 SPA 路由
     守卫读取 localStorage 之前，把登录态一致地归零，让页面干净停在 /login。
     token 未过期则完全不动，保住有效会话。
+
+    过期时连暗格一起清掉：否则 restore init script 会把过期 token 恢复回去，
+    重新形成互踢。
     """
     keys = ", ".join(f"'{key}'" for key in AUTH_KEYS)
+    stash_line = f"localStorage.removeItem('{stash_key}');" if stash_key else ""
     return f"""
         try {{
             const exp = Number(localStorage.getItem('token_expires_at') || '0');
@@ -476,6 +523,7 @@ def preflight_init_script() -> str:
                 for (const key of [{keys}]) {{
                     localStorage.removeItem(key);
                 }}
+                {stash_line}
                 sessionStorage.removeItem('auth_expired');
             }}
             localStorage.setItem('{NOTICE_KEY}', 'accepted');
@@ -490,6 +538,8 @@ def login_reset_init_script(sentinel: str) -> str:
     store 会从持久化值重新写回 auth_user，导致 /login 又被弹回 dashboard。必须用
     add_init_script 在每次导航的 document_start（早于框架读取 localStorage）清理。
     sentinel 守护：登录成功后置为 'done' 即停止清理，避免把新拿到的 token 也清掉。
+    暗格不能在这里同步清理：若 sentinel 写入恰逢导航而失败，下一次 document_start
+    仍需靠最后注册的 restore init script 从暗格救回新 token。
     """
     keys = ", ".join(f"'{key}'" for key in AUTH_KEYS)
     return f"""
@@ -505,6 +555,39 @@ def login_reset_init_script(sentinel: str) -> str:
     """
 
 
+def session_restore_init_script(stash_key: str) -> str:
+    """document_start 时把被前端清掉的登录态从暗格恢复回 localStorage。
+
+    只在账密登录成功（且 /auth/me 已验证）之后注册。站点前端一旦把 auth_token
+    清掉并跳回 /login，下一次导航就在 SPA 读 localStorage 之前恢复，签到流程不会
+    因为「前端自己登出了」而误判成登录态失效。
+
+    只恢复未过期的登录态：暗格里的 token_expires_at 已过期就把暗格删掉，
+    避免恢复出一个死 token 反复互踢。
+    """
+    keys = ", ".join(f"'{key}'" for key in AUTH_KEYS)
+    return f"""
+        try {{
+            const raw = localStorage.getItem('{stash_key}');
+            if (raw) {{
+                const saved = JSON.parse(raw);
+                const exp = Number((saved && saved.token_expires_at) || '0');
+                if (Number.isFinite(exp) && exp > 0 && Date.now() >= exp) {{
+                    localStorage.removeItem('{stash_key}');
+                }} else if (!String(localStorage.getItem('auth_token') || '').trim()) {{
+                    for (const key of [{keys}]) {{
+                        const value = saved && saved[key];
+                        if (typeof value === 'string' && value) {{
+                            localStorage.setItem(key, value);
+                        }}
+                    }}
+                    sessionStorage.removeItem('auth_expired');
+                }}
+            }}
+        }} catch (_) {{ /* ignore */ }}
+    """
+
+
 async def add_init_script(context: Any, script: str) -> None:
     if context is None:
         return
@@ -514,12 +597,80 @@ async def add_init_script(context: Any, script: str) -> None:
         pass
 
 
-async def mark_login_done(page: Any, sentinel: str) -> None:
-    """置位 sentinel，停止 init script 清理（否则会清掉刚登录拿到的 token）。"""
+async def mark_login_done(page: Any, sentinel: str) -> bool:
+    """置位 sentinel，停止 init script 清理（否则会清掉刚登录拿到的 token）。
+
+    必须写成并读回确认：这次 evaluate 紧跟在登录之后，站点前端此刻可能正在
+    `window.location.href='/login'`，执行上下文被销毁会让 evaluate 直接抛异常。
+    此前异常被静默吞掉，sentinel 没写上，下一次导航的 login_reset init script
+    就把刚拿到的 token 全清了——表现为「登录成功却立刻判定登录态失效」。
+    """
+    for _ in range(3):
+        try:
+            done = await page.evaluate(
+                f"() => {{ localStorage.setItem('{sentinel}', 'done');"
+                f" return localStorage.getItem('{sentinel}') === 'done'; }}"
+            )
+            if bool(done):
+                return True
+        except Exception:
+            pass
+        try:
+            await page.wait_for_timeout(200)
+        except Exception:
+            return False
+    return False
+
+
+async def stash_session(page: Any, stash_key: str) -> bool:
+    """把当前 localStorage 里的登录态复制进暗格，供导航后恢复。"""
+    if not stash_key:
+        return False
+    keys = ", ".join(f"'{key}'" for key in AUTH_KEYS)
+    script = f"""() => {{
+        try {{
+            const saved = {{}};
+            for (const key of [{keys}]) {{
+                const value = localStorage.getItem(key);
+                if (typeof value === 'string' && value) saved[key] = value;
+            }}
+            if (!saved.auth_token) return false;
+            localStorage.setItem('{stash_key}', JSON.stringify(saved));
+            return true;
+        }} catch (_) {{ return false; }}
+    }}"""
     try:
-        await page.evaluate(f"() => localStorage.setItem('{sentinel}', 'done')")
+        return bool(await page.evaluate(script))
     except Exception:
-        pass
+        return False
+
+
+async def restore_session(page: Any, stash_key: str) -> bool:
+    """运行期恢复：前端把 auth 键清掉后，从暗格补回来。返回是否补过。"""
+    if not stash_key:
+        return False
+    keys = ", ".join(f"'{key}'" for key in AUTH_KEYS)
+    script = f"""() => {{
+        try {{
+            const raw = localStorage.getItem('{stash_key}');
+            if (!raw) return false;
+            const saved = JSON.parse(raw);
+            if (!saved || typeof saved !== 'object' || !saved.auth_token) return false;
+            const exp = Number(saved.token_expires_at || '0');
+            if (Number.isFinite(exp) && exp > 0 && Date.now() >= exp) return false;
+            if (String(localStorage.getItem('auth_token') || '').trim()) return false;
+            for (const key of [{keys}]) {{
+                const value = saved[key];
+                if (typeof value === 'string' && value) localStorage.setItem(key, value);
+            }}
+            sessionStorage.removeItem('auth_expired');
+            return true;
+        }} catch (_) {{ return false; }}
+    }}"""
+    try:
+        return bool(await page.evaluate(script))
+    except Exception:
+        return False
 
 
 async def keep_waf_cookies(context: Any) -> None:
@@ -681,7 +832,8 @@ async def login_with_password(
         await page.wait_for_timeout(min(max(opts.poll_interval_ms, 50), 250))
     except Exception:
         pass
-    result = await submit_login(page, origin, email, password, token)
+    stash_key = session_stash_key(spec.login_reset_sentinel)
+    result = await submit_login(page, origin, email, password, token, stash_key)
     status = int((result or {}).get("status") or 0)
     if bool((result or {}).get("two_factor")):
         return helpers.need_login(
@@ -706,7 +858,18 @@ async def login_with_password(
         )
 
     log(helpers, "账密登录成功，已验证登录态")
-    await mark_login_done(page, spec.login_reset_sentinel)
+    # 登录接口 JS 已经写过暗格，这里再读当前 localStorage 复核一次；两次都不向
+    # Python 返回 token 明文。随后把 restore 脚本注册在 login_reset 之后：即使
+    # sentinel 写入恰逢导航而失败，下一份 document 也会先清理、再恢复新 token。
+    stashed = await stash_session(page, stash_key)
+    marked = await mark_login_done(page, spec.login_reset_sentinel)
+    await add_init_script(context, session_restore_init_script(stash_key))
+    log(
+        helpers,
+        "登录态防丢保护已启用"
+        f"（暗格={'已确认' if stashed else '由登录接口写入'}，"
+        f"清理哨兵={'已确认' if marked else '写入未确认，将由暗格恢复兜底'}）",
+    )
     login_detail.update(
         {
             "login_fallback": "password",
@@ -929,8 +1092,43 @@ async def find_checkin_control(page: Any, opts: ScriptOptions) -> tuple[str, Any
     return None
 
 
+async def page_control_snapshot(page: Any) -> list[dict[str, Any]]:
+    """读取当前可见按钮/链接的脱敏快照，仅用于定位签到控件的过程日志。"""
+    script = r"""() => Array.from(document.querySelectorAll('button, a[href]'))
+        .slice(0, 30)
+        .map((el) => ({
+            tag: String(el.tagName || '').toLowerCase(),
+            text: String(el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80),
+            disabled: Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true'),
+            hidden: !(el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden'),
+        }))"""
+    try:
+        items = await page.evaluate(script)
+    except Exception:
+        return []
+    if not isinstance(items, list):
+        return []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def format_control_snapshot(items: list[dict[str, Any]]) -> str:
+    """把控件快照压成一行，不输出 DOM/属性等无关信息。"""
+    rendered: list[str] = []
+    for item in items[:12]:
+        text = str(item.get("text") or "").strip() or "<无文案>"
+        flags: list[str] = []
+        if bool(item.get("disabled")):
+            flags.append("禁用")
+        if bool(item.get("hidden")):
+            flags.append("隐藏")
+        suffix = f"/{'/'.join(flags)}" if flags else ""
+        rendered.append(f"{item.get('tag') or 'control'}:「{text}」{suffix}")
+    return "；".join(rendered) if rendered else "未读取到按钮/链接"
+
+
 async def click_checkin(
     page: Any,
+    helpers: Any,
     opts: ScriptOptions,
     initial: tuple[str, Any, str] | None = None,
 ) -> tuple[str, Any, str, str]:
@@ -940,20 +1138,25 @@ async def click_checkin(
     期间被前端替换，因此每轮都重新定位。返回 (文案, 元素, 类型, 生效策略)；
     全部失败返回空文案。
     """
+    log(helpers, "开始点击签到按钮：最多重新定位 3 轮，每轮依次尝试 normal/force/dispatch/dom")
     for attempt in range(3):
+        round_no = attempt + 1
         control = initial if attempt == 0 and initial is not None else await find_checkin_control(page, opts)
         if control is None:
+            log(helpers, f"签到点击第 {round_no}/3 轮：未找到可点击控件，等待后重新定位")
             await page.wait_for_timeout(min(150, opts.poll_interval_ms))
             continue
         text, locator, kind = control
+        log(helpers, f"签到点击第 {round_no}/3 轮：定位到「{text}」（{kind}）")
         try:
             element = await locator.element_handle()
         except Exception:
             element = None
         try:
             await locator.scroll_into_view_if_needed(timeout=opts.click_timeout)
-        except Exception:
-            pass
+            log(helpers, f"签到点击第 {round_no}/3 轮：控件已滚动到可视区域")
+        except Exception as exc:
+            log(helpers, f"签到点击第 {round_no}/3 轮：滚动定位未完成（{type(exc).__name__}），继续点击")
         strategies = (
             ("normal", lambda: locator.click(timeout=opts.click_timeout)),
             ("force", lambda: locator.click(timeout=opts.click_timeout, force=True)),
@@ -961,12 +1164,18 @@ async def click_checkin(
             ("dom", lambda: locator.evaluate("el => el.click()")),
         )
         for strategy, do_click in strategies:
+            log(helpers, f"签到点击第 {round_no}/3 轮：尝试 {strategy} 策略")
             try:
                 await do_click()
+                log(helpers, f"签到点击第 {round_no}/3 轮：{strategy} 策略已触发点击事件")
                 return text, element or locator, kind, strategy
-            except Exception:
-                continue
+            except Exception as exc:
+                message = str(exc).replace("\r", " ").replace("\n", " ").strip()[:120]
+                reason = f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+                log(helpers, f"签到点击第 {round_no}/3 轮：{strategy} 策略失败（{reason}）")
+        log(helpers, f"签到点击第 {round_no}/3 轮：全部点击策略失败，准备重新定位控件")
         await page.wait_for_timeout(min(200, max(50, opts.poll_interval_ms)))
+    log(helpers, "签到按钮点击流程结束：3 轮均未能触发点击")
     return "", None, "", ""
 
 
@@ -1135,7 +1344,10 @@ async def click_and_confirm(
                 return
             if any(bad in lowered for bad in spec.response_exclude):
                 return
-            response.update({"status": int(getattr(item, "status", 0) or 0), "url": url})
+            captured_status = int(getattr(item, "status", 0) or 0)
+            response.update({"status": captured_status, "url": url})
+            safe_url = url.split("?", 1)[0]
+            log(helpers, f"捕获签到 POST 响应：HTTP {captured_status or 0} {safe_url}")
             # 监听回调是同步的，读 body 必须 await：丢到后台任务里，轮询循环
             # 每轮都会看一眼是否已填好额度。
             body_tasks.append(asyncio.ensure_future(_read_amounts(item)))
@@ -1151,7 +1363,7 @@ async def click_and_confirm(
 
     try:
         clicked_text, clicked_locator, clicked_kind, strategy = await click_checkin(
-            page, opts, initial=control
+            page, helpers, opts, initial=control
         )
         if clicked_text:
             log(helpers, f"已点击签到控件「{clicked_text}」（{clicked_kind} / {strategy}），等待完成信号...")
@@ -1193,6 +1405,7 @@ async def click_and_confirm(
         while True:
             status = int(response.get("status", 0) or 0)
             if 200 <= status < 300:
+                log(helpers, f"签到完成信号：监听到签到接口成功响应 HTTP {status}")
                 await _settle_amounts()
                 return helpers.success(
                     spec.success_message,
@@ -1206,6 +1419,7 @@ async def click_and_confirm(
                     awarded=response.get("reward"),
                 )
             if status == 409:
+                log(helpers, "签到完成信号：接口返回 HTTP 409，服务端确认今日已签到")
                 # 409 = 今日已签到。响应体里可能就带余额；没有则补一次只读状态查询，
                 # 让「已签到」结果也能报出余额，与 API 路径的产出保持一致。
                 await _settle_amounts()
@@ -1229,6 +1443,7 @@ async def click_and_confirm(
                     quota=balance,
                 )
             if status >= 400:
+                log(helpers, f"签到完成信号：接口返回错误 HTTP {status}")
                 return helpers.error(
                     f"签到接口返回错误（HTTP {status}）",
                     {
@@ -1244,6 +1459,7 @@ async def click_and_confirm(
             # 先渲染出来）。不带的话同一次签到会因命中的信号不同而时有时无额度。
             for text in opts.success_texts:
                 if await visible_text(page, text):
+                    log(helpers, f"签到完成信号：页面出现成功文案「{text}」")
                     await _settle_amounts()
                     return helpers.success(
                         spec.success_message,
@@ -1255,6 +1471,7 @@ async def click_and_confirm(
             already_control = await find_already_control(page, spec, opts)
             if already_control:
                 text, _locator = already_control
+                log(helpers, f"签到完成信号：按钮切换为已签到状态「{text}」")
                 await _settle_amounts()
                 return helpers.success(
                     spec.success_message,
@@ -1265,6 +1482,7 @@ async def click_and_confirm(
 
             matched_already = await find_already_text(page, spec, opts)
             if matched_already:
+                log(helpers, f"签到完成信号：页面出现已签到文案「{matched_already}」")
                 await _settle_amounts()
                 return helpers.success(
                     spec.success_message,
@@ -1274,6 +1492,7 @@ async def click_and_confirm(
                 )
 
             if clicked_locator is not None and not await is_visible(clicked_locator):
+                log(helpers, "签到完成信号：原签到控件已从页面隐藏/移除")
                 await _settle_amounts()
                 return helpers.success(
                     spec.success_message,
@@ -1287,6 +1506,11 @@ async def click_and_confirm(
             remaining_ms = max(1, int((deadline - loop.time()) * 1000))
             await page.wait_for_timeout(min(opts.poll_interval_ms, remaining_ms))
 
+        log(
+            helpers,
+            f"签到确认超时：点击后等待 {opts.completion_timeout_ms}ms，"
+            "未捕获接口响应、成功文案、已签到状态或按钮消失",
+        )
         screenshot = await helpers.screenshot(f"{spec.screenshot_prefix}-after-click.png")
         return helpers.error(
             "已点击签到按钮，但未检测到签到完成信号",
@@ -1361,17 +1585,21 @@ async def wait_for_checkin_control(
         already = await find_already_control(page, spec, opts)
         if already:
             text, _locator = already
+            log(helpers, f"签到按钮扫描结果：发现已签到控件「{text}」，无需点击")
             return None, await _already(text, spec.signal_already_control)
         matched_text = await find_already_text(page, spec, opts)
         if matched_text:
+            log(helpers, f"签到按钮扫描结果：页面已显示「{matched_text}」，无需点击")
             return None, await _already(matched_text, spec.signal_already_text)
 
         control = await find_checkin_control(page, opts)
         if control is not None:
-            log(helpers, f"发现可点击签到控件「{control[0]}」")
+            log(helpers, f"签到按钮扫描结果：发现可点击控件「{control[0]}」（{control[2]}）")
             return control, None
 
         if loop.time() >= deadline:
+            snapshot = format_control_snapshot(await page_control_snapshot(page))
+            log(helpers, f"签到按钮等待超时，当前页面控件快照：{snapshot}")
             return None, None
         remaining_ms = max(1, int((deadline - loop.time()) * 1000))
         await page.wait_for_timeout(min(opts.poll_interval_ms * 3, remaining_ms))
@@ -1403,7 +1631,8 @@ async def run_checkin_flow(
             login_detail=login_detail,
         )
 
-    await add_init_script(context, preflight_init_script())
+    stash_key = session_stash_key(spec.login_reset_sentinel)
+    await add_init_script(context, preflight_init_script(stash_key))
     await navigate_and_settle(page, helpers, start_target, opts)
 
     login_attempted = False
@@ -1415,11 +1644,22 @@ async def run_checkin_flow(
         await navigate_and_settle(page, helpers, start_target, opts)
         if await on_login_page(page):
             # URL/密码框只是 SPA 路由表现，服务端 /auth/me 才是认证权威。
-            # 某些部署登录成功后不会立即离开 /login，但 localStorage token 已可正常
-            # 调签到接口；此时不能反向覆盖刚刚成立的 authenticated() 结论。
-            if await authenticated(page, origin):
+            # 站点前端的 401 拦截器会主动清空 localStorage 并跳回 /login；而这枚
+            # token 在登录后已经通过 /auth/me。先从暗格恢复，再做认证复查，不能把
+            # 前端自己的登出动作反向覆盖为「账密登录失败」。
+            log(helpers, "登录后仍停留/返回登录页，开始复查并恢复可能被前端清空的登录态")
+            verified = await authenticated(page, origin)
+            restored = False
+            if not verified:
+                restored = await restore_session(page, stash_key)
+                if restored:
+                    log(helpers, "检测到 auth_token 被前端清空，已从登录态暗格恢复并重新验证")
+                verified = await authenticated(page, origin)
+            if verified:
                 log(helpers, "登录已由 /auth/me 验证，但页面路由仍显示登录页，直接使用有效 token 接口签到")
                 login_detail["login_route_stale"] = True
+                if restored:
+                    login_detail["login_state_restored"] = True
                 await persist_state(context, site)
                 return await api_fallback(
                     page,

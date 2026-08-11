@@ -160,6 +160,7 @@ class FakePage:
         form_available: bool = True,
         login_result: dict[str, Any] | None = None,
         login_route_stale: bool = False,
+        wipe_auth_after_login_check: bool = False,
         api_checkin_result: dict[str, Any] | None = None,
         api_checkin_result_after_login: dict[str, Any] | None = None,
         status_result: dict[str, Any] | None = None,
@@ -194,6 +195,9 @@ class FakePage:
             "message": "",
         }
         self.login_route_stale = login_route_stale
+        self.wipe_auth_after_login_check = wipe_auth_after_login_check
+        self.auth_checks_after_login = 0
+        self.auth_wiped_once = False
         self.login_requests: list[list[Any]] = []
         self.prepared_login: list[str] = []
         # Turnstile 真实鼠标点击相关。
@@ -216,7 +220,28 @@ class FakePage:
                 return self.api_checkin_result_after_login
             return self.api_checkin_result
         if "/api/v1/auth/me" in expression:
+            if self._login_succeeded:
+                self.auth_checks_after_login += 1
+                if (
+                    self.wipe_auth_after_login_check
+                    and self.auth_checks_after_login >= 2
+                    and not self.auth_wiped_once
+                ):
+                    self.authenticated = False
+                    self.auth_wiped_once = True
             return bool(self.authenticated)
+        if "querySelectorAll('button, a[href]" in expression:
+            # 页面控件快照（失败诊断用）；必须先于 getBoundingClientRect 判断，
+            # 因为快照 JS 内部也调用 getBoundingClientRect。
+            return [
+                {
+                    "tag": "button",
+                    "text": element.text,
+                    "disabled": element.disabled,
+                    "hidden": not element.visible,
+                }
+                for element in self.elements
+            ]
         if "getBoundingClientRect" in expression:
             # 定位 Turnstile widget box；无 token 需求时也返回一个可点区域。
             return {"x": 100.0, "y": 200.0, "width": 300.0, "height": 65.0}
@@ -238,6 +263,13 @@ class FakePage:
                     self.has_password_field = False
                     self.url = "https://example.invalid/check-in"
             return self.login_result
+        if (
+            "__x100_login_reset_session" in expression
+            and "sessionStorage.removeItem('auth_expired')" in expression
+        ):
+            # 模拟站点前端清空 AUTH_KEYS 后，脚本从暗格恢复 auth_token。
+            self.authenticated = True
+            return True
         if "__x100_login_reset" in expression:
             # sentinel 的开/关不改变认证态，只是控制 init script 是否清理。
             return True
@@ -712,6 +744,10 @@ def test_password_login_fallback_signs_in_then_checks_in(monkeypatch: Any) -> No
         "/login?redirect=/check-in",
         "/check-in",
     ]
+    assert any("开始点击签到按钮" in line for line in helpers.logs)
+    assert any("尝试 normal 策略" in line for line in helpers.logs)
+    assert any("捕获签到 POST 响应：HTTP 200" in line for line in helpers.logs)
+    assert any("签到完成信号：监听到签到接口成功响应 HTTP 200" in line for line in helpers.logs)
     rendered = repr(result)
     assert email not in rendered
     assert password not in rendered
@@ -745,6 +781,40 @@ def test_verified_login_with_stale_login_route_uses_api_checkin(monkeypatch: Any
     assert result["detail"]["login_route_stale"] is True
     assert result["detail"]["completion_signal"] == "api_fallback"
     assert any("页面路由仍显示登录页" in line for line in helpers.logs)
+    assert page.api_checkin_requests == 1
+
+
+def test_login_state_wiped_after_verified_login_is_restored(monkeypatch: Any) -> None:
+    """复现线上故障：首次 auth/me 成功，导航后前端清空 token 并退回 /login。"""
+    monkeypatch.setenv("X100LABS_EMAIL", "user@example.test")
+    monkeypatch.setenv("X100LABS_PASSWORD", "not-a-real-password")
+    page = FakePage(
+        [],
+        url="https://example.invalid/login?redirect=/check-in",
+        authenticated=False,
+        has_password_field=True,
+        turnstile_token="real-turnstile-token",
+        login_result={"ok": True, "status": 200, "two_factor": False, "message": ""},
+        login_route_stale=True,
+        wipe_auth_after_login_check=True,
+        api_checkin_result_after_login={
+            "ok": True,
+            "status": 200,
+            "already": False,
+            "code": "0",
+            "message": "",
+        },
+    )
+
+    result, helpers = _run(page, {"button_wait_ms": 1, "poll_interval_ms": 20})
+
+    assert result["status"] == "success"
+    assert result["detail"]["auth_verified"] is True
+    assert result["detail"]["login_state_restored"] is True
+    assert result["detail"]["completion_signal"] == "api_fallback"
+    assert page.auth_wiped_once is True
+    assert page.authenticated is True
+    assert any("auth_token 被前端清空" in line for line in helpers.logs)
     assert page.api_checkin_requests == 1
 
 

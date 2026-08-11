@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import sys
+from collections import deque
 import traceback
 import uuid
 from copy import deepcopy
@@ -834,23 +835,109 @@ def reconcile_token_cache(rows: list[SiteRow]) -> int:
 
 
 # ── 剪贴板导入 / 凭据导出 ────────────────────────────────────────────────────
+_TOKEN_KEY_NAMES = frozenset({"accesstoken", "authtoken", "refreshtoken", "rttoken"})
+
+
+def _compact_token_key(value: Any) -> str:
+    """令牌键名归一化：auth_token/authToken/AUTH-TOKEN 均视为同一键。"""
+    return "".join(char for char in str(value or "").casefold() if char.isalnum())
+
+
+def _clean_embedded_token(value: Any) -> str:
+    """清除 JSON 字符串展示时混入的换行/缩进；Bearer/rt token 不允许含空白。"""
+    if not isinstance(value, str):
+        return ""
+    return "".join(value.split())
+
+
+def _extract_json_tokens(root: Any) -> dict[str, str]:
+    """从任意 JSON 结构广度优先提取 access/refresh token。
+
+    除普通 dict/list 外，也解析看起来像 JSON 的字符串值，兼容 localStorage 导出、
+    DevTools 存储快照及多层包装。相同类型优先采用标准键 access_token / refresh_token，
+    找不到时再采用 auth_token / rt_token；节点预算防止异常大 JSON 长时间遍历。
+    """
+    found: dict[str, str] = {}
+    queue: deque[Any] = deque([root])
+    remaining = 10000
+    decoded_strings = 0
+
+    while queue and remaining > 0:
+        node = queue.popleft()
+        remaining -= 1
+        if isinstance(node, dict):
+            for key, value in node.items():
+                normalized = _compact_token_key(key)
+                if normalized in _TOKEN_KEY_NAMES and normalized not in found:
+                    token = _clean_embedded_token(value)
+                    if token:
+                        found[normalized] = token
+                if isinstance(value, (dict, list)):
+                    queue.append(value)
+                elif isinstance(value, str):
+                    stripped = value.strip()
+                    if (
+                        decoded_strings < 128
+                        and len(stripped) <= 2_000_000
+                        and stripped.startswith(("{", "["))
+                    ):
+                        try:
+                            nested = json.loads(stripped)
+                        except json.JSONDecodeError:
+                            continue
+                        decoded_strings += 1
+                        queue.append(nested)
+        elif isinstance(node, list):
+            queue.extend(node)
+        elif isinstance(node, str):
+            stripped = node.strip()
+            if stripped.startswith(("{", "[")) and len(stripped) <= 2_000_000:
+                try:
+                    queue.append(json.loads(stripped))
+                except json.JSONDecodeError:
+                    pass
+
+    access = found.get("accesstoken") or found.get("authtoken") or ""
+    refresh = found.get("refreshtoken") or found.get("rttoken") or ""
+    return {
+        key: value
+        for key, value in (("access_token", access), ("refresh_token", refresh))
+        if value
+    }
+
+
 def parse_clipboard_site(text: str) -> tuple[dict[str, Any] | None, str]:
-    """剪贴板 JSON → 站点字段子集；返回 (data, error)。"""
+    """剪贴板 JSON → 站点字段子集；返回 (data, error)。
+
+    原有站点/collector JSON 识别逻辑保持不变；额外从完整 JSON 的任意层级提取
+    auth_token/access_token 与 rt_token/refresh_token，映射到 GUI 标准字段。
+    """
     if not (text or "").strip():
         return None, "剪贴板为空。"
     try:
-        data = json.loads(text)
+        root = json.loads(text)
     except json.JSONDecodeError:
         return None, "剪贴板内容不是合法 JSON。"
+
+    extracted_tokens = _extract_json_tokens(root)
+    data = root
     if isinstance(data, list) and data:
         data = data[0]
     if not isinstance(data, dict):
+        if extracted_tokens:
+            return extracted_tokens, ""
         return None, "JSON 结构无法识别。"
     if "name" not in data and "base_url" not in data and len(data) == 1:
         key, value = next(iter(data.items()))
         if isinstance(value, dict):
             value.setdefault("name", key)
             data = value
+
+    # 原有顶层标准字段优先；只有缺少 access_token / refresh_token 时才补递归结果。
+    for key, value in extracted_tokens.items():
+        current = data.get(key)
+        if not isinstance(current, str) or not current.strip():
+            data[key] = value
     return data, ""
 
 
