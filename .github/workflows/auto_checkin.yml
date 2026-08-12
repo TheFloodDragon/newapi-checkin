@@ -136,6 +136,8 @@ jobs:
       - name: 执行签到
         id: checkin
         env:
+          # hCaptcha 视觉配置统一从一个 JSON Secret 注入，避免拆分多个环境变量。
+          HCAPTCHA_VISION_CONFIG: ${{ secrets.HCAPTCHA_VISION_CONFIG }}
           # 仅手动触发且勾选 run_all 时为 true；定时触发该值为空，保持沿用当天已完成结果。
           RUN_ALL: ${{ inputs.run_all }}
         run: |

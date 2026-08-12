@@ -23,7 +23,9 @@ from __future__ import annotations
 
 _LAZY = (
     "bypass",
+    "hcaptcha",
     "oauth_providers",
+    "openai_vision",
     "popups",
     "script_helpers",
     "script_loader",

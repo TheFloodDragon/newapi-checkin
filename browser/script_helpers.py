@@ -124,7 +124,18 @@ class ScriptHelpers:
     async def wait_text(self, text: str, timeout: int = 10000) -> bool:
         return await self.visible_text(text, timeout=timeout)
 
-    async def screenshot(self, name: str = "browser_script.png") -> str:
+    async def screenshot(
+        self,
+        name: str = "browser_script.png",
+        *,
+        target: Any = None,
+        full_page: bool = True,
+    ) -> str:
+        """保存页面或指定 Locator 截图。
+
+        验证码失败诊断优先传入挑战容器 ``target``，避免把整个已登录页面和账户信息
+        持久化到磁盘；普通脚本截图保持原有 full_page 行为。
+        """
         self.screenshot_dir.mkdir(parents=True, exist_ok=True)
         safe_name = re.sub(r"[^\w.\-\u4e00-\u9fff]+", "_", name or "browser_script.png").strip("._")
         if not safe_name:
@@ -133,7 +144,10 @@ class ScriptHelpers:
             safe_name += ".png"
         path = self.screenshot_dir / safe_name
         try:
-            await self.page.screenshot(path=str(path), full_page=True)
+            if target is not None:
+                await target.screenshot(path=str(path), type="png")
+            else:
+                await self.page.screenshot(path=str(path), full_page=full_page)
         except Exception:
             return ""
         return str(path)
@@ -175,6 +189,53 @@ class ScriptHelpers:
             self.log(f"验证码识别不确定（{result.text or '空'}），建议换一张重试")
             return ""
         return result.text
+
+    async def solve_hcaptcha(
+        self,
+        *,
+        trigger: Any = None,
+        options: Any = None,
+    ) -> Any:
+        """在当前 Page 内完成 hCaptcha，返回 ``HCaptchaSolveResult``。
+
+        默认配置来自 ``script_args.hcaptcha``；调用方传入 dict 时只覆盖指定项，
+        也可直接传 ``HCaptchaOptions``。API Key 只允许由环境变量提供，即使站点配置
+        误写了 api_key 也会被忽略，避免凭据进入 ACCOUNTS/Secret 导出和脚本结果。
+        """
+        from browser import hcaptcha
+
+        script_args = getattr(self.site, "script_args", {}) if self.site is not None else {}
+        nested = script_args.get("hcaptcha") if isinstance(script_args, dict) else None
+        merged = dict(nested) if isinstance(nested, dict) else {}
+        if "api_key" in merged:
+            merged.pop("api_key", None)
+            self.log("hCaptcha 配置中的 api_key 已忽略；模型密钥只允许通过环境变量提供")
+
+        resolved: Any
+        if options is None:
+            resolved = merged
+        elif isinstance(options, dict):
+            overrides = dict(options)
+            if "api_key" in overrides:
+                overrides.pop("api_key", None)
+                self.log("hCaptcha 调用参数中的 api_key 已忽略；模型密钥只允许通过环境变量提供")
+            merged.update(overrides)
+            resolved = merged
+        else:
+            resolved = options
+
+        async def _screenshot(name: str, *, target: Any = None) -> str:
+            if target is None:
+                return await self.screenshot(name)
+            return await self.screenshot(name, target=target, full_page=False)
+
+        return await hcaptcha.solve(
+            self.page,
+            trigger=trigger,
+            options=resolved,
+            log=self.log,
+            screenshot=_screenshot,
+        )
 
     def success(
         self,

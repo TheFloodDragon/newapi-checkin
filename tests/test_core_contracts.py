@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from types import ModuleType
+import subprocess
+import sys
 
 import accounts_store
 import providers
@@ -67,6 +69,24 @@ def test_worker_event_roundtrip_is_versioned_and_redacted() -> None:
     assert restored.site == "s"
     assert restored.fields == {"access_token": "<redacted>", "attempt": 2}
     assert WorkerEvent.from_line("ordinary diagnostic") is None
+
+
+def test_browser_package_keeps_hcaptcha_modules_lazy() -> None:
+    code = (
+        "import json, sys; import browser; "
+        "print(json.dumps({"
+        "'hcaptcha': 'browser.hcaptcha' in sys.modules, "
+        "'vision': 'browser.openai_vision' in sys.modules, "
+        "'playwright': 'playwright' in sys.modules}))"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.stdout.strip() == '{"hcaptcha": false, "vision": false, "playwright": false}'
 
 
 def test_loaded_script_contract_resolves_supported_hooks() -> None:

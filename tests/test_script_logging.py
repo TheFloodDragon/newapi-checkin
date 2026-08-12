@@ -56,6 +56,12 @@ def test_log_masks_bearer_and_jwt() -> None:
     assert "eyJhbGciOiJIUzI1NiJ9" not in text
 
 
+def test_log_masks_hcaptcha_model_api_key() -> None:
+    secret = "sk-hcaptcha-super-secret-123456"
+    text = _capture(lambda: _helpers().log(f"HCAPTCHA_OPENAI_API_KEY={secret}"))
+    assert secret not in text
+
+
 def test_log_ignores_blank_messages() -> None:
     assert _capture(lambda: _helpers().log("")) == ""
     assert _capture(lambda: _helpers().log("   ")) == ""
