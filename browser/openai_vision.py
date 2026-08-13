@@ -14,6 +14,7 @@ import base64
 import json
 import math
 import os
+import random
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -315,6 +316,8 @@ class OpenAIVisionClient:
             config = VisionClientConfig.from_options(resolved_options, environ=environ)
         self.config = config
         self._transport = transport or provider_base.http_request
+        # 瞬时网关故障（424/429/5xx）的最大尝试次数。视觉分析是纯读操作，重放安全。
+        self.max_attempts = 3
 
     async def analyze(
         self,
@@ -417,19 +420,33 @@ class OpenAIVisionClient:
             media_type=media_type or "image/png",
         )
 
+    # 网关侧的瞬时故障码。424 是本仓库实测最常见的一种（上游账号短暂不可用，
+    # 报 "Upstream service temporarily unavailable"），紧接着重试往往就成功；
+    # 429/5xx 同属瞬时。视觉分析是纯读操作，重放没有副作用。
+    _TRANSIENT_STATUSES = frozenset({424, 425, 429, 500, 502, 503, 504})
+
     async def _request(self, payload: dict[str, Any]) -> Any:
-        try:
-            return await self._send(payload)
-        except Exception as exc:
-            status = _status_of(exc)
-            if status == 400 and "response_format" in payload:
-                fallback = dict(payload)
-                fallback.pop("response_format", None)
-                try:
-                    return await self._send(fallback)
-                except Exception as retry_exc:
-                    raise self._safe_transport_error(retry_exc) from None
-            raise self._safe_transport_error(exc) from None
+        attempts = max(1, int(self.max_attempts))
+        last: BaseException | None = None
+        for attempt in range(attempts):
+            try:
+                return await self._send(payload)
+            except Exception as exc:
+                last = exc
+                status = _status_of(exc)
+                if status == 400 and "response_format" in payload:
+                    fallback = dict(payload)
+                    fallback.pop("response_format", None)
+                    try:
+                        return await self._send(fallback)
+                    except Exception as retry_exc:
+                        raise self._safe_transport_error(retry_exc) from None
+                if status not in self._TRANSIENT_STATUSES or attempt >= attempts - 1:
+                    raise self._safe_transport_error(exc) from None
+                # 退避 + 抖动：上游刚被打满时立刻重试只会再撞一次。
+                delay = min(4.0, 0.6 * (2**attempt))
+                await asyncio.sleep(delay + random.uniform(0, delay * 0.25))
+        raise self._safe_transport_error(last or RuntimeError("vision request failed"))
 
     async def _send(self, payload: dict[str, Any]) -> Any:
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")

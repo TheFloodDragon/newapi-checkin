@@ -351,6 +351,48 @@ def test_response_format_400_retries_without_response_format() -> None:
     assert "response_format" not in requests[1]
 
 
+def test_transient_gateway_error_is_retried_but_fatal_error_is_not() -> None:
+    """424/429/5xx 是网关瞬时故障，紧接着重试常能成功；4xx 确定性错误不得重放。
+
+    实测端点频繁返回 424 "Upstream service temporarily unavailable"，单次即放弃
+    会让整轮挑战作废、还得从复选框重来。视觉分析是纯读操作，重放没有副作用。
+    """
+    ok = '{"challenge_type":"point","confidence":0.9,"points":[{"x":1,"y":2}]}'
+
+    def make(sequence):
+        state = {"n": 0}
+
+        def transport(_url: str, **_kwargs):
+            index = state["n"]
+            state["n"] += 1
+            item = sequence[min(index, len(sequence) - 1)]
+            if isinstance(item, int):
+                raise ApiError(item, {"error": {"message": "upstream"}}, "x")
+            return _response(item)
+
+        return transport, state
+
+    config = lambda: VisionClientConfig(  # noqa: E731
+        api_key="k", base_url="https://v.example/v1", model="m"
+    )
+
+    transport, state = make([424, ok])
+    plan = asyncio.run(OpenAIVisionClient(config(), transport=transport).analyze(b"x"))
+    assert plan.challenge_type == "point"
+    assert state["n"] == 2, "瞬时 424 后应重试"
+
+    transport, state = make([424])
+    with pytest.raises(VisionClientError) as caught:
+        asyncio.run(OpenAIVisionClient(config(), transport=transport).analyze(b"x"))
+    assert caught.value.status == 424
+    assert state["n"] == 3, "重试必须有上限"
+
+    transport, state = make([401])
+    with pytest.raises(VisionClientError):
+        asyncio.run(OpenAIVisionClient(config(), transport=transport).analyze(b"x"))
+    assert state["n"] == 1, "确定性错误不得重放"
+
+
 def test_non_400_error_does_not_retry_or_leak_key() -> None:
     calls = 0
 

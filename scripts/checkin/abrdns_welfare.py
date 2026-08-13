@@ -324,11 +324,15 @@ async def _submit_checkin(page: Any, helpers: Any) -> dict[str, Any]:
             # 没返回就会被切断，结果报成「单轮求解超时」而掩盖真实错误（如 HTTP 424）。
             solve = await helpers.solve_hcaptcha(
                 options={
+                    # 各段之和必须留在 total 之内，否则总超时会在跑完计划轮次前
+                    # 触发（旧配比 40 + 2×(75+12) = 214s > 180s，结构上必然撞墙）。
+                    # 现：40 + 2×(75+12) = 214 仍偏大，故把 total 提到 300s，
+                    # 并由 helpers 按脚本剩余时间再收敛。
                     "presence_timeout_ms": 20_000,
                     "widget_mount_timeout_ms": 40_000,
                     "post_action_wait_ms": 12_000,
                     "round_timeout_ms": 75_000,
-                    "total_timeout_ms": 180_000,
+                    "total_timeout_ms": 300_000,
                 }
             )
         except Exception as exc:

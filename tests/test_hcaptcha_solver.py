@@ -695,6 +695,37 @@ def test_widget_present_but_iframe_not_ready_keeps_waiting() -> None:
     assert any("尚未就绪" in line for line in logs)
 
 
+def test_slow_humanized_move_cannot_stall_the_click() -> None:
+    """拟人化移动必须有上限：否则点击开销会吃光预算，表现为「总体超时、零次调用」。
+
+    实测 Camoufox humanize=True 下单次 mouse.move 耗时 17.7s，两段共 29.5s，
+    而 humanize=False 仅 0.2s。这里用慢速 mouse 复现并确认落点点击仍然发生。
+    """
+    import time as _time
+
+    class SlowMouse(FakeMouse):
+        async def move(self, x: float, y: float, *, steps: int = 1) -> None:
+            await asyncio.sleep(30)
+            self.events.append(("move", x, y, steps))
+
+    frame = challenge_frame(tiles=1)
+    page = FakePage(FakeFrame("https://site.invalid", children=[frame]))
+    page.mouse = SlowMouse()
+    solver = HCaptchaSolver(page, options=options(move_timeout_ms=200))
+    target = FakeLocator(box={"x": 10, "y": 20, "width": 40, "height": 40})
+
+    began = _time.monotonic()
+    clicked = run(solver._mouse_click_locator(target, label="测试元素"))
+    elapsed = _time.monotonic() - began
+    run(solver.aclose())
+
+    assert clicked is True, "移动超时不应导致点击失败"
+    assert elapsed < 5, f"移动未受上限约束，耗时 {elapsed:.1f}s"
+    # 落点点击必须真实发生，且坐标为元素中心
+    clicks = [e for e in page.mouse.events if e[0] == "click"]
+    assert clicks == [("click", 30.0, 40.0)]
+
+
 def test_irrelevant_junk_field_does_not_invalidate_a_valid_plan() -> None:
     """实测第 2 轮：drag 答案正确，但模型附带了与 drag 无关的垃圾 tile_indices
     （{"source": [...], "target": [...]}），旧实现因此丢掉整份正确答案。

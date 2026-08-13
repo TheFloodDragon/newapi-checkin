@@ -131,6 +131,9 @@ class HCaptchaOptions:
     widget_mount_timeout_ms: int = 25_000
     post_action_wait_ms: int = 5_000
     poll_interval_ms: int = 200
+    # 单次拟人化 mouse.move 的上限。Camoufox humanize=True 下实测一次移动可达
+    # 17s，两段就是 29.5s；不设上限会让点击开销吃光整轮预算。
+    move_timeout_ms: int = 3_000
     confidence_threshold: float = 0.65
     frame_depth: int = 4
 
@@ -172,6 +175,7 @@ class HCaptchaOptions:
             widget_mount_timeout_ms=max(0, int(self.widget_mount_timeout_ms)),
             post_action_wait_ms=max(0, int(self.post_action_wait_ms)),
             poll_interval_ms=max(10, int(self.poll_interval_ms)),
+            move_timeout_ms=max(100, int(self.move_timeout_ms)),
             confidence_threshold=min(1.0, max(0.0, float(self.confidence_threshold))),
             frame_depth=min(4, max(0, int(self.frame_depth))),
         )
@@ -204,6 +208,11 @@ class HCaptchaSolveResult:
 
 
 async def _maybe_await(value: Any) -> Any:
+    return await value if inspect.isawaitable(value) else value
+
+
+async def _as_coro(value: Any) -> Any:
+    """把「可能是同步返回值」的调用结果包装成可被 wait_for 约束的协程。"""
     return await value if inspect.isawaitable(value) else value
 
 
@@ -904,14 +913,41 @@ class HCaptchaSolver:
         x = box["x"] + box["width"] / 2
         y = box["y"] + box["height"] / 2
         try:
-            await _maybe_await(self.page.mouse.move(x - 24, y - 8, steps=5))
-            await _maybe_await(self.page.mouse.move(x, y, steps=7))
+            # approach + settle 两段移动用于反检测（轨迹不能是瞬移直线）。但在
+            # Camoufox humanize=True 下，单次 mouse.move 会做拟人化缓动：实测这
+            # 两段耗时 17.7s + 11.8s = 29.5s，而 humanize=False 时只需 0.2s
+            # （100 倍差距）。求解器每次点击都要付这笔钱，仅复选框 + 图块 + 提交
+            # 就能在任何模型调用之前吃光总预算，表现为「总体求解超时、零次调用」。
+            #
+            # 因此给移动本身加超时：超时即放弃缓动、直接落点点击。轨迹仍非瞬移
+            # （已经历部分缓动），但不会再让预算失控。
+            await self._humanized_move(x - 24, y - 8, steps=5)
+            await self._humanized_move(x, y, steps=7)
             await _maybe_await(self.page.mouse.click(x, y))
             self._safe_log(f"已点击{label}：({x:.0f}, {y:.0f})")
             return True
         except Exception as exc:
             self._safe_log(f"点击{label}异常：{type(exc).__name__}")
             return False
+
+    async def _humanized_move(self, x: float, y: float, *, steps: int) -> None:
+        """执行一次拟人化移动，超过 move_timeout_ms 即放弃缓动。
+
+        放弃缓动不等于失败：后续 click 用绝对坐标，落点不受影响。
+        """
+        budget = self.options.move_timeout_ms / 1000
+        try:
+            await asyncio.wait_for(
+                asyncio.ensure_future(_as_coro(self.page.mouse.move(x, y, steps=steps))),
+                timeout=budget,
+            )
+        except (TimeoutError, asyncio.TimeoutError):
+            self._safe_log(f"拟人化移动超过 {budget:.1f}s，改用直接落点")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # 移动失败不致命，交给后续 click 用绝对坐标兜底。
+            pass
 
     async def _click_checkbox(self, frame: Any) -> bool:
         locator = await _first_locator(frame, _CHECKBOX_SELECTORS)
