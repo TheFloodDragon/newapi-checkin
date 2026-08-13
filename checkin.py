@@ -215,6 +215,12 @@ def _stabilize_oauth_state_basis(site: SiteConfig) -> None:
 
     这里把 state basis 固定为「该站点配置本身」（配置里通常为空），使
     脚本续存与下次读取使用同一基线；配置真的填了 browser_state 时行为不变。
+
+    只有 ``CHECKIN_CONFIGURED_BROWSER_STATE`` 确实存在时才改写 basis：该变量由父进程
+    按站点配置导出，是「配置值」的唯一可信来源。直接用 CLI 跑单站时它不存在，此时
+    site.browser_state 就是用户显式传入的配置值，构造期算出的 basis 已经正确；若把
+    缺失当成空串强行改写，写出的 basis 会与读取侧永不相等，反而制造出本函数要防的
+    「续存的登录态永远用不上」。
     """
     from providers import token_cache
 
@@ -225,7 +231,9 @@ def _stabilize_oauth_state_basis(site: SiteConfig) -> None:
     context = getattr(site, "runtime_credentials", None)
     if context is None:
         return
-    configured_state = os.environ.get("CHECKIN_CONFIGURED_BROWSER_STATE", "")
+    configured_state = os.environ.get("CHECKIN_CONFIGURED_BROWSER_STATE")
+    if configured_state is None:
+        return
     context.state_basis = token_cache.credential_basis(browser_state=configured_state, group="state")
 
 

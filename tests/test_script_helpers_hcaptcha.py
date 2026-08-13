@@ -135,6 +135,64 @@ def test_helper_supplies_existing_screenshot_callback(monkeypatch: Any, tmp_path
     assert value == "saved/hcaptcha-failed.png"
 
 
+def test_budget_is_clamped_to_remaining_script_time(monkeypatch: Any, tmp_path: Path) -> None:
+    """求解预算不得超过脚本剩余时间，否则脚本会被强杀、丢掉结论与截图。"""
+    import time as _time
+
+    seen: dict[str, Any] = {}
+
+    async def fake_solve(_page: Any, **kwargs: Any) -> Any:
+        seen.update(kwargs)
+        return SimpleNamespace(ok=False, status="failed", message="x")
+
+    monkeypatch.setattr(hcaptcha, "solve", fake_solve)
+    helper = _helpers(tmp_path)
+    # 只剩 50s：预留 20s 收尾后可用 30s，远小于脚本请求的 180s。
+    helper._deadline = _time.monotonic() + 50
+
+    asyncio.run(helper.solve_hcaptcha(options={"total_timeout_ms": 180_000, "widget_mount_timeout_ms": 40_000}))
+
+    assert seen["options"]["total_timeout_ms"] <= 30_000
+    # 单段不得吃掉全部总预算。
+    assert seen["options"]["widget_mount_timeout_ms"] <= seen["options"]["total_timeout_ms"]
+
+
+def test_budget_untouched_without_deadline(monkeypatch: Any, tmp_path: Path) -> None:
+    seen: dict[str, Any] = {}
+
+    async def fake_solve(_page: Any, **kwargs: Any) -> Any:
+        seen.update(kwargs)
+        return SimpleNamespace(ok=True, status="success", message="ok")
+
+    monkeypatch.setattr(hcaptcha, "solve", fake_solve)
+    helper = _helpers(tmp_path)
+
+    asyncio.run(helper.solve_hcaptcha(options={"total_timeout_ms": 180_000}))
+
+    assert seen["options"]["total_timeout_ms"] == 180_000
+
+
+def test_exhausted_deadline_disables_solver_to_keep_conclusion(monkeypatch: Any, tmp_path: Path) -> None:
+    """剩余时间不足时应禁用求解并让脚本给出明确结论，而不是耗尽后被强杀。"""
+    import time as _time
+
+    seen: dict[str, Any] = {}
+
+    async def fake_solve(_page: Any, **kwargs: Any) -> Any:
+        seen.update(kwargs)
+        return SimpleNamespace(ok=False, status="not_configured", message="disabled")
+
+    monkeypatch.setattr(hcaptcha, "solve", fake_solve)
+    logs: list[str] = []
+    helper = _helpers(tmp_path, log=logs.append)
+    helper._deadline = _time.monotonic() + 3
+
+    asyncio.run(helper.solve_hcaptcha(options={"total_timeout_ms": 180_000}))
+
+    assert seen["options"]["enabled"] is False
+    assert any("剩余时间不足" in line for line in logs)
+
+
 def test_helper_failure_screenshot_prefers_page_clip(monkeypatch: Any, tmp_path: Path) -> None:
     captured: dict[str, Any] = {}
     page_calls: list[dict[str, Any]] = []

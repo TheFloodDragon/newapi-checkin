@@ -44,6 +44,9 @@ class VerificationMode(StrEnum):
 class ResultStatus(StrEnum):
     SUCCESS = "success"
     ALREADY_DONE = "already_done"
+    # 站点活动未开放（未到开始时间/已结束/管理员停用）。属于告警而非失败：
+    # 不是本工具或账号的问题，重试不会改变结果，因此不计入失败也不触发重跑。
+    NOT_OPEN = "not_open"
     NEED_LOGIN = "need_login"
     NEED_VERIFICATION = "need_verification"
     NEED_CONFIG = "need_config"
@@ -64,6 +67,7 @@ class StatusMeta:
 STATUS_META: dict[ResultStatus, StatusMeta] = {
     ResultStatus.SUCCESS: StatusMeta("成功", "✅", True, "✅ 签到成功", "✅ 成功"),
     ResultStatus.ALREADY_DONE: StatusMeta("已领取", "🎁", True, "🎁 今日已完成", "🎁 已完成"),
+    ResultStatus.NOT_OPEN: StatusMeta("未开放", "🚧", True, "🚧 活动未开放", "🚧 未开放"),
     ResultStatus.NEED_LOGIN: StatusMeta(
         "登录失效", "🔐", gui_label="🔐 登录失效", compact_label="🔐 失效", failure_prefix="登录失效"
     ),

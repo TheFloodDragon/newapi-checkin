@@ -68,6 +68,35 @@ def test_configured_state_keeps_its_own_basis(monkeypatch) -> None:
     )
 
 
+def test_direct_cli_run_without_parent_env_keeps_explicit_state_basis(monkeypatch, tmp_path) -> None:
+    """CLI 直跑单站（父进程变量不存在）时，显式 --browser-state 的 basis 不能被改写。
+
+    把「变量缺失」当成空串会写出与读取侧永不相等的 basis，反而制造出这个函数
+    本该防住的「续存的登录态永远用不上」。
+    """
+    cache = tmp_path / "token_cache.json"
+    monkeypatch.setattr(token_cache, "CACHE_PATH", cache)
+    monkeypatch.delenv("CHECKIN_CONFIGURED_BROWSER_STATE", raising=False)
+    site = accounts_store.runtime_site_from_mapping(
+        _oauth_script_site(browser_state="EXPLICIT-CLI-STATE"),
+        cache_policy="ignore",
+    )
+    expected = token_cache.credential_basis(browser_state="EXPLICIT-CLI-STATE", group="state")
+
+    checkin._stabilize_oauth_state_basis(site)
+
+    assert site.runtime_credentials.state_basis == expected
+    # 续存后必须能被同一份显式配置读回，否则等于缓存从未生效。
+    assert token_cache.save_site_tokens(site, "", "", browser_state="SESSION-SNAPSHOT", path=cache)
+    resolved = token_cache.resolve_cached_credentials(
+        site.name,
+        site.base_url,
+        configured_browser_state="EXPLICIT-CLI-STATE",
+        path=cache,
+    )
+    assert resolved.get("browser_state") == "SESSION-SNAPSHOT"
+
+
 def test_non_oauth_script_site_basis_is_untouched(monkeypatch) -> None:
     monkeypatch.setenv("CHECKIN_CONFIGURED_BROWSER_STATE", "")
     site = accounts_store.runtime_site_from_mapping(

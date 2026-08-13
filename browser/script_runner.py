@@ -8,6 +8,7 @@ import asyncio
 import inspect
 import os
 import sys
+import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -297,6 +298,9 @@ async def run_browser_script(
         )
         return result
 
+    # 脚本硬超时的截止点：从启动浏览器起算，交给 helpers 让长耗时步骤自行收敛预算，
+    # 避免被 asyncio.wait_for 强杀而丢掉结论与诊断（表现为 rc=124「执行超时」）。
+    script_deadline = time.monotonic() + timeout
     try:
         log(f"启动浏览器执行脚本 {site_view.script}（超时 {timeout}s）")
         browser, context = await bypass.launch_camoufox(
@@ -332,7 +336,7 @@ async def run_browser_script(
             log("OAuth 登录已回跳站点")
             await popups.dismiss_popups(page)
 
-        helpers = ScriptHelpers(page, context, site_view, SCREENSHOT_DIR, log=log)
+        helpers = ScriptHelpers(page, context, site_view, SCREENSHOT_DIR, log=log, deadline=script_deadline)
 
         log("开始执行脚本 run()")
         maybe_result = run_func(page, context, site_view, helpers)
@@ -347,7 +351,10 @@ async def run_browser_script(
         screenshot = ""
         if page is not None:
             try:
-                helpers = ScriptHelpers(page, getattr(page, "context", None), site_view, SCREENSHOT_DIR, log=log)
+                helpers = ScriptHelpers(
+                    page, getattr(page, "context", None), site_view, SCREENSHOT_DIR, log=log,
+                    deadline=script_deadline,
+                )
                 screenshot = await helpers.screenshot("browser_script-timeout.png")
             except Exception:
                 screenshot = ""
@@ -381,7 +388,10 @@ async def run_browser_script(
         screenshot = ""
         if page is not None:
             try:
-                helpers = ScriptHelpers(page, getattr(page, "context", None), site_view, SCREENSHOT_DIR, log=log)
+                helpers = ScriptHelpers(
+                    page, getattr(page, "context", None), site_view, SCREENSHOT_DIR, log=log,
+                    deadline=script_deadline,
+                )
                 screenshot = await helpers.screenshot("browser_script-error.png")
             except Exception:
                 screenshot = ""

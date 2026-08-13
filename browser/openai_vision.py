@@ -34,9 +34,17 @@ Transport = Callable[..., Any]
 class VisionClientError(RuntimeError):
     """A configuration, transport, response, or validation error."""
 
-    def __init__(self, message: str, *, status: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int | None = None,
+        model_output: Mapping[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.status = status
+        # 校验失败时携带模型实际返回，便于调用方完整记录（不含密钥）。
+        self.model_output = model_output
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +169,8 @@ class VisionPlan:
     tile_indices: list[int] = field(default_factory=list)
     points: list[dict[str, int | float]] = field(default_factory=list)
     drags: list[dict[str, dict[str, int | float]]] = field(default_factory=list)
+    # 模型未经规范化的原始返回，仅用于日志与排障；不参与任何动作判定。
+    raw_output: Mapping[str, Any] | None = field(default=None, repr=False)
 
     def model_dump(self) -> dict[str, Any]:
         """Return the action shape consumed by the browser hCaptcha solver."""
@@ -200,24 +210,43 @@ class VisionPlan:
         if not 0 <= confidence <= 1:
             raise VisionClientError("confidence must be between 0 and 1")
 
+        # 与本次挑战类型无关、且结构本身就不是动作数组的字段，不得否决一个有效计划：
+        # 实测模型在 drag 计划里附带了垃圾 tile_indices（{"source": [...],
+        # "target": [...]}），旧实现因此报 "tile_indices must be an array"
+        # 丢掉了正确的 drags。
+        #
+        # 但「模型确实填了合法数组、只是值越界」必须照旧严格报错——那是真实的坐标
+        # 错误，静默丢弃会让越界答案变成「没有动作」，掩盖问题。因此只对「非数组」
+        # 的无关字段宽容。
+        def _relevant(name: str) -> bool:
+            return challenge_type in ("unknown", name)
+
         raw_tiles = value.get("tile_indices", [])
-        if not isinstance(raw_tiles, list):
-            raise VisionClientError("tile_indices must be an array")
         tile_indices: list[int] = []
-        for index in raw_tiles:
-            if isinstance(index, bool) or not isinstance(index, int) or index < 1:
-                raise VisionClientError("tile_indices must contain 1-based positive integers")
-            tile_indices.append(index)
+        if isinstance(raw_tiles, list):
+            # 合法数组一律严格校验，与 points/drags 同一标准。
+            for index in raw_tiles:
+                if isinstance(index, bool) or not isinstance(index, int) or index < 1:
+                    raise VisionClientError("tile_indices must contain 1-based positive integers")
+                tile_indices.append(index)
+        elif _relevant("grid"):
+            raise VisionClientError("tile_indices must be an array")
 
         raw_points = value.get("points", [])
-        if not isinstance(raw_points, list):
+        points: list[dict[str, int | float]] = []
+        if isinstance(raw_points, list):
+            # 合法数组一律严格校验：越界坐标必须报错，不能静默丢成「无动作」。
+            points = [_point(point, "points") for point in raw_points]
+        elif _relevant("point"):
             raise VisionClientError("points must be an array")
-        points = [_point(point, "points") for point in raw_points]
 
-        raw_drags = value.get("drags", [])
-        if not isinstance(raw_drags, list):
+        # elements/paths 是模型实测用过的等价键名，与 hcaptcha._validated_answer 保持一致。
+        raw_drags = value.get("drags", value.get("elements", value.get("paths", [])))
+        drags: list[dict[str, dict[str, int | float]]] = []
+        if isinstance(raw_drags, list):
+            drags = [_drag(drag) for drag in raw_drags]
+        elif _relevant("drag"):
             raise VisionClientError("drags must be an array")
-        drags = [_drag(drag) for drag in raw_drags]
 
         action_count = len(tile_indices) + len(points) + len(drags)
         if action_count > max_actions:
@@ -228,7 +257,19 @@ class VisionPlan:
             "drag": bool(drags),
             "unknown": action_count == 0,
         }
-        if not expected_nonempty[challenge_type]:
+        # 模型常把类型填成 unknown 却给出明确且唯一的动作（实测 mimo-v2.5 对
+        # "click the TWO crosses" 返回 challenge_type=unknown + 两个正确 points，
+        # confidence=1）。此时动作本身已无歧义，按动作反推类型即可，直接拒绝等于
+        # 丢掉一个正确答案。仅在「恰好一种动作非空」时推断，多种并存仍视为矛盾。
+        if challenge_type == "unknown" and action_count:
+            present = [
+                name
+                for name, values in (("grid", tile_indices), ("point", points), ("drag", drags))
+                if values
+            ]
+            if len(present) == 1:
+                challenge_type = present[0]
+        if not expected_nonempty.get(challenge_type, bool(action_count)):
             raise VisionClientError(f"{challenge_type} plan has no matching actions")
         if challenge_type != "grid" and tile_indices:
             raise VisionClientError("tile_indices are only valid for grid plans")
@@ -281,10 +322,30 @@ class OpenAIVisionClient:
         *,
         prompt: str | None = None,
         media_type: str = "image/png",
+        grid_image: bytes | bytearray | memoryview | str | None = None,
     ) -> VisionPlan:
-        """Analyze an image and return a validated action plan."""
+        """Analyze an image and return a validated action plan.
+
+        grid_image 为可选的坐标网格辅助图（与主图同尺寸、叠加 0-1000 刻度）。
+        提供时会作为第二张图一并发送，模型可照刻度读数而非凭空估算坐标。
+        """
 
         image_url = _image_url(image, media_type)
+        content: list[dict[str, Any]] = [
+            {"type": "text", "text": prompt or "Determine the correct actions for this challenge."},
+            {"type": "image_url", "image_url": {"url": image_url}},
+        ]
+        if grid_image:
+            content.append(
+                {
+                    "type": "text",
+                    "text": (
+                        "The second image is the same challenge with a 0-1000 coordinate grid "
+                        "overlaid. Read the axis ticks to report exact coordinates."
+                    ),
+                }
+            )
+            content.append({"type": "image_url", "image_url": {"url": _image_url(grid_image, media_type)}})
         payload = {
             "model": self.config.model,
             "messages": [
@@ -297,13 +358,7 @@ class OpenAIVisionClient:
                         "All coordinates are normalized integers or numbers from 0 through 1000."
                     ),
                 },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt or "Determine the correct actions for this challenge."},
-                        {"type": "image_url", "image_url": {"url": image_url}},
-                    ],
-                },
+                {"role": "user", "content": content},
             ],
             "temperature": 0,
             "response_format": {"type": "json_object"},
@@ -311,7 +366,17 @@ class OpenAIVisionClient:
         response = await self._request(payload)
         content = _response_content(response)
         parsed = parse_json_object(content)
-        return VisionPlan.from_mapping(parsed, max_actions=self.config.max_actions)
+        try:
+            plan = VisionPlan.from_mapping(parsed, max_actions=self.config.max_actions)
+        except VisionClientError as exc:
+            # 校验失败与传输失败必须可区分：把模型实际返回附在异常上，调用方才能
+            # 记录「模型判成什么、缺什么动作」，而不是笼统的「未返回结构化结果」。
+            exc.model_output = parsed
+            raise
+        # 成功路径同样保留原文：规范化会丢掉模型的附加字段（如解释性 note），
+        # 而这些字段在判断「模型为何这样答」时往往是唯一线索。
+        plan.raw_output = parsed
+        return plan
 
     async def plan(
         self,
@@ -332,6 +397,8 @@ class OpenAIVisionClient:
         task_type: str = "unknown",
         tiles: Any = None,
         round: int | None = None,
+        grid_image: bytes | bytearray | memoryview | str | None = None,
+        media_type: str = "image/png",
         **_ignored: Any,
     ) -> VisionPlan:
         """Adapt an hCaptcha round request to the generic vision endpoint."""
@@ -343,7 +410,12 @@ class OpenAIVisionClient:
             details.append(f"The displayed grid has {len(tiles)} numbered tiles.")
         if round is not None:
             details.append(f"This is challenge round {round}.")
-        return await self.analyze(image, prompt=" ".join(details) or None)
+        return await self.analyze(
+            image,
+            prompt=" ".join(details) or None,
+            grid_image=grid_image,
+            media_type=media_type or "image/png",
+        )
 
     async def _request(self, payload: dict[str, Any]) -> Any:
         try:
@@ -387,9 +459,41 @@ class OpenAIVisionClient:
             raise
 
     def _safe_transport_error(self, exc: BaseException) -> VisionClientError:
+        """把传输异常转成不含密钥的 VisionClientError，但保留服务端诊断信息。
+
+        服务端正文常是唯一能说明原因的线索（如「Upstream access forbidden」与
+        「Service temporarily unavailable」对应完全不同的处置）。之前一律丢弃，
+        排障时只能看到「request failed」。这里附带正文摘要，调用方输出前会再过
+        一次 mask_secrets；请求头与 api_key 从不出现在异常里。
+        """
         status = _status_of(exc)
         suffix = f" (HTTP {status})" if status is not None else ""
-        return VisionClientError(f"OpenAI vision request failed{suffix}", status=status)
+        detail = ""
+        payload = getattr(exc, "payload", None)
+        if payload is not None:
+            try:
+                rendered = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+            except Exception:
+                rendered = str(payload)
+            rendered = " ".join(str(rendered).split())
+            if rendered:
+                detail = f": {rendered[:400]}"
+        if not detail:
+            message = " ".join(str(getattr(exc, "message", "") or "").split())
+            if message:
+                detail = f": {message[:400]}"
+        # 服务端可能把请求里的 key 原样回显在错误正文里，必须在构造异常时就脱敏：
+        # 异常文本会流向日志、结果 detail 与用户界面，不能依赖每个调用方各自处理。
+        if detail:
+            try:
+                from mask_utils import mask_secrets
+
+                detail = mask_secrets(detail)
+            except Exception:
+                detail = ""
+            if self.config.api_key and self.config.api_key in detail:
+                detail = detail.replace(self.config.api_key, "***")
+        return VisionClientError(f"OpenAI vision request failed{suffix}{detail}", status=status)
 
 
 # A concise public name, while retaining the explicit provider name for callers.
@@ -496,6 +600,14 @@ def _number(value: Any, label: str) -> int | float:
 
 
 def _point(value: Any, label: str) -> dict[str, int | float]:
+    # 允许 [x, y] 与再包一层的 {"point": [x, y]}：实测 mimo-v2.5 返回
+    # {"start": {"point": [850, 390]}}，不解包会把正确答案判为无效。
+    if isinstance(value, Mapping):
+        for key in ("point", "coordinates", "coordinate", "position", "pos"):
+            if key in value:
+                return _point(value.get(key), label)
+    elif isinstance(value, (list, tuple)) and len(value) == 2:
+        value = {"x": value[0], "y": value[1]}
     if not isinstance(value, Mapping):
         raise VisionClientError(f"{label} entries must be objects with x and y")
     x = _number(value.get("x"), f"{label}.x")

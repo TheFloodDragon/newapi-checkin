@@ -121,6 +121,7 @@ class FakeHelpers:
         self.page = page
         self.site = SimpleNamespace(base_url="https://checkin.new-api.abrdns.com")
         self.logs: list[str] = []
+        self.solve_options: dict[str, Any] = {}
 
     def resolve_url(self, path: str = "/") -> str:
         return "https://checkin.new-api.abrdns.com" + (path if path.startswith("/") else "/" + path)
@@ -131,7 +132,8 @@ class FakeHelpers:
     async def screenshot(self, name: str, **_kwargs: Any) -> str:
         return f".cache-checkin/{name}"
 
-    async def solve_hcaptcha(self) -> Any:
+    async def solve_hcaptcha(self, *, trigger: Any = None, options: Any = None) -> Any:
+        self.solve_options = dict(options or {})
         return SimpleNamespace(
             status="failed",
             message="未取得验证令牌",
@@ -204,6 +206,9 @@ def test_run_returns_need_verification_when_hcaptcha_is_present() -> None:
     assert result["detail"]["captcha_status"] == "failed"
     assert page.submitted is False
     assert all("token" not in line.casefold() for line in helpers.logs)
+    # 本站 widget 挂载慢，必须传入放宽后的挂载预算，否则会在挑战出现前就超时。
+    assert helpers.solve_options["widget_mount_timeout_ms"] >= 40_000
+    assert helpers.solve_options["presence_timeout_ms"] >= 20_000
 
 
 def test_run_never_submits_logout_form_as_checkin() -> None:

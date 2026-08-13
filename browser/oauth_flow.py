@@ -406,7 +406,15 @@ def attach_oauth_completion_messages(
 
 
 def is_oauth_callback_url(url: str, base_url: str) -> bool:
-    """严格按同源与回跳特征判断 URL，拒绝字符串包含造成的伪回跳。"""
+    """严格按同源与回跳特征判断 URL，拒绝字符串包含造成的伪回跳。
+
+    「已经回到本站」本身就是回跳成立的充分条件：同源是硬门槛（provider 页永远
+    不同源，不会被误判）。不能再额外要求 /console、/oauth 或 code= —— 有的站点
+    callback 成功后直接 302 到业务页并把 code 去掉，实测 ABR 福利站落在
+    `/checkin`，旧判据因此把一次成功的回跳报成「未跳回站点」。
+
+    唯一要排除的是仍停留在本站的登录入口：那说明还没真正走完授权。
+    """
     if not same_origin(url, base_url):
         return False
     try:
@@ -414,8 +422,13 @@ def is_oauth_callback_url(url: str, base_url: str) -> bool:
     except ValueError:
         return False
     path = parsed.path.casefold()
-    query = parsed.query.casefold()
-    return "/console" in path or "/oauth" in path or any(part.partition("=")[0] == "code" for part in query.split("&"))
+    # 本站的登录入口不算回跳终点（例如 /auth/<provider>/login）。
+    if path.endswith("/login") or "/auth/" in path:
+        query = parsed.query.casefold()
+        has_code = any(part.partition("=")[0] == "code" for part in query.split("&"))
+        # 但带 code 的 /auth/... 正是标准 callback，必须视为回跳成功。
+        return has_code
+    return True
 
 
 async def finish_oauth_authorization(
@@ -478,7 +491,17 @@ async def finish_oauth_authorization(
                 content_lower = (await page.content()).lower()
             except Exception:
                 pass
-            if "just a moment" in content_lower or "cloudflare" in content_lower:
+            # 不能用裸 "cloudflare" 判定：受 CF 保护的正常页面（如 Linux DO 授权页）
+            # 都含该字样，会把「停在授权页」误报成「被 Cloudflare 拦截」，掩盖真实原因。
+            # 统一复用 bypass 的挑战页判据（标题 / CF 容器 / 可见拦截文案）。
+            title_lower = ""
+            try:
+                title_lower = (await page.title() or "").lower()
+            except Exception:
+                pass
+            from .bypass import _is_cf_challenge
+
+            if _is_cf_challenge(title_lower, content_lower):
                 result["cloudflare"] = True
                 log("OAuth 被 Cloudflare 拦截")
             else:

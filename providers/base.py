@@ -392,7 +392,15 @@ class CheckinReward:
 
 
 class ApiError(Exception):
-    def __init__(self, status: int | None, payload: Any, message: str, *, transient: bool = False) -> None:
+    def __init__(
+        self,
+        status: int | None,
+        payload: Any,
+        message: str,
+        *,
+        transient: bool = False,
+        not_open: bool = False,
+    ) -> None:
         super().__init__(message)
         self.status = status
         self.payload = payload
@@ -400,6 +408,10 @@ class ApiError(Exception):
         # transient=True 表示瞬时性错误（网络失败/超时/429/5xx），可安全重试；
         # 非 JSON 响应、Cloudflare 验证、4xx 等确定性错误为 False。
         self.transient = transient
+        # not_open=True 表示站点活动本身未开放（未到开始时间/已结束/管理员停用）。
+        # 这不是本工具或账号的故障，重试也不会变好，因此归为告警而非失败：
+        # 站点没开门时不应产生「签到失败」噪声，也不该让整批任务退出码变红。
+        self.not_open = not_open
 
 
 # ── 站点适配器抽象接口 ─────────────────────────────────────────────────────────

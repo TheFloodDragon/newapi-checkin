@@ -335,6 +335,31 @@ def test_oauth_callback_url_requires_exact_origin() -> None:
     assert not is_oauth_callback_url("https://site.invalid/login?next=code", base_url)
 
 
+def test_oauth_callback_accepts_business_page_landing() -> None:
+    """同源业务页就是有效回跳终点，不能强求 /console、/oauth 或 code=。
+
+    有的站点 callback 成功后直接 302 到业务页并去掉 code：实测 ABR 福利站落在
+    `/checkin`，旧判据把这次成功回跳报成「OAuth 未跳回站点，停在 <站点地址>」，
+    进而误判为登录失败。
+    """
+    base_url = "https://checkin.new-api.abrdns.com"
+
+    assert is_oauth_callback_url("https://checkin.new-api.abrdns.com/checkin", base_url)
+    assert is_oauth_callback_url("https://checkin.new-api.abrdns.com/", base_url)
+    # 仍停在本站登录入口说明授权没走完，不算回跳
+    assert not is_oauth_callback_url(
+        "https://checkin.new-api.abrdns.com/auth/linuxdo/login", base_url
+    )
+    # 但带 code 的 /auth/... 正是标准 callback
+    assert is_oauth_callback_url(
+        "https://checkin.new-api.abrdns.com/auth/linuxdo/callback?code=abc", base_url
+    )
+    # 跨源（仍在 provider 授权页）永远不算回跳
+    assert not is_oauth_callback_url(
+        "https://connect.linux.do/oauth2/authorize?client_id=x", base_url
+    )
+
+
 def test_site_success_message_extracts_agentrouter_toast() -> None:
     assert session._site_success_message(["dom: 登录成功，今日奖励已发放"]) == "登录成功，今日奖励已发放"
     assert session._site_success_message(["dom: 今日已签到", "dom: 登录失败，请重试"]) == ""

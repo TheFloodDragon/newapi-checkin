@@ -316,7 +316,21 @@ async def _submit_checkin(page: Any, helpers: Any) -> dict[str, Any]:
     if await _challenge_present(page) and not token:
         helpers.log("ABR 福利站检测到 hCaptcha，调用内置视觉求解器")
         try:
-            solve = await helpers.solve_hcaptcha()
+            # 本站 widget 挂载偏慢（实测 iframe 内部控件需 10s 以上才可定位），
+            # 放宽挂载与单轮预算，否则会在挑战出现前就按超时结束。
+            #
+            # round_timeout_ms 必须容纳一次完整视觉请求：求解器按「单轮预算 - 1s」
+            # 设置模型请求超时，若单轮预算小于视觉端点自身超时（默认 60s），远端还
+            # 没返回就会被切断，结果报成「单轮求解超时」而掩盖真实错误（如 HTTP 424）。
+            solve = await helpers.solve_hcaptcha(
+                options={
+                    "presence_timeout_ms": 20_000,
+                    "widget_mount_timeout_ms": 40_000,
+                    "post_action_wait_ms": 12_000,
+                    "round_timeout_ms": 75_000,
+                    "total_timeout_ms": 180_000,
+                }
+            )
         except Exception as exc:
             solve = None
             solve_detail["solver_error"] = type(exc).__name__

@@ -25,12 +25,25 @@ class ScriptHelpers:
         site: Any,
         screenshot_dir: Path,
         log: Any = None,
+        deadline: float | None = None,
     ) -> None:
         self.page = page
         self.context = context
         self.site = site
         self.screenshot_dir = screenshot_dir
         self._log = log
+        # 脚本硬超时的 monotonic 截止点。solve_hcaptcha 等长耗时 helper 会据此收敛
+        # 自己的预算：脚本被 asyncio.wait_for 强杀时不会留下任何结论与截图，
+        # 只能得到「执行超时」，比明确的 need_verification 少掉全部诊断信息。
+        self._deadline = deadline
+
+    def remaining_seconds(self) -> float | None:
+        """距脚本硬超时的剩余秒数；未提供 deadline 时返回 None。"""
+        if self._deadline is None:
+            return None
+        import time as _time
+
+        return max(0.0, self._deadline - _time.monotonic())
 
     def log(self, message: str) -> None:
         """输出一行脚本进度日志（stderr，已脱敏）。
@@ -190,6 +203,44 @@ class ScriptHelpers:
             return ""
         return result.text
 
+    def _clamp_hcaptcha_budget(self, resolved: Any) -> Any:
+        """把求解预算压到脚本剩余时间内，留出收尾余量。
+
+        站点脚本按「这一步最多值得等多久」给预算，但它不知道 OAuth / Cloudflare
+        已经花掉多少。若总预算超过脚本硬超时，asyncio.wait_for 会直接强杀脚本：
+        结果退化成「执行超时（rc=124）」，丢掉本可返回的 need_verification、失败
+        阶段与挑战截图。这里按剩余时间收敛，保证求解器能自己走完并留下结论。
+        """
+        remaining = self.remaining_seconds()
+        if remaining is None or not isinstance(resolved, dict):
+            return resolved
+        # 预留收尾时间：截图落盘、结果组装与登录态续存都在脚本返回后进行。
+        budget_ms = int(max(0.0, remaining - 20) * 1000)
+        if budget_ms <= 0:
+            self.log("剩余时间不足，跳过 hCaptcha 求解以保留明确结论")
+            clamped = dict(resolved)
+            clamped["enabled"] = False
+            return clamped
+        clamped = dict(resolved)
+        total = int(clamped.get("total_timeout_ms") or 0)
+        if total <= 0 or total > budget_ms:
+            clamped["total_timeout_ms"] = budget_ms
+            if total > budget_ms:
+                self.log(f"hCaptcha 总预算按脚本剩余时间收敛为 {budget_ms // 1000}s")
+        # 单段预算不得超过总预算，否则第一段就能吃掉全部时间。
+        for key, share in (
+            ("widget_mount_timeout_ms", 0.5),
+            ("presence_timeout_ms", 0.3),
+            # 单轮可以占满剩余总预算：宁可只跑一轮但让视觉请求跑完，也不要把它
+            # 中途切断而把真实错误（如 HTTP 424）掩盖成「单轮求解超时」。
+            ("round_timeout_ms", 1.0),
+        ):
+            value = int(clamped.get(key) or 0)
+            cap = int(clamped["total_timeout_ms"] * share)
+            if value > cap:
+                clamped[key] = cap
+        return clamped
+
     async def solve_hcaptcha(
         self,
         *,
@@ -223,6 +274,8 @@ class ScriptHelpers:
             resolved = merged
         else:
             resolved = options
+
+        resolved = self._clamp_hcaptcha_budget(resolved)
 
         async def _screenshot(name: str, *, target: Any = None) -> str:
             if target is None:

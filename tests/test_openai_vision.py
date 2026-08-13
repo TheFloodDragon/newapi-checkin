@@ -130,6 +130,55 @@ def test_parse_direct_fenced_and_first_balanced_json() -> None:
         parse_json_object("no object here")
 
 
+def test_irrelevant_field_is_ignored_but_relevant_field_still_validated() -> None:
+    """无关字段不得否决有效计划；该类型真正需要的字段仍严格校验。"""
+    plan = VisionPlan.from_mapping(
+        {
+            "challenge_type": "drag",
+            "confidence": 0.95,
+            "drags": [{"end": {"x": 431, "y": 830}, "start": {"x": 753, "y": 475}}],
+            "tile_indices": {"source": [8, 5], "target": [4, 8]},
+        }
+    )
+    assert plan.drags == [{"start": {"x": 753, "y": 475}, "end": {"x": 431, "y": 830}}]
+    assert plan.tile_indices == []
+
+    with pytest.raises(VisionClientError, match="tile_indices must be an array"):
+        VisionPlan.from_mapping(
+            {"challenge_type": "grid", "confidence": 1, "tile_indices": {"a": 1}}
+        )
+    with pytest.raises(VisionClientError, match="1-based positive integers"):
+        VisionPlan.from_mapping(
+            {"challenge_type": "grid", "confidence": 1, "tile_indices": [0, -1]}
+        )
+
+
+def test_plan_accepts_elements_key_and_nested_point_wrappers() -> None:
+    """与 hcaptcha 层一致：接受 elements 键与嵌套 point，但仍校验范围。"""
+    plan = VisionPlan.from_mapping(
+        {
+            "challenge_type": "drag",
+            "confidence": 0.95,
+            "elements": [{"end": {"point": [550, 350]}, "start": {"point": [850, 390]}}],
+        }
+    )
+    assert plan.drags == [{"start": {"x": 850, "y": 390}, "end": {"x": 550, "y": 350}}]
+
+    point_plan = VisionPlan.from_mapping(
+        {"challenge_type": "point", "confidence": 0.9, "points": [{"point": [181, 761]}]}
+    )
+    assert point_plan.points == [{"x": 181, "y": 761}]
+
+    with pytest.raises(VisionClientError, match="between 0 and 1000"):
+        VisionPlan.from_mapping(
+            {
+                "challenge_type": "drag",
+                "confidence": 1,
+                "elements": [{"start": {"point": [1200, 10]}, "end": {"point": [5, 5]}}],
+            }
+        )
+
+
 def test_plan_validation_accepts_supported_actions() -> None:
     plan = VisionPlan.from_mapping(
         {
@@ -207,6 +256,48 @@ def test_client_uses_to_thread_and_builds_chat_completions_request(monkeypatch: 
     assert request["response_format"] == {"type": "json_object"}
     image = request["messages"][1]["content"][1]["image_url"]["url"]
     assert image == "data:image/png;base64,cG5n"
+
+
+def test_grid_image_is_sent_as_second_image_with_instruction() -> None:
+    captured: list[dict] = []
+
+    def transport(_url: str, **kwargs):
+        captured.append(json.loads(kwargs["body"]))
+        return _response('{"challenge_type":"point","confidence":0.9,"points":[{"x":10,"y":20}]}')
+
+    client = OpenAIVisionClient(
+        VisionClientConfig(api_key="k", base_url="https://v.example/v1", model="m"),
+        transport=transport,
+    )
+    plan = asyncio.run(
+        client.solve_hcaptcha(image=b"main", task_type="point", grid_image=b"grid", round=1)
+    )
+
+    assert plan.challenge_type == "point"
+    content = captured[0]["messages"][1]["content"]
+    images = [part["image_url"]["url"] for part in content if part["type"] == "image_url"]
+    assert len(images) == 2
+    assert images[0] == "data:image/png;base64,bWFpbg=="
+    assert images[1] == "data:image/png;base64,Z3JpZA=="
+    texts = " ".join(part["text"] for part in content if part["type"] == "text")
+    assert "coordinate grid" in texts
+
+
+def test_analyze_without_grid_image_sends_single_image() -> None:
+    captured: list[dict] = []
+
+    def transport(_url: str, **kwargs):
+        captured.append(json.loads(kwargs["body"]))
+        return _response('{"challenge_type":"unknown","confidence":0}')
+
+    client = OpenAIVisionClient(
+        VisionClientConfig(api_key="k", base_url="https://v.example/v1", model="m"),
+        transport=transport,
+    )
+    asyncio.run(client.analyze(b"only"))
+
+    content = captured[0]["messages"][1]["content"]
+    assert sum(1 for part in content if part["type"] == "image_url") == 1
 
 
 def test_hcaptcha_adapter_and_keyword_configuration() -> None:

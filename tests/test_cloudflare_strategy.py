@@ -28,12 +28,20 @@ from browser import bypass, turnstile
         # 新版 managed challenge：旧词表漏判
         ("Just a moment...", "<html><body>Verifying you are human</body></html>", True),
         ("", "<html><body>Enable JavaScript and cookies to continue</body></html>", True),
-        ("", '<html><body><script src="/cdn-cgi/challenge-platform/x.js"></script></body></html>', True),
         ("", '<html><body><div id="cf-chl-widget"></div></body></html>', True),
         ("Attention Required!", "<html><body>blocked</body></html>", True),
+        ("", '<html><body><div class="cf-wrapper">blocked</div></body></html>', True),
+        ("", '<html><body><form id="challenge-form"></form></body></html>', True),
         # 正常页面不得误判
         ("Dashboard", "<html><body>welcome back</body></html>", False),
         ("极速蹬", "<html><body>余额 $1.00</body></html>", False),
+        # challenge-platform 是「受 CF 保护」的环境脚本，正常页面同样会加载它，
+        # 不能作为挑战页判据。实测 Linux DO 授权页（title="authorize - linux do
+        # connect"，无任何 CF 容器）仅因含该脚本就被误报「检测到 Cloudflare 挑战」，
+        # 白跑一轮 ClickSolver 并掩盖真实失败原因。
+        ("authorize - linux do connect", '<html><body><script src="/cdn-cgi/challenge-platform/x.js"></script></body></html>', False),
+        # 含 hCaptcha widget 的正常业务页同样不得误判
+        ("签到 - 福利站", '<html><body><iframe src="https://newassets.hcaptcha.com/captcha/v1/x"></iframe></body></html>', False),
     ],
 )
 def test_cf_challenge_detection_covers_modern_variants(title: str, html: str, expected: bool) -> None:

@@ -197,18 +197,35 @@ CF_TITLE_PATTERNS = (
     "access denied",
     "please wait",
 )
+# 仅出现在「真正的挑战/拦截页」上的结构标记。挑战页会渲染 CF 自己的容器与表单，
+# 正常页面即使受 Cloudflare 保护也不会有这些节点。
+CF_STRUCTURAL_PATTERNS = (
+    "cf-wrapper",
+    "cf-error-details",
+    "id=\"challenge-form\"",
+    "id='challenge-form'",
+    "cf-challenge-running",
+    "cf_chl_opt",
+    "_cf_chl",
+    "cf-chl-bypass",
+    # 挑战 widget 的实际容器节点（区别于 challenge-platform 那类环境脚本）。
+    "cf-chl-widget",
+    "id=\"cf-challenge\"",
+    "class=\"cf-challenge\"",
+)
+# 挑战页会对用户显示的可见文案。这些是人读得懂的拦截提示，正常页面不会出现。
+#
+# 已移除 "challenges.cloudflare.com" / "challenge-platform" / "cf-challenge" /
+# "cf-chl"：它们同样出现在「受 Cloudflare 保护的正常页面」以及 Turnstile/hCaptcha
+# widget 的常规脚本里。实测 Linux DO 授权页（title="authorize - linux do connect"，
+# 无任何 CF 容器）仅因含 challenge-platform 就被判为挑战页，于是日志报「检测到
+# Cloudflare 挑战」并白跑一轮 ClickSolver。结构性标记见 CF_STRUCTURAL_PATTERNS。
 CF_CONTENT_PATTERNS = (
     "checking your browser",
     "verifying you are human",
     "verify you are human",
     "needs to review the security of your connection",
     "enable javascript and cookies to continue",
-    "challenges.cloudflare.com",
-    "challenge-platform",
-    "cf-challenge",
-    "cf-chl",
-    "cf_chl_opt",
-    "_cf_chl",
 )
 
 # 交互式 Turnstile widget 特征：这类挑战不会自动签发令牌，必须用真实鼠标点击
@@ -235,8 +252,15 @@ async def _page_signals(page) -> tuple[str, str]:
 
 
 def _is_cf_challenge(title_low: str, content_low: str) -> bool:
-    """页面是否为 Cloudflare 挑战/拦截页。"""
+    """页面是否为 Cloudflare 挑战/拦截页。
+
+    判据必须是「这是一张挑战页」，而不是「这页和 Cloudflare 有关」：受 CF 保护的
+    正常页面同样会加载 challenge-platform 之类的脚本。三类证据任一成立即判定：
+    标题为已知拦截标题、渲染了 CF 自己的容器/表单、或显示了面向用户的拦截文案。
+    """
     if any(pattern in title_low for pattern in CF_TITLE_PATTERNS):
+        return True
+    if any(pattern in content_low for pattern in CF_STRUCTURAL_PATTERNS):
         return True
     return any(pattern in content_low for pattern in CF_CONTENT_PATTERNS)
 
