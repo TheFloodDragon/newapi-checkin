@@ -133,3 +133,36 @@ def test_helper_supplies_existing_screenshot_callback(monkeypatch: Any, tmp_path
     value = asyncio.run(captured["screenshot"]("hcaptcha-failed.png"))
 
     assert value == "saved/hcaptcha-failed.png"
+
+
+def test_helper_failure_screenshot_prefers_page_clip(monkeypatch: Any, tmp_path: Path) -> None:
+    captured: dict[str, Any] = {}
+    page_calls: list[dict[str, Any]] = []
+
+    async def fake_solve(_page: Any, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return SimpleNamespace(ok=False, status="failed", message="failed")
+
+    async def page_screenshot(**kwargs: Any) -> None:
+        page_calls.append(kwargs)
+        Path(kwargs["path"]).write_bytes(b"png")
+
+    async def bounding_box() -> dict[str, float]:
+        return {"x": 10, "y": 20, "width": 300, "height": 180}
+
+    monkeypatch.setattr(hcaptcha, "solve", fake_solve)
+    helper = _helpers(tmp_path)
+    helper.page = SimpleNamespace(screenshot=page_screenshot)
+    target = SimpleNamespace(bounding_box=bounding_box)
+
+    asyncio.run(helper.solve_hcaptcha())
+    value = asyncio.run(captured["screenshot"]("hcaptcha-failed.png", target=target))
+
+    assert value == str(tmp_path / "hcaptcha-failed.png")
+    assert page_calls == [
+        {
+            "path": str(tmp_path / "hcaptcha-failed.png"),
+            "type": "png",
+            "clip": {"x": 10.0, "y": 20.0, "width": 300.0, "height": 180.0},
+        }
+    ]

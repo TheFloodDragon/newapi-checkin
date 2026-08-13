@@ -56,6 +56,32 @@ def _script_handles_oauth(site: SiteConfig) -> bool:
     return bool(value)
 
 
+def _should_try_api_first(site: SiteConfig) -> tuple[bool, str]:
+    """判断是否值得先跑纯 API 首选阶段。
+
+    返回 (是否尝试, 跳过原因)。script_args.api_first 显式开关优先（含显式 True，
+    用于强制重试）；未显式配置时，只有在存在任一可用凭据来源
+    （access_token / refresh_token / 脚本账密）时才尝试——否则纯 API 阶段必然空跑，
+    只会为 OAuth/纯浏览器站点（如 ABR 福利站）平白增加一次探测延迟与日志噪声。
+    """
+    args = site.script_args if isinstance(site.script_args, dict) else {}
+    if "api_first" in args:
+        value = args.get("api_first")
+        if isinstance(value, str):
+            enabled = value.strip().casefold() in {"1", "true", "yes", "on"}
+        else:
+            enabled = bool(value)
+        return enabled, "" if enabled else "script_args.api_first=false，按配置跳过纯 API 首选阶段"
+
+    has_token = bool(normalize_access_token(getattr(site, "access_token", "") or ""))
+    has_refresh = bool(str(getattr(site, "refresh_token", "") or "").strip())
+    email, password = _script_credentials(site)
+    has_credentials = bool(email and password)
+    if has_token or has_refresh or has_credentials:
+        return True, ""
+    return False, "无 access_token / refresh_token / 脚本账密，跳过纯 API 首选阶段，直接执行浏览器脚本"
+
+
 # 「脚本是否自管 HTTP 流程」的唯一实现在 api action（两条链路共用同一判定）。
 _script_owns_http_flow = script_owns_http_flow
 
@@ -425,9 +451,14 @@ def run_action(site: SiteConfig, profile: SiteProfile, turnstile: str = "") -> C
 
     # 首选方案：纯 API 签到（用配置的 access_token，不启动浏览器）。成功/已签到直接
     # 返回；登录态失效或接口不可用则降级到浏览器脚本（browser_state → 账密登录）。
-    api_result = _try_api_checkin(site, profile)
-    if api_result is not None:
-        return api_result
+    # 没有任何 API 可用凭据时（典型：OAuth/纯浏览器站点）默认跳过，避免空跑一轮。
+    try_api, skip_reason = _should_try_api_first(site)
+    if try_api:
+        api_result = _try_api_checkin(site, profile)
+        if api_result is not None:
+            return api_result
+    elif skip_reason:
+        _api_log(site, skip_reason)
 
     auth_method = (site.auth_method or "").strip().lower()
     script_handles_oauth = _script_handles_oauth(site)
@@ -445,7 +476,13 @@ def run_action(site: SiteConfig, profile: SiteProfile, turnstile: str = "") -> C
     if auth_method == "oauth":
         oauth_provider = accounts_store.normalize_oauth_provider(site.oauth_provider) or "linuxdo"
         oauth_account = accounts_store.normalize_oauth_account(getattr(site, "oauth_account", ""))
-        state_text = accounts_store.oauth_state_text(oauth_provider, oauth_account) or site.browser_state
+        # 特殊 OAuth 脚本完成首次回跳后会把「provider + 本站 session」一起缓存为
+        # site.browser_state。后续应优先复用这份本站态；否则每次都从顶层共享 provider
+        # state 重新登录，刚缓存的目标站 session 永远不会被使用。
+        if script_handles_oauth and str(site.browser_state or "").strip():
+            state_text = site.browser_state
+        else:
+            state_text = accounts_store.oauth_state_text(oauth_provider, oauth_account) or site.browser_state
         detail: dict[str, Any] = {
             "checkin_source": "browser_script",
             "auth_method": auth_method,

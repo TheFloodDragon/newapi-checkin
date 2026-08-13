@@ -38,6 +38,10 @@ SPEC = common.SiteSpec(
     success_message="抽奖完成",
 )
 
+# 声明本脚本完全接管 HTTP 流程（状态查询、签到与结果确认），跳过 Sub2API 标准端点探测。
+# 本站使用自定义 lottery 接口而非标准签到接口，探测 /api/v1/check-in/status 等端点只会产生无用的 404 日志。
+OWNS_HTTP_FLOW = True
+
 
 def _log_fn(log: Any = None):
     return log if callable(log) else (lambda _message: None)

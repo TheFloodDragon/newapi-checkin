@@ -165,6 +165,9 @@ class HCaptchaSolveResult:
     rounds: int = 0
     challenge_type: str = ""
     screenshot: str = ""
+    failure_stage: str = ""
+    error_type: str = ""
+    http_status: int | None = None
 
     @property
     def ok(self) -> bool:
@@ -260,6 +263,25 @@ async def _box(locator: Any) -> dict[str, float] | None:
         return box
     except Exception:
         return None
+
+
+async def _screenshot_locator(page: Any, locator: Any) -> bytes:
+    """优先从顶层 Page 裁剪 iframe 区域，避免 Firefox 元素截图返回纯黑图片。"""
+    box = await _box(locator)
+    if box is not None:
+        try:
+            image = await _maybe_await(page.screenshot(type="png", clip=box))
+            if isinstance(image, (bytes, bytearray, memoryview)) and image:
+                return bytes(image)
+        except Exception:
+            pass
+    try:
+        image = await _maybe_await(locator.screenshot(type="png"))
+        if isinstance(image, (bytes, bytearray, memoryview)) and image:
+            return bytes(image)
+    except Exception:
+        pass
+    return b""
 
 
 def _children(frame: Any) -> list[Any]:
@@ -418,6 +440,14 @@ def _validated_answer(answer: Any, *, max_actions: int = 16) -> Mapping[str, Any
         }
 
 
+def _safe_exception_detail(exc: BaseException, *, stage: str) -> dict[str, Any]:
+    detail: dict[str, Any] = {"failure_stage": stage, "error_type": type(exc).__name__}
+    status = getattr(exc, "status", None)
+    if isinstance(status, int):
+        detail["http_status"] = status
+    return detail
+
+
 class HCaptchaSolver:
     """单个 Page 的 hCaptcha 求解会话。构造时即开始监听响应。"""
 
@@ -440,6 +470,7 @@ class HCaptchaSolver:
         self._network_passed = False
         self._network_token = ""
         self._network_failed = False
+        self._vision_failure: dict[str, Any] = {}
         self._diagnostic_target: Any = None
         self._closed = False
         self._listener = self._on_response
@@ -567,6 +598,35 @@ class HCaptchaSolver:
                 frames = []
         return frames
 
+    async def _wait_for_live_challenge(self, frame: Any) -> Any | None:
+        """点击复选框后等待挑战真正呈现题面，返回可求解的 frame。"""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.options.post_action_wait_ms / 1000
+        candidate = frame
+        while True:
+            _checkbox, current = await self._find_frames()
+            if current is not None:
+                candidate = current
+            if await self._challenge_is_live(candidate):
+                return candidate
+            if loop.time() >= deadline:
+                return candidate if await self._challenge_is_live(candidate) else None
+            await asyncio.sleep(self.options.poll_interval_ms / 1000)
+
+    async def _challenge_is_live(self, frame: Any) -> bool:
+        """挑战 iframe 是否真的呈现了题目。
+
+        hCaptcha 会在点击复选框之前就把 challenge iframe 挂到 DOM 上，此时它没有
+        prompt 也没有 task-image，截图是纯黑图。把这种「空壳」当成已加载的挑战会
+        让求解器跳过复选框点击，并把黑图发给模型（已实测：prompt 空、tiles=0、
+        图像仅 1179 字节纯黑）。因此必须以题面或图块存在为准。
+        """
+        if frame is None:
+            return False
+        if await _first_locator(frame, _PROMPT_SELECTORS) is not None:
+            return bool(await _text(await _first_locator(frame, _PROMPT_SELECTORS)))
+        return await _locator_collection(frame, _GRID_SELECTORS) is not None
+
     async def _find_frames(self) -> tuple[Any | None, Any | None]:
         checkbox_frame = None
         challenge_frame = None
@@ -672,20 +732,12 @@ class HCaptchaSolver:
                 labels_added = False
         try:
             if action_target is not None:
-                try:
-                    image = await _maybe_await(action_target.screenshot(type="png"))
-                except Exception:
-                    image = b""
+                image = await _screenshot_locator(self.page, action_target)
             if not image:
                 body = await _first_locator(frame, ("body",))
                 if body is not None:
-                    try:
-                        image = await _maybe_await(body.screenshot(type="png"))
-                        action_target = body
-                    except Exception:
-                        image = b""
-                if not image:
-                    action_target = None
+                    image = await _screenshot_locator(self.page, body)
+                    action_target = body if image else None
         finally:
             if labels_added:
                 try:
@@ -729,6 +781,7 @@ class HCaptchaSolver:
     async def _ask_vision(self, request: Mapping[str, Any]) -> Mapping[str, Any] | None:
         client = await self._default_vision_client()
         if client is None:
+            self._vision_failure = {"failure_stage": "client_init", "error_type": "VisionClientError"}
             return None
         method = None
         for name in ("solve_hcaptcha", "solve", "analyze"):
@@ -739,13 +792,22 @@ class HCaptchaSolver:
         if method is None and callable(client):
             method = client
         if method is None:
+            self._vision_failure = {"failure_stage": "client_method", "error_type": "VisionClientError"}
             return None
         try:
             signature = inspect.signature(method)
             signature.bind(**request)
         except (TypeError, ValueError):
+            self._vision_failure = {"failure_stage": "client_signature", "error_type": "TypeError"}
             return None
-        answer = await _maybe_await(method(**request))
+        try:
+            answer = await _maybe_await(method(**request))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # 传输/服务错误必须转成结构化失败，且不泄露密钥或原始响应正文。
+            self._vision_failure = _safe_exception_detail(exc, stage="vision_request")
+            return None
         return _validated_answer(answer)
 
     async def _apply_grid(self, frame: Any, answer: Mapping[str, Any], tile_count: int) -> bool:
@@ -889,6 +951,9 @@ class HCaptchaSolver:
         token: str = "",
         rounds: int = 0,
         challenge_type: str = "",
+        failure_stage: str = "",
+        error_type: str = "",
+        http_status: int | None = None,
     ) -> HCaptchaSolveResult:
         screenshot = ""
         if status not in ("success", "not_present"):
@@ -901,6 +966,9 @@ class HCaptchaSolver:
             rounds=rounds,
             challenge_type=challenge_type,
             screenshot=screenshot,
+            failure_stage=failure_stage,
+            error_type=error_type,
+            http_status=http_status,
         )
 
     async def solve(self, *, trigger: Callable[[], Any] | None = None) -> HCaptchaSolveResult:
@@ -918,15 +986,19 @@ class HCaptchaSolver:
                         return await self._result("timeout", "检测到 hCaptcha，但未等到验证令牌")
                     return await self._result("not_present", "页面中未发现 hCaptcha")
 
-                if challenge_frame is None and checkbox_frame is not None:
+                # 预挂载但没有题面的 challenge iframe 不算已加载的挑战；仍需先点复选框。
+                if checkbox_frame is not None and not await self._challenge_is_live(challenge_frame):
                     if not await self._click_checkbox(checkbox_frame):
                         return await self._result("failed", "无法点击 hCaptcha 复选框")
                     self._safe_log("已点击 hCaptcha 复选框，等待自动通过或图片挑战")
-                    token, challenge_frame, passed = await self._wait_for_progress()
+                    token, progressed_frame, passed = await self._wait_for_progress()
                     if token or passed:
                         return await self._result("success", "hCaptcha 已自动通过", token=token)
+                    challenge_frame = await self._wait_for_live_challenge(
+                        progressed_frame or challenge_frame
+                    )
 
-                if challenge_frame is None:
+                if not await self._challenge_is_live(challenge_frame):
                     return await self._result("failed", "hCaptcha 挑战未加载")
                 if await self._default_vision_client() is None:
                     return await self._result("not_configured", "hCaptcha 视觉客户端未配置")
@@ -936,10 +1008,21 @@ class HCaptchaSolver:
                         async with asyncio.timeout(self.options.round_timeout_ms / 1000):
                             request = await self._capture_round(challenge_frame, round_number)
                             action_target = request.pop("action_target", None)
+                            self._vision_failure = {}
                             answer = await self._ask_vision(request)
                             if answer is None:
+                                failure = dict(self._vision_failure)
+                                http_status = failure.get("http_status")
+                                message = "hCaptcha 视觉客户端未返回结构化结果"
+                                if isinstance(http_status, int):
+                                    message = f"hCaptcha 视觉服务请求失败（HTTP {http_status}）"
                                 return await self._result(
-                                    "failed", "hCaptcha 视觉客户端未返回结构化结果", rounds=round_number
+                                    "failed",
+                                    message,
+                                    rounds=round_number,
+                                    failure_stage=str(failure.get("failure_stage") or "vision_request"),
+                                    error_type=str(failure.get("error_type") or ""),
+                                    http_status=http_status if isinstance(http_status, int) else None,
                                 )
                             challenge_type = str(
                                 answer.get("challenge_type")
@@ -994,8 +1077,15 @@ class HCaptchaSolver:
             return await self._result("timeout", "hCaptcha 总体求解超时")
         except asyncio.CancelledError:
             raise
-        except Exception:
-            return await self._result("failed", "hCaptcha 求解失败")
+        except Exception as exc:
+            failure = _safe_exception_detail(exc, stage="solver_exception")
+            return await self._result(
+                "failed",
+                "hCaptcha 求解失败",
+                failure_stage=str(failure.get("failure_stage") or "solver_exception"),
+                error_type=str(failure.get("error_type") or ""),
+                http_status=failure.get("http_status") if isinstance(failure.get("http_status"), int) else None,
+            )
 
 
 async def solve(

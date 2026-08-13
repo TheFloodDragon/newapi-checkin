@@ -4,6 +4,7 @@ ACCOUNTS.json
 # 精确匹配 ACCOUNTS.json.bak 覆盖不到，而这类文件含全部账号的 token 与明文密码。
 ACCOUNTS.json.bak*
 ACCOUNTS.json.lock
+HCAPTCHA_VISION_CONFIG.json
 
 # 临时诊断脚本（会读取账号密码做登录实验，不入库）
 .tmpdiag/

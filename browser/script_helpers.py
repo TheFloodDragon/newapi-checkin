@@ -227,6 +227,28 @@ class ScriptHelpers:
         async def _screenshot(name: str, *, target: Any = None) -> str:
             if target is None:
                 return await self.screenshot(name)
+            box = None
+            try:
+                raw_box = await target.bounding_box()
+                if isinstance(raw_box, dict) and all(
+                    isinstance(raw_box.get(key), (int, float)) for key in ("x", "y", "width", "height")
+                ):
+                    box = {key: float(raw_box[key]) for key in ("x", "y", "width", "height")}
+            except Exception:
+                box = None
+            if box and box["width"] > 0 and box["height"] > 0:
+                self.screenshot_dir.mkdir(parents=True, exist_ok=True)
+                safe_name = re.sub(r"[^\w.\-\u4e00-\u9fff]+", "_", name or "hcaptcha.png").strip("._")
+                if not safe_name:
+                    safe_name = "hcaptcha.png"
+                if "." not in Path(safe_name).name:
+                    safe_name += ".png"
+                path = self.screenshot_dir / safe_name
+                try:
+                    await self.page.screenshot(path=str(path), type="png", clip=box)
+                    return str(path)
+                except Exception:
+                    pass
             return await self.screenshot(name, target=target, full_page=False)
 
         return await hcaptcha.solve(

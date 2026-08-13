@@ -17,12 +17,14 @@ import os
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import providers.base as provider_base
 
 _DEFAULT_BASE_URL = ""
 _DEFAULT_MODEL = ""
+_LOCAL_CONFIG_PATH = Path(__file__).resolve().parent.parent / "HCAPTCHA_VISION_CONFIG.json"
 _ALLOWED_CHALLENGE_TYPES = frozenset({"grid", "point", "drag", "unknown"})
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.IGNORECASE | re.DOTALL)
 
@@ -85,7 +87,13 @@ class VisionClientConfig:
         """
 
         env = os.environ if environ is None else environ
-        secret_config = _read_json_config(env.get("HCAPTCHA_VISION_CONFIG"))
+        # 根目录本地文件用于桌面/本机运行，已由 .gitignore 排除。按用户要求它的
+        # 优先级最高；CI/无文件环境继续使用 HCAPTCHA_VISION_CONFIG Secret。
+        # 显式传 environ 的调用用于测试/隔离配置，不能被开发机本地文件污染；
+        # 正常运行不传 environ，此时根目录文件才作为最高优先级来源。
+        local_config = _read_local_config(_LOCAL_CONFIG_PATH) if environ is None else {}
+        env_config = _read_json_config(env.get("HCAPTCHA_VISION_CONFIG"))
+        secret_config = {**env_config, **local_config}
         api_key = _first_nonempty(
             _config_value(
                 secret_config,
@@ -429,6 +437,17 @@ def parse_json_object(content: str | Mapping[str, Any]) -> dict[str, Any]:
         if parsed is not None:
             return parsed
     raise VisionClientError("Vision response did not contain a valid JSON object")
+
+
+def _read_local_config(path: Path) -> dict[str, Any]:
+    """读取根目录本地视觉配置；错误信息不包含密钥或文件正文。"""
+    if not path.exists():
+        return {}
+    try:
+        raw = path.read_text(encoding="utf-8-sig")
+    except OSError as exc:
+        raise VisionClientError(f"Local hCaptcha vision config could not be read: {type(exc).__name__}") from exc
+    return _read_json_config(raw)
 
 
 def _read_json_config(raw: Any) -> dict[str, Any]:

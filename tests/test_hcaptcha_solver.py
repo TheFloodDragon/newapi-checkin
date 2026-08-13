@@ -8,6 +8,7 @@ from collections.abc import Callable
 from typing import Any
 
 from browser.hcaptcha import HCaptchaOptions, HCaptchaSolveResult, HCaptchaSolver, solve
+from browser.openai_vision import VisionClientError
 
 
 class FakeLocator:
@@ -109,6 +110,11 @@ class FakePage:
         self.mouse = FakeMouse()
         self.responses = list(responses or [(False, "")])
         self.listeners: dict[str, list[Callable[..., Any]]] = {}
+        self.page_screenshots: list[dict[str, Any]] = []
+
+    async def screenshot(self, **kwargs: Any) -> bytes:
+        self.page_screenshots.append(kwargs)
+        return b"page-png"
 
     def on(self, event: str, callback: Callable[..., Any]) -> None:
         self.listeners.setdefault(event, []).append(callback)
@@ -424,7 +430,8 @@ def test_unknown_task_type_is_unsupported() -> None:
     assert result.status == "unsupported"
 
 
-def test_missing_vision_configuration_reports_not_configured(monkeypatch: Any) -> None:
+def test_missing_vision_configuration_reports_not_configured(monkeypatch: Any, tmp_path: Any) -> None:
+    monkeypatch.setattr("browser.openai_vision._LOCAL_CONFIG_PATH", tmp_path / "missing.json")
     for name in ("HCAPTCHA_VISION_CONFIG", "HCAPTCHA_OPENAI_API_KEY", "OPENAI_API_KEY"):
         monkeypatch.delenv(name, raising=False)
     frame = challenge_frame(tiles=2)
@@ -435,7 +442,8 @@ def test_missing_vision_configuration_reports_not_configured(monkeypatch: Any) -
     assert result.status == "not_configured"
 
 
-def test_json_secret_enables_default_vision_client(monkeypatch: Any) -> None:
+def test_json_secret_enables_default_vision_client(monkeypatch: Any, tmp_path: Any) -> None:
+    monkeypatch.setattr("browser.openai_vision._LOCAL_CONFIG_PATH", tmp_path / "missing.json")
     monkeypatch.delenv("HCAPTCHA_OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv(
@@ -488,6 +496,77 @@ def test_round_timeout_and_total_timeout_are_structured() -> None:
     assert round_result.status == "timeout"
     assert round_result.rounds == 1
     assert total_result.status == "timeout"
+
+
+def test_prerendered_empty_challenge_still_clicks_checkbox() -> None:
+    """空壳 challenge iframe 不得跳过复选框点击，也不得把黑图发给模型。"""
+    empty = FakeFrame(
+        "https://newassets.hcaptcha.com/captcha/v1/challenge",
+        {".challenge-container": FakeLocator(box={"x": 10, "y": 10, "width": 376, "height": 190})},
+    )
+    checkbox = FakeFrame(
+        "https://newassets.hcaptcha.com/captcha/v1/checkbox",
+        {"#checkbox": FakeLocator(box={"x": 20, "y": 30, "width": 28, "height": 28})},
+    )
+    page = FakePage(
+        FakeFrame("https://site.invalid", children=[checkbox, empty]),
+        responses=[(True, ""), (True, ""), (True, "checkbox-token")],
+    )
+    vision = FakeVision([])
+
+    result = run(solve(page, options=options(post_action_wait_ms=20), vision_client=vision))
+
+    assert any(event[0] == "click" for event in page.mouse.events)
+    assert vision.calls == []
+    assert result.status == "success"
+    assert result.token == "checkbox-token"
+
+
+def test_empty_challenge_without_checkbox_reports_not_loaded() -> None:
+    empty = FakeFrame(
+        "https://newassets.hcaptcha.com/captcha/v1/challenge",
+        {".challenge-container": FakeLocator(box={"x": 10, "y": 10, "width": 376, "height": 190})},
+    )
+    page = FakePage(FakeFrame("https://site.invalid", children=[empty]), responses=[(True, "")])
+    vision = FakeVision([])
+
+    result = run(solve(page, options=options(), vision_client=vision))
+
+    assert result.status == "failed"
+    assert result.message == "hCaptcha 挑战未加载"
+    assert vision.calls == []
+
+
+def test_vision_transport_error_reports_safe_stage_and_status() -> None:
+    class FailingVision:
+        async def solve_hcaptcha(self, **_request: Any) -> dict[str, Any]:
+            raise VisionClientError("secret-key rejected upstream", status=424)
+
+    frame = challenge_frame(tiles=2)
+    page = FakePage(FakeFrame("https://site.invalid", children=[frame]), responses=[(True, "")])
+
+    result = run(solve(page, options=options(max_rounds=1), vision_client=FailingVision()))
+
+    assert result.status == "failed"
+    assert result.failure_stage == "vision_request"
+    assert result.error_type == "VisionClientError"
+    assert result.http_status == 424
+    assert "424" in result.message
+    assert "secret-key" not in result.message
+    assert "secret-key" not in repr(result)
+
+
+def test_page_clip_screenshot_avoids_black_iframe_element_capture() -> None:
+    frame = challenge_frame(tiles=1)
+    page = FakePage(FakeFrame("https://site.invalid", children=[frame]), responses=[(True, "")])
+    solver = HCaptchaSolver(page, options=options(), vision_client=FakeVision([]))
+
+    request = run(solver._capture_round(frame, 1))
+
+    assert request["image"] == b"page-png"
+    assert page.page_screenshots
+    assert page.page_screenshots[0]["clip"] == {"x": 100.0, "y": 200.0, "width": 400.0, "height": 300.0}
+    run(solver.aclose())
 
 
 def test_failure_screenshot_callback_and_safe_logs() -> None:

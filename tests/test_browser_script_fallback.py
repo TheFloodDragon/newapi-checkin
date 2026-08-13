@@ -73,6 +73,25 @@ def test_script_handles_oauth_keeps_shared_state_without_pretrigger(monkeypatch)
     assert result.detail["script_handles_oauth"] is True
 
 
+def test_script_handles_oauth_prefers_cached_site_session(monkeypatch) -> None:
+    runner = FakeRunner(["success"])
+    _install(monkeypatch, runner)
+    site = _site()
+    site.auth_method = "oauth"
+    site.browser_state = "cached-site-session"
+    site.oauth_fallback_provider = ""
+    site.oauth_fallback_account = ""
+    site.oauth_provider = "linuxdo"
+    site.oauth_account = "default"
+    site.script_args = {"script_handles_oauth": True}
+
+    result = browser_script.run_action(site, SimpleNamespace())
+
+    assert result.status == "success"
+    assert runner.calls[0]["browser_state_text"] == "cached-site-session"
+    assert runner.calls[0]["oauth_provider"] == ""
+
+
 def test_browser_script_retries_once_with_oauth_on_need_login(monkeypatch) -> None:
     runner = FakeRunner(["need_login", "success"])
     _install(monkeypatch, runner)

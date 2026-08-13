@@ -58,6 +58,27 @@ def test_config_environment_fallbacks_and_missing_key() -> None:
         VisionClientConfig.from_options({"api_key": "option-secret"}, environ={})
 
 
+def test_root_local_config_has_highest_runtime_precedence(tmp_path, monkeypatch) -> None:
+    local = tmp_path / "HCAPTCHA_VISION_CONFIG.json"
+    local.write_text(
+        json.dumps(
+            {
+                "api_key": "local-key",
+                "base_url": "https://local.example/v1",
+                "model": "local-model",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("browser.openai_vision._LOCAL_CONFIG_PATH", local)
+
+    config = VisionClientConfig.from_options()
+
+    assert config.api_key == "local-key"
+    assert config.base_url == "https://local.example/v1"
+    assert config.model == "local-model"
+
+
 def test_single_json_secret_has_highest_precedence() -> None:
     config = VisionClientConfig.from_options(
         {

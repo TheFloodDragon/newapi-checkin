@@ -34,6 +34,9 @@ def test_task_scoped_env_covers_all_credential_vars() -> None:
         "CHECKIN_COOKIE",
         "CHECKIN_USER_ID",
         "CHECKIN_BROWSER_STATE",
+        # 站点配置里的原始 browser_state：用于让子进程按配置基线计算 state basis，
+        # 与注入的运行期登录态分离。同样属任务级敏感值，不能从父环境继承。
+        "CHECKIN_CONFIGURED_BROWSER_STATE",
         "CHECKIN_SCRIPT_ARGS",
         "CHECKIN_CACHE_POLICY",
     }

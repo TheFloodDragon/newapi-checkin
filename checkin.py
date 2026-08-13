@@ -205,6 +205,30 @@ def _explicit_credential_fields(args: argparse.Namespace) -> set[str]:
     return fields
 
 
+def _stabilize_oauth_state_basis(site: SiteConfig) -> None:
+    """让 OAuth 浏览器脚本站点的 state 缓存 basis 保持稳定，缓存才能被复用。
+
+    OAuth 站点的 browser_state 是运行期产物：父进程注入共享 provider 登录态或上次
+    缓存的本站会话，脚本结束后又把新的整体快照写回缓存。若 basis 仍按「本次注入值」
+    计算，每轮的 basis 都不同，下一轮 resolve_cached_credentials 会判为过期缓存而
+    忽略，表现为「刚续存的登录态永远用不上、每次都要重跑整段 OAuth」。
+
+    这里把 state basis 固定为「该站点配置本身」（配置里通常为空），使
+    脚本续存与下次读取使用同一基线；配置真的填了 browser_state 时行为不变。
+    """
+    from providers import token_cache
+
+    if (site.auth_method or "").strip().lower() != "oauth":
+        return
+    if (site.checkin_action or "").strip().lower() != "browser_script":
+        return
+    context = getattr(site, "runtime_credentials", None)
+    if context is None:
+        return
+    configured_state = os.environ.get("CHECKIN_CONFIGURED_BROWSER_STATE", "")
+    context.state_basis = token_cache.credential_basis(browser_state=configured_state, group="state")
+
+
 def _execute(args: argparse.Namespace) -> tuple[dict[str, object] | list[dict[str, object]], int]:
     try:
         script_args = _load_script_args(args)
@@ -252,6 +276,7 @@ def _execute(args: argparse.Namespace) -> tuple[dict[str, object] | list[dict[st
                 cache_policy=os.environ.get("CHECKIN_CACHE_POLICY", "compatible"),
             )
         ]
+        _stabilize_oauth_state_basis(sites[0])
     else:
         config_path = Path(args.config).resolve()
         try:

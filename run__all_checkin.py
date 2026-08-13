@@ -64,6 +64,7 @@ TASK_SCOPED_ENV = frozenset(
         "CHECKIN_COOKIE",
         "CHECKIN_USER_ID",
         "CHECKIN_BROWSER_STATE",
+        "CHECKIN_CONFIGURED_BROWSER_STATE",
         "CHECKIN_SCRIPT_ARGS",
         "CHECKIN_CACHE_POLICY",
     }
@@ -119,6 +120,19 @@ class RetryPlanItem:
     task: CheckinTask
     previous_summary: dict[str, Any] | None = None
     carried_forward: bool = False
+
+
+def _script_args_handles_oauth(site: dict[str, Any]) -> bool:
+    """站点是否声明脚本自行处理 OAuth（script_args.script_handles_oauth）。
+
+    与 providers/actions/browser_script._script_handles_oauth 判定一致，只是这里读的是
+    原始配置 dict。用于决定 OAuth 站点是否优先注入已缓存的本站会话而非共享 provider 态。
+    """
+    args = accounts_store.normalize_script_args(site.get("script_args"))
+    value = args.get("script_handles_oauth", False)
+    if isinstance(value, str):
+        return value.strip().casefold() in {"1", "true", "yes", "on"}
+    return bool(value)
 
 
 def build_site_tasks() -> list[CheckinTask]:
@@ -229,7 +243,19 @@ def build_site_tasks() -> list[CheckinTask]:
                 command.extend(["--login-selector", login_selector])
             # browser_state 可达数十 KB，超命令行长度上限，改用环境变量传给子进程。
             if auth_method == "oauth":
-                browser_state = accounts_store.oauth_state_text(oauth_provider, oauth_account).strip()
+                # script_handles_oauth 站点在首次 OAuth 回跳后会把「本站会话 + provider
+                # 登录态」整体缓存为 browser_state（见 browser/script_runner 的续存）。
+                # runtime_site_from_mapping 已按配置 basis 解析出这份缓存；命中时直接注入，
+                # 子进程脚本即可跳过整段 OAuth（含 Cloudflare 挑战）。未命中再回退到共享
+                # provider 登录态，由脚本走完整 OAuth 并在结束时重新缓存本站会话。
+                cached_site_state = site_config.browser_state.strip()
+                if _script_args_handles_oauth(site) and cached_site_state:
+                    browser_state = cached_site_state
+                else:
+                    browser_state = accounts_store.oauth_state_text(oauth_provider, oauth_account).strip()
+                # 子进程要按「站点配置里的 browser_state」计算 state basis，而不是本次
+                # 注入值；否则每轮 basis 都变，脚本续存的会话下一轮就会被判为过期缓存。
+                env_values["CHECKIN_CONFIGURED_BROWSER_STATE"] = str(site.get("browser_state") or "")
             else:
                 browser_state = site_config.browser_state.strip()
             if browser_state:
