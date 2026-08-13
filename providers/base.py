@@ -295,6 +295,9 @@ class SiteConfig:
     # ── 其它 ──
     enabled: bool = True
     auto_refresh_cookie: bool = True
+    # 该站点失败时是否「不计入失败」：既不算成功也不算失败，不影响整体结果与退出码。
+    # 用于长期受外部因素阻塞、但不希望污染整体成败判定的站点。
+    tolerate_failure: bool = False
     # newapi + api 专用：接口变体偏好（auto=challenge 优先，legacy=旧接口优先）。
     # 仅影响首次尝试顺序，两种都会在失败时互为兜底；其它 profile 忽略。
     # 默认 legacy，理由见 checkin_core.enums.DEFAULT_API_VARIANT。

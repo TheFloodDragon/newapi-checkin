@@ -336,6 +336,7 @@ CONFIG_FIELDS = (
     "token_file",
     "referer_path",
     "auto_refresh_cookie",
+    "tolerate_failure",
     "browser_state",
     "browser_profile",
     "login_selector",
@@ -665,6 +666,8 @@ def configured_site_from_mapping(
         referer_path=str(row.get("referer_path") or "/profile"),
         enabled=parse_enabled(row.get("enabled"), True),
         auto_refresh_cookie=parse_enabled(row.get("auto_refresh_cookie"), True),
+        # 默认 False：容错必须显式开启，否则真实故障会被静默吞掉。
+        tolerate_failure=parse_enabled(row.get("tolerate_failure"), False),
         verify_ssl=parse_enabled(row.get("verify_ssl"), True),
         runtime_credentials=context,
     )
@@ -991,6 +994,8 @@ _PERSIST_OPTIONAL = (
 _PERSIST_OPTIONAL_BOOL = (
     ("verify_ssl", True),
     ("auto_refresh_cookie", True),
+    # 默认 False：只有显式开启才写盘，避免默认值噪声写进每个站点。
+    ("tolerate_failure", False),
 )
 _KNOWN_ACCOUNT_FIELDS = set(CONFIG_FIELDS) | set(CRED_FIELDS) | {
     "url",
@@ -1317,6 +1322,10 @@ def build_github_secret_payload(
             out["referer_path"] = referer_path
         if not parse_enabled(row.get("auto_refresh_cookie"), True):
             out["auto_refresh_cookie"] = False
+        # 容错开关会改变整体成败判定，CI 必须与本地一致，否则同一配置在两侧
+        # 得到不同的退出码。
+        if parse_enabled(row.get("tolerate_failure"), False):
+            out["tolerate_failure"] = True
 
         exported_accounts.append(out)
 

@@ -93,6 +93,9 @@ class CheckinTask:
     command: list[str]
     env: dict[str, str] | None = None
     site_key: str = ""
+    # 该站点失败时不计入整体失败（既不算成功也不算失败）。父进程已持有配置，
+    # 无需再透传给子进程：判定只发生在汇总阶段。
+    tolerate_failure: bool = False
     # Hard wall-clock cap for the child process. Browser tasks can hang inside
     # launch_camoufox / page.goto with no internal timeout, which would block
     # the whole ThreadPoolExecutor shutdown until the CI job-level timeout. A
@@ -111,6 +114,8 @@ class TaskResult:
     duration: float = 0.0
     diagnostics: str = ""
     worker_protocol: bool = False
+    # 由对应 CheckinTask 透传：该站点失败时不计入整体失败。
+    tolerate_failure: bool = False
 
 
 @dataclass
@@ -293,6 +298,7 @@ def build_site_tasks() -> list[CheckinTask]:
                 site_key=base_url,
                 timeout=task_timeout,
                 worker_protocol=True,
+                tolerate_failure=site_config.tolerate_failure,
             )
         )
     return tasks
@@ -470,6 +476,7 @@ def run_task(task: CheckinTask) -> TaskResult:
             duration=time.perf_counter() - start_perf,
             diagnostics=diagnostics.rstrip(),
             worker_protocol=task.worker_protocol,
+            tolerate_failure=task.tolerate_failure,
         )
     ended_at = datetime.now()
     return TaskResult(
@@ -481,6 +488,7 @@ def run_task(task: CheckinTask) -> TaskResult:
         duration=time.perf_counter() - start_perf,
         diagnostics=completed.stderr.rstrip(),
         worker_protocol=task.worker_protocol,
+        tolerate_failure=task.tolerate_failure,
     )
 
 
@@ -733,6 +741,17 @@ def task_result_to_summary(result: TaskResult) -> dict[str, Any]:
     icon = status_icon(status, result.returncode)
     note = build_detail_note(status, message, detail)
     ok = status in OK_STATUSES and result.returncode == 0
+    # tolerated 只在「确实没成功」时才有意义：成功的条目无需容错标记。
+    #
+    # 刻意不把 ok 改成 True：ok 同时被 is_completed_summary 用于「当天可沿用」的
+    # 判定，置真会让这个站点当天不再重试——而容错的语义是「失败不算失败」，
+    # 不是「今天不用再试了」。因此 ok 保持 False，另加独立标记供计数时排除。
+    tolerated = bool(getattr(result, "tolerate_failure", False)) and not ok
+    if tolerated:
+        # 标记必须显眼：容错不等于隐藏。若这个站点日后真的回归成功，或出现新的
+        # 故障模式，运行者要能一眼看出「这条被豁免了」，而不是误以为一切正常。
+        label = f"{label}（已豁免）"
+        icon = "➖"
 
     return {
         "site": site,
@@ -742,6 +761,7 @@ def task_result_to_summary(result: TaskResult) -> dict[str, Any]:
         "label": label,
         "icon": icon,
         "ok": ok,
+        "tolerated": tolerated,
         "returncode": result.returncode,
         "message": value_to_text(message),
         "note": note,
@@ -904,6 +924,7 @@ def run_tasks(tasks: list[CheckinTask], workers: int = 0, verbose: bool = False)
             "",
             diagnostics=f"任务异常：{exc}",
             worker_protocol=task.worker_protocol,
+            tolerate_failure=task.tolerate_failure,
         ),
         workers=workers,
         on_result=lambda result: print_result(result, verbose=verbose),
@@ -933,7 +954,11 @@ def build_result_payload(
     业务日，写出的文件头日期与其中结果的实际归属不符，下一轮沿用判定就会被误导。
     传入定格值可消除这个不一致。
     """
-    failed_count = sum(1 for item in summaries if item.get("ok") is not True)
+    # tolerated 的站点既不算成功也不算失败：不计入失败数，也不影响退出码。
+    failed_count = sum(
+        1 for item in summaries
+        if item.get("ok") is not True and not item.get("tolerated")
+    )
     success_count = sum(1 for item in summaries if item.get("status") == "success")
     already_done_count = sum(1 for item in summaries if item.get("status") == "already_done")
     executed_count, carried_count, retry_succeeded_count = result_run_counts(summaries)
@@ -1061,7 +1086,11 @@ def main() -> int:
         f"沿用上次完成：{carried_count}；"
         f"本轮重试成功：{retry_succeeded_count}"
     )
-    failed_count = sum(1 for item in summaries if item.get("ok") is not True)
+    # tolerated 的站点既不算成功也不算失败：不计入失败数，也不影响退出码。
+    failed_count = sum(
+        1 for item in summaries
+        if item.get("ok") is not True and not item.get("tolerated")
+    )
     print(f"结果文件：{RESULT_JSON_PATH}")
     return 0 if failed_count == 0 else 2
 

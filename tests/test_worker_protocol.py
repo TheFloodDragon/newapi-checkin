@@ -574,3 +574,57 @@ def test_manual_dispatch_can_force_full_checkin() -> None:
     assert "RUN_ALL: ${{ inputs.run_all }}" in workflow
     # 只有显式 true 才清空重试开关；定时触发时该变量为空串，走沿用分支。
     assert 'if [ "$RUN_ALL" = "true" ]' in workflow
+
+
+def _tolerate_summary(status: str, *, tolerate: bool, returncode: int = 2) -> dict:
+    payload = json.dumps(
+        {"site": "S", "base_url": "https://s.invalid", "status": status, "message": "m", "detail": {}},
+        ensure_ascii=False,
+    )
+    result = runner.TaskResult(
+        "t", returncode, payload, worker_protocol=True, tolerate_failure=tolerate
+    )
+    return runner.task_result_to_summary(result)
+
+
+def _failed_count(items: list[dict]) -> int:
+    return sum(1 for i in items if i.get("ok") is not True and not i.get("tolerated"))
+
+
+def test_tolerated_site_is_neither_success_nor_failure() -> None:
+    """tolerate_failure 站点失败时不计入失败，也不算成功，不影响退出码。"""
+    tolerated = _tolerate_summary("need_verification", tolerate=True)
+    normal = _tolerate_summary("need_verification", tolerate=False)
+
+    # 不算成功
+    assert tolerated["ok"] is False
+    # 但被标记为豁免，且标记显眼，避免误读为一切正常
+    assert tolerated["tolerated"] is True
+    assert "已豁免" in tolerated["label"]
+
+    # 不影响失败数与退出码
+    assert _failed_count([tolerated]) == 0
+    assert _failed_count([tolerated, normal]) == 1, "普通失败仍必须计入"
+
+    # 未开启容错的站点行为不变
+    assert normal["tolerated"] is False
+    assert "已豁免" not in normal["label"]
+
+
+def test_tolerated_flag_absent_on_success() -> None:
+    """成功条目不该带豁免标记，否则日后真回归成功时看不出差别。"""
+    summary = _tolerate_summary("success", tolerate=True, returncode=0)
+
+    assert summary["ok"] is True
+    assert summary["tolerated"] is False
+    assert "已豁免" not in summary["label"]
+
+
+def test_tolerated_failure_still_retries_next_run() -> None:
+    """容错语义是「失败不算失败」，不是「今天不用再试」：当天不得被沿用。"""
+    summary = _tolerate_summary("need_verification", tolerate=True)
+
+    assert (
+        runner.is_completed_summary(summary, business_day=summary.get("business_date"))
+        is False
+    )
