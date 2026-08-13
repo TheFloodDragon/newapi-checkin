@@ -63,6 +63,9 @@ def _should_try_api_first(site: SiteConfig) -> tuple[bool, str]:
     用于强制重试）；未显式配置时，只有在存在任一可用凭据来源
     （access_token / refresh_token / 脚本账密）时才尝试——否则纯 API 阶段必然空跑，
     只会为 OAuth/纯浏览器站点（如 ABR 福利站）平白增加一次探测延迟与日志噪声。
+
+    跳过原因为空串表示「无需告知」：只有用户显式配置 api_first=false 才值得记一行，
+    「没有 API 凭据」是这类站点的固有状态，不构成需要用户处置的信息。
     """
     args = site.script_args if isinstance(site.script_args, dict) else {}
     if "api_first" in args:
@@ -79,7 +82,9 @@ def _should_try_api_first(site: SiteConfig) -> tuple[bool, str]:
     has_credentials = bool(email and password)
     if has_token or has_refresh or has_credentials:
         return True, ""
-    return False, "无 access_token / refresh_token / 脚本账密，跳过纯 API 首选阶段，直接执行浏览器脚本"
+    # 无任何 API 凭据是 OAuth/纯浏览器站点的常态，不是异常，不输出日志：
+    # 每轮固定打印一行既无行动指引，又淹没真正需要关注的诊断。
+    return False, ""
 
 
 # 「脚本是否自管 HTTP 流程」的唯一实现在 api action（两条链路共用同一判定）。
