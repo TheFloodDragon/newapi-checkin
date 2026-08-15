@@ -22,6 +22,7 @@ from typing import Any
 
 from ..base import (
     USER_AGENT,
+    NOT_OPEN_PATTERNS,
     ApiError,
     CheckinReward,
     contains_any,
@@ -258,6 +259,10 @@ def checked_in_flag(data: Any) -> bool | None:
 def classify_error(error: ApiError) -> str:
     """把 ApiError 归类为 already_done / not_open / need_login / need_verification / error。"""
     if error.not_open:
+        return "not_open"
+    # 服务端明确说签到功能未启用/活动未开放时，必须先于宽泛的登录与验证词表判定，
+    # 否则「未开启签到」这类文案会被 LOGIN_PATTERNS 的「无效/过期」等词误伤。
+    if contains_any(error.message, NOT_OPEN_PATTERNS):
         return "not_open"
     if contains_any(error.message, ALREADY_DONE_PATTERNS):
         return "already_done"

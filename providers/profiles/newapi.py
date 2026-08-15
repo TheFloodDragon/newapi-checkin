@@ -32,6 +32,7 @@ from accounts_store import normalize_api_variant
 
 from ..base import (
     USER_AGENT,
+    NOT_OPEN_PATTERNS,
     ApiError,
     AuthInfo,
     BrowserAuthError,
@@ -225,6 +226,10 @@ class NewApiClient(ProfileClient):
 
     def classify(self, error: ApiError) -> str:
         if error.not_open:
+            return "not_open"
+        # 服务端明确回执「签到功能未启用」等文案时，站点没开门：重试与浏览器兜底
+        # 都不会改变结果，必须先于 already_done/登录判定，避免落入宽泛词表。
+        if contains_any(error.message, NOT_OPEN_PATTERNS):
             return "not_open"
         if contains_any(error.message, ALREADY_DONE_PATTERNS) or payload_code(error.payload) == "already_done":
             return "already_done"

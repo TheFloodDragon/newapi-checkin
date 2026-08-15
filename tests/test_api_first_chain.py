@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 from browser import script_loader
 from providers.actions import browser_script
@@ -132,6 +132,26 @@ def test_stage1_token_already_checked_in_returns_without_login(monkeypatch) -> N
     assert result.detail["quota_is_usd"] is True
     assert profile.login_calls == 0
     assert client.checkin_calls == 0
+
+
+def test_server_disabled_checkin_message_is_classified_as_not_open() -> None:
+    """站点回执「签到功能未启用」时不得判失败：重试与浏览器兜底都不会改变结果。
+
+    实测 KittyRouter 的 /api/user/checkin 与状态接口都只回这句话，旧实现落到
+    error，既产生失败噪声，又白跑一次 Turnstile 求解。
+    """
+    from providers.profiles.newapi import NewApiClient
+    from providers.profiles.sub2api_protocol import classify_error
+
+    disabled = ApiError(None, {"message": "签到功能未启用", "success": False}, "签到功能未启用")
+
+    assert NewApiClient.classify(cast(Any, None), disabled) == "not_open"
+    assert classify_error(disabled) == "not_open"
+
+    # 账号维度的限制仍必须保持为失败，不能被「未开放」吞掉。
+    ineligible = ApiError(403, {}, "当前不具备签到资格（等级不足）")
+    assert NewApiClient.classify(cast(Any, None), ineligible) != "not_open"
+    assert classify_error(ineligible) != "not_open"
 
 
 def test_not_open_api_result_stops_before_browser_fallback(monkeypatch) -> None:
