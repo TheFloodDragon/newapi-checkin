@@ -209,6 +209,17 @@ def test_run_returns_need_verification_when_hcaptcha_is_present() -> None:
     # 本站 widget 挂载慢，必须传入放宽后的挂载预算，否则会在挑战出现前就超时。
     assert helpers.solve_options["widget_mount_timeout_ms"] >= 40_000
     assert helpers.solve_options["presence_timeout_ms"] >= 20_000
+    assert helpers.solve_options["max_rounds"] >= 5
+    assert helpers.solve_options["vision_max_attempts"] == 2
+    assert helpers.solve_options["vision_retry_reserve_ms"] >= 15_000
+    assert helpers.solve_options["vision_max_edge"] == 400
+    assert helpers.solve_options["vision_jpeg_quality"] == 72
+    assert helpers.solve_options["move_before_click"] is False
+    assert helpers.solve_options["click_timeout_ms"] == 5_000
+    assert helpers.solve_options["temporal_frames"] == 6
+    assert helpers.solve_options["temporal_interval_ms"] == 400
+    assert helpers.solve_options["temporal_sheet_max_edge"] == 800
+    assert helpers.solve_options["temporal_phase_wait_ms"] == 5_000
 
 
 def test_run_never_submits_logout_form_as_checkin() -> None:

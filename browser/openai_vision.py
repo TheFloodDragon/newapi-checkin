@@ -147,6 +147,22 @@ class VisionClientConfig:
             if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, (int, float)):
                 raise VisionClientError("Vision request timeout_ms must be a positive number")
             timeout = max(0.1, float(timeout_ms) / 1000)
+        resolved_timeout = 60 if timeout in (None, "") else timeout
+        # timeout_cap_ms 是调用方给出的安全上限，不参与普通配置优先级：本地文件 /
+        # Secret 仍决定常规超时，但浏览器求解器可确保单次阻塞请求不超过当前轮预算。
+        # 实测根配置 timeout_ms=240000 覆盖了求解器 75s 轮预算；协程取消后 _send
+        # 又会等待 to_thread 自然结束，导致单任务实际挂满 900s。
+        timeout_cap_ms = _option(options, "timeout_cap_ms")
+        if timeout_cap_ms not in (None, ""):
+            if (
+                isinstance(timeout_cap_ms, bool)
+                or not isinstance(timeout_cap_ms, (int, float))
+                or not math.isfinite(float(timeout_cap_ms))
+                or float(timeout_cap_ms) <= 0
+            ):
+                raise VisionClientError("Vision timeout_cap_ms must be a positive number")
+            resolved_timeout = min(float(resolved_timeout), max(0.1, float(timeout_cap_ms) / 1000))
+
         max_actions = _config_value(secret_config, "max_actions", "maxActions")
         if max_actions in (None, ""):
             max_actions = _option(options, "max_actions")
@@ -154,7 +170,7 @@ class VisionClientConfig:
             api_key=api_key or "",
             base_url=base_url or "",
             model=model or "",
-            timeout=60 if timeout in (None, "") else timeout,
+            timeout=resolved_timeout,
             max_actions=16 if max_actions in (None, "") else max_actions,
         )
 
@@ -224,30 +240,83 @@ class VisionPlan:
 
         raw_tiles = value.get("tile_indices", [])
         tile_indices: list[int] = []
+        tile_error = ""
         if isinstance(raw_tiles, list):
-            # 合法数组一律严格校验，与 points/drags 同一标准。
             for index in raw_tiles:
                 if isinstance(index, bool) or not isinstance(index, int) or index < 1:
-                    raise VisionClientError("tile_indices must contain 1-based positive integers")
+                    tile_error = "tile_indices must contain 1-based positive integers"
+                    tile_indices = []
+                    break
                 tile_indices.append(index)
         elif _relevant("grid"):
-            raise VisionClientError("tile_indices must be an array")
+            tile_error = "tile_indices must be an array"
 
-        raw_points = value.get("points", [])
+        raw_points = value.get("points")
+        if raw_points is None:
+            raw_points = value.get("point")
+        if raw_points is None and challenge_type == "point":
+            # 2026-08-14 真实端点返回 target:{x,y} 表示 point 目标。
+            # 仅在明确 point 类型下采用，避免与 drag 的 target 语义混淆。
+            raw_points = value.get("target")
+        if raw_points is None:
+            raw_points = []
+        # 2026-08-14 真实端点返回 point:{x,y}（单数对象）；语义无歧义，统一包装
+        # 成 points 数组。列表仍按原规则严格校验，越界坐标绝不静默丢弃。
+        if isinstance(raw_points, Mapping):
+            raw_points = [raw_points]
         points: list[dict[str, int | float]] = []
         if isinstance(raw_points, list):
-            # 合法数组一律严格校验：越界坐标必须报错，不能静默丢成「无动作」。
             points = [_point(point, "points") for point in raw_points]
         elif _relevant("point"):
-            raise VisionClientError("points must be an array")
+            raise VisionClientError("points must be an array or point object")
 
-        # elements/paths 是模型实测用过的等价键名，与 hcaptcha._validated_answer 保持一致。
-        raw_drags = value.get("drags", value.get("elements", value.get("paths", [])))
+        # elements/paths 是模型实测用过的等价键名；另有顶层
+        # source_point/target_point（2026-08-14 真实返回），统一包装成单次 drag。
+        raw_drags = value.get(
+            "drags", value.get("drag", value.get("elements", value.get("paths")))
+        )
+        if isinstance(raw_drags, Mapping):
+            raw_drags = [raw_drags]
+        if raw_drags is None and ("source_point" in value or "target_point" in value):
+            raw_drags = [
+                {"start": value.get("source_point"), "end": value.get("target_point")}
+            ]
+        if raw_drags is None and ("drag_start" in value or "drag_end" in value):
+            # 2026-08-15 实测别名：顶层 drag_start / drag_end。
+            raw_drags = [{"start": value.get("drag_start"), "end": value.get("drag_end")}]
+        if raw_drags is None and challenge_type in {"drag", "unknown"} and (
+            "source" in value or "target" in value
+        ):
+            # 2026-08-15 真实视觉端点返回了顶层 source/target；仅对明确的
+            # drag/unknown 计划采用，避免覆盖 point 题的 target:{x,y} 语义。
+            raw_drags = [{"start": value.get("source"), "end": value.get("target")}]
+        if (
+            raw_drags is None
+            and challenge_type in {"drag", "unknown"}
+            and ("start" in value or "from" in value)
+            and ("end" in value or "to" in value)
+        ):
+            # 2026-08-15 实测：模型把 start/end 直接放在顶层而不是 drags 数组里。
+            raw_drags = [value]
+        if raw_drags is None:
+            raw_drags = []
         drags: list[dict[str, dict[str, int | float]]] = []
         if isinstance(raw_drags, list):
             drags = [_drag(drag) for drag in raw_drags]
         elif _relevant("drag"):
             raise VisionClientError("drags must be an array")
+
+        # 实测 drag 返回会同时附带 points=[end,start]，只是起终点的重复副本。
+        # 只有两边坐标集合完全一一对应时才忽略；任何额外/不同 point 仍作为矛盾拒绝。
+        if challenge_type in {"drag", "unknown"} and points and drags:
+            point_coords = sorted((float(point["x"]), float(point["y"])) for point in points)
+            drag_coords = sorted(
+                (float(point["x"]), float(point["y"]))
+                for drag in drags
+                for point in (drag["start"], drag["end"])
+            )
+            if point_coords == drag_coords:
+                points = []
 
         action_count = len(tile_indices) + len(points) + len(drags)
         if action_count > max_actions:
@@ -270,6 +339,8 @@ class VisionPlan:
             ]
             if len(present) == 1:
                 challenge_type = present[0]
+        if tile_error and challenge_type not in {"point", "drag"}:
+            raise VisionClientError(tile_error)
         if not expected_nonempty.get(challenge_type, bool(action_count)):
             raise VisionClientError(f"{challenge_type} plan has no matching actions")
         if challenge_type != "grid" and tile_indices:
@@ -326,11 +397,17 @@ class OpenAIVisionClient:
         prompt: str | None = None,
         media_type: str = "image/png",
         grid_image: bytes | bytearray | memoryview | str | None = None,
+        temporal_image: bytes | bytearray | memoryview | str | None = None,
+        temporal_media_type: str = "image/jpeg",
+        drag_detail_image: bytes | bytearray | memoryview | str | None = None,
+        drag_detail_media_type: str = "image/jpeg",
     ) -> VisionPlan:
         """Analyze an image and return a validated action plan.
 
         grid_image 为可选的坐标网格辅助图（与主图同尺寸、叠加 0-1000 刻度）。
-        提供时会作为第二张图一并发送，模型可照刻度读数而非凭空估算坐标。
+        drag_detail_image 为 drag 题的源侧/场景放大图，刻度仍映射到主图坐标。
+        temporal_image 为同一题面的连续帧序列图，用于 grows / jumps 等时间型题。
+        坐标始终以首张主图的 0-1000 空间为准，不使用任何辅助拼图整体坐标。
         """
 
         image_url = _image_url(image, media_type)
@@ -349,6 +426,54 @@ class OpenAIVisionClient:
                 }
             )
             content.append({"type": "image_url", "image_url": {"url": _image_url(grid_image, media_type)}})
+        if drag_detail_image:
+            content.append(
+                {
+                    "type": "text",
+                    "text": (
+                        "An additional image enlarges the movable SOURCE side and the DESTINATION "
+                        "SCENE for this drag challenge. Compare the source outline and internal edges "
+                        "with every candidate before choosing the matching destination. The red ring "
+                        "marks an exact source point. Tick labels in the destination panel are the "
+                        "original first-image 0-1000 coordinates. Report start/end in that original "
+                        "coordinate space, never in the detail-sheet pixel space, and place the end at "
+                        "the geometric center of the matching outline or gap."
+                    ),
+                }
+            )
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": _image_url(
+                            drag_detail_image,
+                            drag_detail_media_type or "image/jpeg",
+                        )
+                    },
+                }
+            )
+        if temporal_image:
+            content.append(
+                {
+                    "type": "text",
+                    "text": (
+                        "An additional image is a temporal contact sheet of the same scene, "
+                        "ordered left-to-right and top-to-bottom as t0, t1, ... tN. Compare panels "
+                        "to identify what grows, moves, changes, or jumps highest. The first main "
+                        "image is the same scene at the final tN panel. Report the target location "
+                        "using the 0-1000 coordinates of that main/final image, never the full "
+                        "contact-sheet coordinates."
+                    ),
+                }
+            )
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": _image_url(temporal_image, temporal_media_type or "image/jpeg")
+                    },
+                }
+            )
         payload = {
             "model": self.config.model,
             "messages": [
@@ -358,6 +483,9 @@ class OpenAIVisionClient:
                         "Return only one JSON object describing the visual challenge. "
                         "Use challenge_type grid, point, drag, or unknown; confidence from 0 to 1; "
                         "1-based tile_indices; points with x/y; and drags with start/end points. "
+                        "For a drag, start is the movable object and end is its matching destination; "
+                        "start and end must be different coordinates. If you use top-level source/target "
+                        "aliases, source is the movable object and target is the destination. "
                         "All coordinates are normalized integers or numbers from 0 through 1000."
                     ),
                 },
@@ -401,7 +529,12 @@ class OpenAIVisionClient:
         tiles: Any = None,
         round: int | None = None,
         grid_image: bytes | bytearray | memoryview | str | None = None,
+        temporal_image: bytes | bytearray | memoryview | str | None = None,
+        temporal_media_type: str = "image/jpeg",
+        drag_detail_image: bytes | bytearray | memoryview | str | None = None,
+        drag_detail_media_type: str = "image/jpeg",
         media_type: str = "image/png",
+        source_hint: Any = None,
         **_ignored: Any,
     ) -> VisionPlan:
         """Adapt an hCaptcha round request to the generic vision endpoint."""
@@ -409,6 +542,46 @@ class OpenAIVisionClient:
         details = [prompt.strip()] if prompt.strip() else []
         if task_type:
             details.append(f"Challenge type hint: {task_type}.")
+        if task_type == "drag":
+            # 真实 hCaptcha drag 题的可拖动源会标注 "Move"；目标是场景中与其
+            # 外观/语义匹配的对象或缺口。旧提示未说明这一规则，模型常把背景装饰、
+            # 目标本身或角色底座当成起点，连续答错导致挑战不断加题。
+            details.append(
+                "For drag challenges, the source is the movable object explicitly marked 'Move'. "
+                "Drag the center of that source to the center of the matching object or gap in the scene. "
+                "Do not choose background decorations or the target object as the source."
+            )
+        hint_points = _hint_points(source_hint)
+        if len(hint_points) == 1:
+            # 源已由本地像素检测确定，模型只需判断目标；实测模型自行找源的错误率高。
+            details.append(
+                f"The movable source object is already located at x={hint_points[0][0]:.0f}, "
+                f"y={hint_points[0][1]:.0f} in the 0-1000 coordinate space. Use exactly that point as "
+                "the drag start, and spend your analysis on the destination: report it as the drag "
+                "end, which must be a clearly different location."
+            )
+        elif hint_points:
+            listed = "; ".join(f"({point[0]:.0f}, {point[1]:.0f})" for point in hint_points)
+            details.append(
+                "The movable source objects have already been located at these 0-1000 coordinates: "
+                f"{listed}. Exactly one of them belongs with one destination in the scene. Choose the "
+                "matching pair, use that source coordinate verbatim as the drag start, and report its "
+                "destination as the drag end."
+            )
+        if hint_points:
+            mean_source_x = sum(point[0] for point in hint_points) / len(hint_points)
+            if mean_source_x < 400:
+                details.append(
+                    "All movable sources are in the left source column. The destination scene is on "
+                    "the opposite right side, so drag end.x must be at least 280. Never return a point "
+                    "inside a source card."
+                )
+            elif mean_source_x > 600:
+                details.append(
+                    "All movable sources are in the right source column. The destination scene is on "
+                    "the opposite left side, so drag end.x must be at most 720. Never return a point "
+                    "inside a source card."
+                )
         if isinstance(tiles, list) and tiles:
             details.append(f"The displayed grid has {len(tiles)} numbered tiles.")
         if round is not None:
@@ -417,6 +590,10 @@ class OpenAIVisionClient:
             image,
             prompt=" ".join(details) or None,
             grid_image=grid_image,
+            temporal_image=temporal_image,
+            temporal_media_type=temporal_media_type or "image/jpeg",
+            drag_detail_image=drag_detail_image,
+            drag_detail_media_type=drag_detail_media_type or "image/jpeg",
             media_type=media_type or "image/png",
         )
 
@@ -441,7 +618,14 @@ class OpenAIVisionClient:
                         return await self._send(fallback)
                     except Exception as retry_exc:
                         raise self._safe_transport_error(retry_exc) from None
-                if status not in self._TRANSIENT_STATUSES or attempt >= attempts - 1:
+                # 底层 http_request 会把连接中断、读取超时等无 HTTP 状态的网络错误
+                # 标为 transient=True。旧逻辑只看 status，导致
+                # "Remote end closed connection without response"（status=None）
+                # 单次即放弃；解析/schema 异常没有 transient 标记，仍不会误重试。
+                retryable = status in self._TRANSIENT_STATUSES or bool(
+                    getattr(exc, "transient", False)
+                )
+                if not retryable or attempt >= attempts - 1:
                     raise self._safe_transport_error(exc) from None
                 # 退避 + 抖动：上游刚被打满时立刻重试只会再撞一次。
                 delay = min(4.0, 0.6 * (2**attempt))
@@ -616,11 +800,54 @@ def _number(value: Any, label: str) -> int | float:
     return value
 
 
+def _hint_point(value: Any) -> tuple[float, float] | None:
+    """把调用方给出的源坐标提示收敛成 0-1000 内的 (x, y)；无效则忽略。
+
+    提示只影响 prompt 文案，不参与动作校验，因此这里静默忽略脏数据而不抛错。
+    """
+    if isinstance(value, Mapping):
+        raw = (value.get("x"), value.get("y"))
+    elif isinstance(value, (list, tuple)) and len(value) == 2:
+        raw = (value[0], value[1])
+    else:
+        return None
+    coords: list[float] = []
+    for item in raw:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            return None
+        number = float(item)
+        if not math.isfinite(number) or not 0 <= number <= 1000:
+            return None
+        coords.append(number)
+    return coords[0], coords[1]
+
+
+def _hint_points(value: Any) -> list[tuple[float, float]]:
+    """接受单个坐标或坐标序列，返回全部有效的 0-1000 提示点。"""
+    single = _hint_point(value)
+    if single is not None:
+        return [single]
+    if isinstance(value, (list, tuple)):
+        points = [_hint_point(item) for item in value]
+        return [point for point in points if point is not None]
+    return []
+
+
 def _point(value: Any, label: str) -> dict[str, int | float]:
     # 允许 [x, y] 与再包一层的 {"point": [x, y]}：实测 mimo-v2.5 返回
     # {"start": {"point": [850, 390]}}，不解包会把正确答案判为无效。
+    # 2026-08-15 又实测到 {"source": {"center": [800, 350]}}，同属包装层。
     if isinstance(value, Mapping):
-        for key in ("point", "coordinates", "coordinate", "position", "pos"):
+        for key in (
+            "point",
+            "coordinates",
+            "coordinate",
+            "position",
+            "pos",
+            "center",
+            "centre",
+            "center_point",
+        ):
             if key in value:
                 return _point(value.get(key), label)
     elif isinstance(value, (list, tuple)) and len(value) == 2:
@@ -636,13 +863,27 @@ def _point(value: Any, label: str) -> dict[str, int | float]:
 
 def _drag(value: Any) -> dict[str, dict[str, int | float]]:
     if isinstance(value, Mapping):
-        start = value.get("start", value.get("from"))
-        end = value.get("end", value.get("to"))
+        # 实测 mimo-v2.5 会返回 start_point / end_point；它们与 start / end
+        # 语义完全相同，不能让一个置信度 1 的有效拖拽答案因键名差异被丢弃。
+        start = value.get(
+            "start",
+            value.get(
+                "from", value.get("start_point", value.get("source", value.get("drag_start")))
+            ),
+        )
+        end = value.get(
+            "end",
+            value.get("to", value.get("end_point", value.get("target", value.get("drag_end")))),
+        )
     elif isinstance(value, (list, tuple)) and len(value) == 2:
         start, end = value
     else:
         raise VisionClientError("drags entries must contain start and end points")
-    return {"start": _point(start, "drags.start"), "end": _point(end, "drags.end")}
+    normalized_start = _point(start, "drags.start")
+    normalized_end = _point(end, "drags.end")
+    if normalized_start == normalized_end:
+        raise VisionClientError("drag start and end points must differ")
+    return {"start": normalized_start, "end": normalized_end}
 
 
 def _image_url(image: bytes | bytearray | memoryview | str, media_type: str) -> str:

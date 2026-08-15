@@ -12,9 +12,16 @@ from browser.hcaptcha import (
     HCaptchaOptions,
     HCaptchaSolveResult,
     HCaptchaSolver,
+    _image_fingerprint,
+    _is_temporal_prompt,
+    _task_type_from_prompt,
     _validated_answer,
     compress_for_vision,
     coordinate_grid_overlay,
+    detect_move_source,
+    detect_move_sources,
+    drag_detail_sheet,
+    temporal_contact_sheet,
     solve,
 )
 from browser.openai_vision import VisionClientError
@@ -403,8 +410,84 @@ def test_drag_uses_move_down_move_up() -> None:
     assert result.status == "success"
     assert ("down",) in page.mouse.events
     assert ("up",) in page.mouse.events
-    assert ("move", 100.0, 200.0, 5) in page.mouse.events
-    assert ("move", 500.0, 500.0, 15) in page.mouse.events
+    assert ("move", 100.0, 200.0, 1) in page.mouse.events
+    assert ("move", 500.0, 500.0, 2) in page.mouse.events
+    assert page.mouse.events.index(("down",)) < page.mouse.events.index(("up",))
+
+
+def test_drag_clicks_verify_that_replaces_skip_after_drop() -> None:
+    """真实 drag 题放下对象后按钮会由 Skip 变为 Verify，必须提交答案。"""
+    submit = FakeLocator(
+        text="Skip",
+        box={"x": 520, "y": 450, "width": 60, "height": 30},
+    )
+    frame = FakeFrame(
+        "https://newassets.hcaptcha.com/captcha/v1/challenge",
+        {
+            ".prompt-text": FakeLocator(text="Please drag the element to the place where it fits"),
+            ".challenge-container": FakeLocator(
+                box={"x": 100, "y": 200, "width": 400, "height": 300}
+            ),
+            "button.button-submit": submit,
+        },
+    )
+
+    class VerifyAfterDropMouse(FakeMouse):
+        async def up(self) -> None:
+            await super().up()
+            submit.text = "Verify"
+
+    page = FakePage(FakeFrame("https://site.invalid", children=[frame]))
+    page.mouse = VerifyAfterDropMouse()
+    solver = HCaptchaSolver(
+        page,
+        options=options(move_before_click=False, poll_interval_ms=10),
+    )
+    answer = {
+        "challenge_type": "drag",
+        "confidence": 1,
+        "drags": [{"start": {"x": 0, "y": 0}, "end": {"x": 1000, "y": 1000}}],
+    }
+
+    applied = run(solver._apply_drag(frame, answer))
+    run(solver.aclose())
+
+    assert applied is True
+    assert submit.text == "Verify"
+    assert ("click", 550.0, 465.0) in page.mouse.events
+    assert page.mouse.events.index(("up",)) < page.mouse.events.index(("click", 550.0, 465.0))
+
+
+def test_drag_end_timeout_always_releases_mouse() -> None:
+    """按下后的终段移动超时也必须 mouse.up，不能污染后续浏览器操作。"""
+
+    class StallingEndMouse(FakeMouse):
+        async def move(self, x: float, y: float, *, steps: int = 1) -> None:
+            if steps == 2:
+                await asyncio.sleep(30)
+                return
+            self.events.append(("move", x, y, steps))
+
+    frame = challenge_frame()
+    page = FakePage(FakeFrame("https://site.invalid", children=[frame]))
+    page.mouse = StallingEndMouse()
+    solver = HCaptchaSolver(
+        page,
+        options=options(drag_move_timeout_ms=100),
+    )
+    answer = {
+        "challenge_type": "drag",
+        "confidence": 1,
+        "drags": [{"start": {"x": 0, "y": 0}, "end": {"x": 1000, "y": 1000}}],
+    }
+
+    applied = run(solver._apply_drag(frame, answer))
+    run(solver.aclose())
+
+    assert applied is False
+    assert ("down",) in page.mouse.events
+    assert ("up",) in page.mouse.events
+    assert page.mouse.events.index(("down",)) < page.mouse.events.index(("up",))
 
 
 def test_low_confidence_empty_and_out_of_bounds_actions_do_not_click() -> None:
@@ -477,6 +560,32 @@ def test_json_secret_enables_default_vision_client(monkeypatch: Any, tmp_path: A
     run(solver.aclose())
 
 
+def test_round_budget_is_split_across_vision_attempts(monkeypatch: Any, tmp_path: Any) -> None:
+    """一次请求不得独占整轮，否则瞬时断连后的重试永远没有执行机会。"""
+    monkeypatch.setattr("browser.openai_vision._LOCAL_CONFIG_PATH", tmp_path / "missing.json")
+    monkeypatch.setenv(
+        "HCAPTCHA_VISION_CONFIG",
+        '{"api_key":"k","base_url":"https://v.example/v1",'
+        '"model":"m","timeout_ms":240000}',
+    )
+    solver = HCaptchaSolver(
+        FakePage(FakeFrame("https://site.invalid")),
+        options=options(
+            round_timeout_ms=125_000,
+            vision_max_attempts=3,
+            vision_retry_reserve_ms=4_000,
+        ),
+    )
+
+    client = run(solver._default_vision_client())
+
+    assert solver._vision_attempt_timeout_ms() == 40_333
+    assert client is not None
+    assert abs(client.config.timeout - 40.333) < 0.001
+    assert client.max_attempts == 3
+    run(solver.aclose())
+
+
 def test_max_rounds_is_finite() -> None:
     frame = challenge_frame(tiles=2)
     page = FakePage(FakeFrame("https://site.invalid", children=[frame]), responses=[(True, "")])
@@ -538,6 +647,319 @@ def _png(width: int, height: int, color: tuple[int, int, int]) -> bytes:
     buffer = BytesIO()
     Image.new("RGB", (width, height), color).save(buffer, format="PNG")
     return buffer.getvalue()
+
+
+def test_prompt_task_type_inference_uses_visible_instruction() -> None:
+    assert _task_type_from_prompt("Please drag the element to the gap", has_tiles=False) == "drag"
+    assert _task_type_from_prompt("Please click on the animal", has_tiles=False) == "point"
+    assert _task_type_from_prompt("Move ONE animal to the matching silhouette", has_tiles=False) == "drag"
+    assert (
+        _task_type_from_prompt(
+            "Find all animals based on the number provided", has_tiles=False
+        )
+        == "point"
+    )
+    assert _task_type_from_prompt("Please click all buses", has_tiles=True) == "grid"
+    assert _task_type_from_prompt("Solve this challenge", has_tiles=False) == "unknown"
+
+
+def test_temporal_prompt_detection_and_contact_sheet() -> None:
+    from io import BytesIO
+
+    from PIL import Image
+
+    assert _is_temporal_prompt("Please click on the shape that grows")
+    assert _is_temporal_prompt("Please click on the animal who jumps the highest")
+    assert not _is_temporal_prompt("Please click on the two crosses")
+
+    frames = [_png(200, 160, (20 + index * 20, 40, 80)) for index in range(6)]
+    sheet = temporal_contact_sheet(frames, columns=3, max_edge=800, quality=72)
+
+    assert sheet
+    with Image.open(BytesIO(sheet)) as image:
+        assert image.format == "JPEG"
+        assert max(image.size) <= 800
+        assert image.width > image.height
+
+
+def test_temporal_point_round_attaches_sequence_image_only_when_needed() -> None:
+    class SequencePage(FakePage):
+        def __init__(self, main_frame: FakeFrame, images: list[bytes]) -> None:
+            super().__init__(main_frame)
+            self.images = list(images)
+
+        async def screenshot(self, **kwargs: Any) -> bytes:
+            self.page_screenshots.append(kwargs)
+            return self.images.pop(0) if len(self.images) > 1 else self.images[0]
+
+    temporal_frame = FakeFrame(
+        "https://newassets.hcaptcha.com/captcha/v1/challenge",
+        {
+            ".prompt-text": FakeLocator(text="Please click on the shape that grows"),
+            ".challenge-container": FakeLocator(),
+        },
+    )
+    temporal_images = [
+        _png(200, 160, (30, 40, 50)),
+        _png(200, 160, (80, 90, 100)),
+        _png(200, 160, (140, 150, 160)),
+    ]
+    temporal_page = SequencePage(
+        FakeFrame("https://site.invalid", children=[temporal_frame]), temporal_images
+    )
+    temporal_solver = HCaptchaSolver(
+        temporal_page,
+        options=options(
+            temporal_frames=3,
+            temporal_interval_ms=10,
+            temporal_sheet_max_edge=600,
+            compress_uploads=False,
+        ),
+    )
+    temporal_request = run(temporal_solver._capture_round(temporal_frame, 1))
+    run(temporal_solver.aclose())
+
+    static_frame = FakeFrame(
+        "https://newassets.hcaptcha.com/captcha/v1/challenge",
+        {
+            ".prompt-text": FakeLocator(text="Please click on the two crosses"),
+            ".challenge-container": FakeLocator(),
+        },
+    )
+    static_page = FakePage(FakeFrame("https://site.invalid", children=[static_frame]))
+    static_solver = HCaptchaSolver(
+        static_page,
+        options=options(temporal_frames=3, temporal_interval_ms=10),
+    )
+    static_request = run(static_solver._capture_round(static_frame, 1))
+    run(static_solver.aclose())
+
+    assert temporal_request.get("temporal_image")
+    assert temporal_request["temporal_media_type"] == "image/jpeg"
+    assert temporal_request["image"] == temporal_images[-1]
+    assert temporal_request["temporal_phase_image"] == temporal_images[-1]
+    assert len(temporal_page.page_screenshots) == 3
+    assert "temporal_image" not in static_request
+    assert len(static_page.page_screenshots) == 1
+
+
+def _striped_png(width: int, height: int, stripes: int) -> bytes:
+    """竖条纹 PNG：dHash 比较横向相邻像素，条纹数不同则指纹必然不同。"""
+    from io import BytesIO
+
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", (width, height), (240, 240, 240))
+    draw = ImageDraw.Draw(image)
+    band = max(1, width // max(1, stripes))
+    for index in range(stripes):
+        if index % 2:
+            draw.rectangle((index * band, 0, (index + 1) * band, height), fill=(20, 20, 20))
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def test_grid_fingerprint_ignores_locally_injected_tile_labels() -> None:
+    """指纹必须基于无标签画面，否则模型答案会被误判为「题面已更新」而丢弃。"""
+
+    class LabelAwareFrame(FakeFrame):
+        def __init__(self, url: str, selectors: dict[str, FakeLocator]) -> None:
+            super().__init__(url, selectors)
+            self.labels_on = False
+
+        async def evaluate(self, script: str, arg: Any = None) -> Any:
+            self.evaluations.append((script, arg))
+            # 移除脚本只出现连字符属性与 badge.remove()，新增脚本才带驼峰 dataset 名。
+            if "remove()" in script:
+                self.labels_on = False
+                return None
+            if "nfHcaptchaIndex" in script:
+                self.labels_on = True
+                return len(self.selectors.get(".task-image", EmptyLocator()).items or [])
+            return len(self.selectors.get(".task-image", EmptyLocator()).items or [])
+
+    class LabelAwarePage(FakePage):
+        def __init__(self, main_frame: FakeFrame, challenge: LabelAwareFrame) -> None:
+            super().__init__(main_frame)
+            self.challenge = challenge
+
+        async def screenshot(self, **kwargs: Any) -> bytes:
+            self.page_screenshots.append(kwargs)
+            # 标签开启时画面明显不同，模拟真实注入的红色序号徽章。
+            if self.challenge.labels_on:
+                return _striped_png(200, 160, 8)
+            return _striped_png(200, 160, 2)
+
+    tiles = [FakeLocator(box={"x": 100 + index * 40, "y": 200, "width": 36, "height": 36}) for index in range(9)]
+    challenge = LabelAwareFrame(
+        "https://newassets.hcaptcha.com/captcha/v1/challenge",
+        {
+            ".prompt-text": FakeLocator(text="Click on all objects smaller than the example"),
+            ".challenge-container": FakeLocator(box={"x": 100, "y": 200, "width": 400, "height": 300}),
+            ".task-image": FakeLocator(items=tiles),
+        },
+    )
+    page = LabelAwarePage(FakeFrame("https://site.invalid", children=[challenge]), challenge)
+    solver = HCaptchaSolver(page, options=options(compress_uploads=False))
+
+    request = run(solver._capture_round(challenge, 1))
+    fingerprint = str(request["challenge_fingerprint"])
+    _frame, _target, same = run(
+        solver._refresh_action_context(
+            challenge,
+            task_type="grid",
+            prompt="Click on all objects smaller than the example",
+            original_fingerprint=fingerprint,
+        )
+    )
+    run(solver.aclose())
+
+    assert len(request["tiles"]) == 9
+    # 两种画面的指纹必须确实不同，否则本测试无法证明修复生效。
+    assert _image_fingerprint(_striped_png(200, 160, 8)) != _image_fingerprint(
+        _striped_png(200, 160, 2)
+    )
+    # 发给模型的图仍带标签，用于指纹的参考图不带标签，因此复核判定为同一题。
+    assert request["image"] == _striped_png(200, 160, 8)
+    assert fingerprint == _image_fingerprint(_striped_png(200, 160, 2))
+    assert same is True
+
+
+def _drag_scene(
+    badges: tuple[tuple[int, int], ...] = ((394, 119),), size: tuple[int, int] = (500, 470)
+) -> bytes:
+    """合成 drag 题图：中亮度背景 + 近黑 Move 胶囊（内含白字块）。"""
+    from io import BytesIO
+
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", size, (150, 180, 200))
+    draw = ImageDraw.Draw(image)
+    for x, y in badges:
+        draw.rectangle((x, y, x + 59, y + 19), fill=(30, 35, 45))
+        for offset in (10, 24, 38):
+            draw.rectangle((x + offset, y + 7, x + offset + 5, y + 12), fill=(255, 255, 255))
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def test_detect_move_source_finds_single_badge_and_refuses_ambiguity() -> None:
+    """Move 胶囊唯一时给出源中心；缺失、多候选或无法定位时必须放弃而不是猜。"""
+    detected = detect_move_source(_drag_scene())
+
+    assert detected is not None
+    # 合成胶囊宽 60（白字团合并约 44）、中心约 x=421，中心点下移到源方块主体，
+    # 归一化到 0-1000 后 x=842、y≈339。
+    assert round(detected[0]) == 842
+    assert abs(detected[1] - 339) <= 2
+
+    # 等比缩放后归一化坐标必须保持一致（真实链路会先压缩再上传）。
+    compressed, _media = compress_for_vision(_drag_scene(), max_edge=250, quality=90)
+    scaled = detect_move_source(compressed)
+    assert scaled is not None
+    assert abs(scaled[0] - detected[0]) <= 12
+    assert abs(scaled[1] - detected[1]) <= 12
+
+    assert detect_move_source(_png(500, 470, (150, 180, 200))) is None
+    assert detect_move_source(b"") is None
+    assert detect_move_source(b"not-an-image") is None
+    # 多候选时唯一源检测必须拒绝，交由多源检测与视觉模型判断。
+    assert detect_move_source(_drag_scene(badges=((394, 119), (60, 119)))) is None
+
+
+def test_detect_move_sources_finds_all_badges() -> None:
+    """多源题必须检出全部可拖动元素，且尺寸一致的误检块要被剔除。"""
+    sources = detect_move_sources(_drag_scene(badges=((60, 119), (394, 119))))
+
+    assert len(sources) == 2
+    x_values = sorted(round(point[0]) for point in sources)
+    assert x_values == [174, 842]
+    assert all(abs(point[1] - 339) <= 2 for point in sources)
+
+
+def test_drag_detail_sheet_enlarges_both_sides_and_keeps_original_coordinate_ticks() -> None:
+    from io import BytesIO
+
+    from PIL import Image
+
+    detail = drag_detail_sheet(_drag_scene(), [(848.0, 358.0)], max_edge=900, quality=82)
+
+    assert detail
+    with Image.open(BytesIO(detail)) as decoded:
+        assert decoded.format == "JPEG"
+        assert max(decoded.size) <= 900
+        assert decoded.width > decoded.height
+    assert drag_detail_sheet(_drag_scene(), []) == b""
+    assert drag_detail_sheet(_drag_scene(), [(500.0, 400.0)]) == b""
+
+
+def test_drag_round_attaches_high_resolution_detail_image() -> None:
+    class DragScenePage(FakePage):
+        async def screenshot(self, **kwargs: Any) -> bytes:
+            self.page_screenshots.append(kwargs)
+            return _drag_scene()
+
+    frame = FakeFrame(
+        "https://newassets.hcaptcha.com/captcha/v1/challenge",
+        {
+            ".prompt-text": FakeLocator(text="Please drag the element to the place where it fits"),
+            ".challenge-container": FakeLocator(
+                box={"x": 100, "y": 200, "width": 500, "height": 470}
+            ),
+        },
+    )
+    page = DragScenePage(FakeFrame("https://site.invalid", children=[frame]))
+    solver = HCaptchaSolver(page, options=options(compress_uploads=False))
+    solver._network_task_type = "drag"
+
+    request = run(solver._capture_round(frame, 1))
+    run(solver.aclose())
+
+    assert request["source_hint"]
+    assert request["drag_detail_image"]
+    assert request["drag_detail_media_type"] == "image/jpeg"
+    assert "grid_image" not in request
+    assert request["image"] == _drag_scene()
+
+
+def test_drag_start_uses_detected_source_and_fixes_reversed_direction() -> None:
+    """检测到的源覆盖模型起点；模型写反方向时按距离自动纠正。"""
+    frame = challenge_frame()
+    page = FakePage(FakeFrame("https://site.invalid", children=[frame]))
+    solver = HCaptchaSolver(page, options=options())
+    answer = {
+        "challenge_type": "drag",
+        "confidence": 1,
+        "drags": [{"start": {"x": 100, "y": 100}, "end": {"x": 900, "y": 900}}],
+    }
+
+    applied = run(solver._apply_drag(frame, answer, source_points=[(900.0, 900.0)]))
+    run(solver.aclose())
+
+    assert applied is True
+    # box=(100,200,400,300)：源 (900,900) → (460,470)，目标 (100,100) → (140,230)。
+    assert ("move", 460.0, 470.0, 1) in page.mouse.events
+    assert ("move", 140.0, 230.0, 2) in page.mouse.events
+
+
+def test_drag_refuses_when_both_model_points_hug_detected_source() -> None:
+    """两端都紧贴检测源时无法判断目标，必须判为不确定而不是原地拖拽。"""
+    frame = challenge_frame()
+    page = FakePage(FakeFrame("https://site.invalid", children=[frame]))
+    solver = HCaptchaSolver(page, options=options())
+    answer = {
+        "challenge_type": "drag",
+        "confidence": 1,
+        "drags": [{"start": {"x": 510, "y": 500}, "end": {"x": 500, "y": 520}}],
+    }
+
+    applied = run(solver._apply_drag(frame, answer, source_points=[(500.0, 500.0)]))
+    run(solver.aclose())
+
+    assert applied is False
+    assert ("down",) not in page.mouse.events
 
 
 def test_coordinate_grid_overlay_keeps_size_and_adds_marks() -> None:
@@ -695,6 +1117,132 @@ def test_widget_present_but_iframe_not_ready_keeps_waiting() -> None:
     assert any("尚未就绪" in line for line in logs)
 
 
+def test_submit_selector_ignores_skip_and_offscreen_candidates() -> None:
+    """hCaptcha 的 .button-submit 可能实际是 Skip，离屏旧挑战也会保持 visible。"""
+    logs: list[str] = []
+    frame = FakeFrame(
+        "https://newassets.hcaptcha.com/captcha/v1/challenge",
+        {
+            "button.button-submit": FakeLocator(
+                text="Skip", box={"x": 500, "y": 600, "width": 60, "height": 30}
+            ),
+            "button[type='submit']": FakeLocator(
+                text="Submit", box={"x": 400, "y": -9458, "width": 60, "height": 30}
+            ),
+        },
+    )
+    solver = HCaptchaSolver(
+        FakePage(FakeFrame("https://site.invalid")), options=options(), log=logs.append
+    )
+
+    submit = run(solver._first_submit_locator(frame, timeout_ms=0))
+    run(solver.aclose())
+
+    assert submit is None
+    assert any("跳过按钮" in line for line in logs)
+    assert any("离屏" in line for line in logs)
+
+
+def test_submit_selector_keeps_real_verify_button_clickable() -> None:
+    verify = FakeLocator(text="Verify", box={"x": 520, "y": 450, "width": 60, "height": 30})
+    frame = FakeFrame(
+        "https://newassets.hcaptcha.com/captcha/v1/challenge",
+        {"button.button-submit": verify},
+    )
+    page = FakePage(FakeFrame("https://site.invalid"))
+    page.viewport_size = {"width": 1280, "height": 720}
+    solver = HCaptchaSolver(page, options=options())
+
+    submit = run(solver._first_submit_locator(frame, timeout_ms=0))
+    clicked = run(solver._mouse_click_locator(submit, label="提交按钮"))
+    run(solver.aclose())
+
+    assert submit is verify
+    assert clicked is True
+    assert ("click", 550.0, 465.0) in page.mouse.events
+
+
+def test_direct_click_mode_skips_pre_move() -> None:
+    class ClickableLocator(FakeLocator):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.clicks: list[dict[str, Any]] = []
+
+        async def click(self, **kwargs: Any) -> None:
+            self.clicks.append(kwargs)
+
+    frame = challenge_frame(tiles=1)
+    page = FakePage(FakeFrame("https://site.invalid", children=[frame]))
+    solver = HCaptchaSolver(page, options=options(move_before_click=False))
+    target = ClickableLocator(box={"x": 10, "y": 20, "width": 40, "height": 40})
+
+    clicked = run(solver._mouse_click_locator(target, label="测试元素"))
+    run(solver.aclose())
+
+    assert clicked is True
+    assert target.clicks == [{"force": True, "timeout": 5_000}]
+    assert page.mouse.events == []
+
+
+def test_direct_point_uses_locator_relative_position() -> None:
+    class ClickableLocator(FakeLocator):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.clicks: list[dict[str, Any]] = []
+
+        async def click(self, **kwargs: Any) -> None:
+            self.clicks.append(kwargs)
+
+    target = ClickableLocator(box={"x": 100, "y": 200, "width": 400, "height": 300})
+    frame = FakeFrame("https://newassets.hcaptcha.com/captcha/v1/challenge")
+    page = FakePage(FakeFrame("https://site.invalid", children=[frame]))
+    solver = HCaptchaSolver(page, options=options(move_before_click=False, poll_interval_ms=10))
+
+    applied = run(
+        solver._apply_point(
+            frame,
+            {"points": [{"x": 250, "y": 500}]},
+            target=target,
+        )
+    )
+    run(solver.aclose())
+
+    assert applied is True
+    assert target.clicks == [
+        {
+            "force": True,
+            "timeout": 5_000,
+            "position": {"x": 100.0, "y": 150.0},
+        }
+    ]
+    assert page.mouse.events == []
+
+
+def test_slow_click_is_bounded() -> None:
+    import time as _time
+
+    class SlowClickMouse(FakeMouse):
+        async def click(self, x: float, y: float) -> None:
+            await asyncio.sleep(30)
+            self.events.append(("click", x, y))
+
+    page = FakePage(FakeFrame("https://site.invalid"))
+    page.mouse = SlowClickMouse()
+    solver = HCaptchaSolver(
+        page,
+        options=options(move_before_click=False, click_timeout_ms=100),
+    )
+
+    began = _time.monotonic()
+    clicked = run(solver._mouse_click_at(30, 40, label="测试元素"))
+    elapsed = _time.monotonic() - began
+    run(solver.aclose())
+
+    assert clicked is False
+    assert elapsed < 2
+    assert page.mouse.events == []
+
+
 def test_slow_humanized_move_cannot_stall_the_click() -> None:
     """拟人化移动必须有上限：否则点击开销会吃光预算，表现为「总体超时、零次调用」。
 
@@ -774,6 +1322,111 @@ def test_junk_field_does_not_block_type_inference_but_real_conflict_still_does()
     assert conflict.get("_invalid") is True
 
 
+def test_singular_point_alias_is_accepted_by_solver_normalizer() -> None:
+    normalized = _validated_answer(
+        {"challenge_type": "point", "confidence": 1, "point": {"x": 317, "y": 444}}
+    )
+
+    assert normalized is not None
+    assert normalized["challenge_type"] == "point"
+    assert normalized["points"] == [{"x": 317.0, "y": 444.0}]
+
+    target = _validated_answer(
+        {"challenge_type": "point", "confidence": 0.95, "target": {"x": 753, "y": 623}}
+    )
+    assert target is not None
+    assert target["points"] == [{"x": 753.0, "y": 623.0}]
+
+
+def test_nested_row_column_hints_are_ignored_only_with_valid_point_actions() -> None:
+    normalized = _validated_answer(
+        {
+            "challenge_type": "unknown",
+            "confidence": 0.95,
+            "points": [{"x": 337, "y": 531}, {"x": 632, "y": 853}],
+            "tile_indices": [[2, 1], [4, 2]],
+        }
+    )
+    assert normalized is not None
+    assert normalized["challenge_type"] == "point"
+    assert normalized["tile_indices"] == []
+    assert normalized["points"] == [
+        {"x": 337.0, "y": 531.0},
+        {"x": 632.0, "y": 853.0},
+    ]
+
+    invalid = _validated_answer(
+        {
+            "challenge_type": "unknown",
+            "confidence": 0.95,
+            "tile_indices": [[2, 1], [4, 2]],
+        }
+    )
+    assert invalid is not None and invalid.get("_invalid") is True
+
+
+def test_drag_endpoint_points_are_ignored_only_when_exact_duplicates() -> None:
+    normalized = _validated_answer(
+        {
+            "challenge_type": "drag",
+            "confidence": 1,
+            "drags": [{"start": [860, 360], "end": [190, 650]}],
+            "points": [[190, 650], [860, 360]],
+        }
+    )
+    assert normalized is not None
+    assert not normalized.get("_invalid")
+    assert normalized["points"] == []
+    assert normalized["drags"] == [
+        {"start": {"x": 860.0, "y": 360.0}, "end": {"x": 190.0, "y": 650.0}}
+    ]
+
+    conflict = _validated_answer(
+        {
+            "challenge_type": "drag",
+            "confidence": 1,
+            "drags": [{"start": [860, 360], "end": [190, 650]}],
+            "points": [[999, 999]],
+        }
+    )
+    assert conflict is not None and conflict.get("_invalid") is True
+
+
+def test_singular_drag_alias_with_nested_points_is_accepted() -> None:
+    normalized = _validated_answer(
+        {
+            "challenge_type": "drag",
+            "confidence": 1,
+            "drag": {
+                "start": {"point": [915, 600]},
+                "end": {"point": [135, 420]},
+            },
+        }
+    )
+
+    assert normalized is not None
+    assert normalized["drags"] == [
+        {"start": {"x": 915.0, "y": 600.0}, "end": {"x": 135.0, "y": 420.0}}
+    ]
+
+
+def test_top_level_source_target_point_aliases_are_accepted() -> None:
+    normalized = _validated_answer(
+        {
+            "challenge_type": "drag",
+            "confidence": 0.95,
+            "source_point": {"x": 570, "y": 800},
+            "target_point": {"x": 320, "y": 450},
+        }
+    )
+
+    assert normalized is not None
+    assert normalized["challenge_type"] == "drag"
+    assert normalized["drags"] == [
+        {"start": {"x": 570.0, "y": 800.0}, "end": {"x": 320.0, "y": 450.0}}
+    ]
+
+
 def test_real_drag_output_with_elements_and_nested_point_is_accepted() -> None:
     """实测 mimo-v2.5 的 drag 返回：elements 键 + start/end 内再包一层 point。
 
@@ -794,6 +1447,25 @@ def test_real_drag_output_with_elements_and_nested_point_is_accepted() -> None:
     assert normalized["challenge_type"] == "drag"
     assert normalized["drags"] == [
         {"start": {"x": 850.0, "y": 390.0}, "end": {"x": 550.0, "y": 350.0}}
+    ]
+
+
+def test_real_drag_output_with_start_point_aliases_is_accepted() -> None:
+    """2026-08-14 实测返回 start_point/end_point，必须归一化成 start/end。"""
+    real_output = {
+        "challenge_type": "drag",
+        "confidence": 1,
+        "drags": [
+            {"start_point": {"x": 870, "y": 596}, "end_point": {"x": 430, "y": 381}}
+        ],
+    }
+
+    normalized = _validated_answer(real_output)
+
+    assert normalized is not None
+    assert not normalized.get("_invalid")
+    assert normalized["drags"] == [
+        {"start": {"x": 870.0, "y": 596.0}, "end": {"x": 430.0, "y": 381.0}}
     ]
 
 
@@ -984,6 +1656,121 @@ def test_empty_capture_never_reaches_the_model() -> None:
     assert result.failure_stage == "empty_capture"
 
 
+def test_align_temporal_phase_waits_for_matching_final_frame() -> None:
+    class SequenceScreenshotPage(FakePage):
+        def __init__(self, main_frame: FakeFrame, images: list[bytes]) -> None:
+            super().__init__(main_frame)
+            self.images = list(images)
+
+        async def screenshot(self, **kwargs: Any) -> bytes:
+            self.page_screenshots.append(kwargs)
+            return self.images.pop(0) if len(self.images) > 1 else self.images[0]
+
+    target_image = _png(300, 200, (30, 50, 90))
+    different_image = _png(300, 200, (220, 200, 150))
+    fresh = challenge_frame()
+    page = SequenceScreenshotPage(
+        FakeFrame("https://site.invalid", children=[fresh]),
+        [different_image, target_image],
+    )
+    solver = HCaptchaSolver(
+        page,
+        options=options(
+            compress_uploads=False,
+            temporal_phase_wait_ms=1_000,
+            poll_interval_ms=10,
+        ),
+    )
+
+    frame, target, aligned = run(
+        solver._align_temporal_phase(
+            fresh,
+            task_type="point",
+            prompt="请选择所有公交车",
+            target_image=target_image,
+        )
+    )
+    run(solver.aclose())
+
+    assert aligned is True
+    assert frame is fresh
+    assert target is not None
+    assert len(page.page_screenshots) == 2
+    assert not page.mouse.events
+
+
+def test_refresh_action_context_accepts_replaced_frame_for_same_image() -> None:
+    """模型返回期间 iframe 可被替换；同题时应刷新 locator，而非使用 detached 旧节点。"""
+
+    class SequenceScreenshotPage(FakePage):
+        def __init__(self, main_frame: FakeFrame, images: list[bytes]) -> None:
+            super().__init__(main_frame)
+            self.images = list(images)
+
+        async def screenshot(self, **kwargs: Any) -> bytes:
+            self.page_screenshots.append(kwargs)
+            return self.images.pop(0) if len(self.images) > 1 else self.images[0]
+
+    image = coordinate_grid_overlay(_png(300, 200, (90, 120, 160)))
+    old = challenge_frame()
+    fresh = challenge_frame()
+    page = SequenceScreenshotPage(FakeFrame("https://site.invalid", children=[fresh]), [image, image])
+    solver = HCaptchaSolver(page, options=options(compress_uploads=False))
+    request = run(solver._capture_round(old, 1))
+
+    frame, target, same = run(
+        solver._refresh_action_context(
+            old,
+            task_type=str(request["task_type"]),
+            prompt=str(request["prompt"]),
+            original_fingerprint=str(request["challenge_fingerprint"]),
+        )
+    )
+    run(solver.aclose())
+
+    assert same is True
+    assert frame is fresh
+    assert target is not None
+
+
+def test_refresh_action_context_rejects_new_challenge_image() -> None:
+    """模型返回时已换题必须丢弃旧坐标，不能把旧答案点击到新题。"""
+
+    class SequenceScreenshotPage(FakePage):
+        def __init__(self, main_frame: FakeFrame, images: list[bytes]) -> None:
+            super().__init__(main_frame)
+            self.images = list(images)
+
+        async def screenshot(self, **kwargs: Any) -> bytes:
+            self.page_screenshots.append(kwargs)
+            return self.images.pop(0) if len(self.images) > 1 else self.images[0]
+
+    old_image = coordinate_grid_overlay(_png(300, 200, (20, 20, 20)))
+    new_image = coordinate_grid_overlay(_png(300, 200, (240, 240, 240)), divisions=5)
+    old = challenge_frame()
+    fresh = challenge_frame()
+    page = SequenceScreenshotPage(
+        FakeFrame("https://site.invalid", children=[fresh]), [old_image, new_image]
+    )
+    solver = HCaptchaSolver(page, options=options(compress_uploads=False))
+    request = run(solver._capture_round(old, 1))
+
+    frame, target, same = run(
+        solver._refresh_action_context(
+            old,
+            task_type=str(request["task_type"]),
+            prompt=str(request["prompt"]),
+            original_fingerprint=str(request["challenge_fingerprint"]),
+        )
+    )
+    run(solver.aclose())
+
+    assert same is False
+    assert frame is fresh
+    assert target is not None
+    assert not any(event[0] == "click" for event in page.mouse.events)
+
+
 def test_second_round_waits_for_token_when_challenge_dismissed() -> None:
     """第 1 轮动作后挑战收起时，应等令牌而不是把空白图发给模型。"""
 
@@ -1033,6 +1820,96 @@ def test_second_round_waits_for_token_when_challenge_dismissed() -> None:
     assert len(vision.calls) == 1, "挑战收起后不应再发起第 2 轮模型调用"
     assert result.status == "success"
     assert result.token == "second-round-token"
+
+
+def test_dismissed_challenge_restarts_explicitly_unchecked_checkbox_once() -> None:
+    """挑战收起且 aria-checked=false 时只重启一次，并可接收重启后的 token。"""
+
+    class AriaLocator(FakeLocator):
+        async def get_attribute(self, name: str) -> str | None:
+            return "false" if name == "aria-checked" else None
+
+    checkbox = FakeFrame(
+        "https://newassets.hcaptcha.com/captcha/v1/checkbox",
+        {"#checkbox": AriaLocator()},
+    )
+    live = challenge_frame()
+    page = FakePage(FakeFrame("https://site.invalid", children=[checkbox, live]))
+    solver = HCaptchaSolver(
+        page,
+        options=options(
+            max_rounds=3,
+            round_timeout_ms=2_000,
+            post_action_wait_ms=0,
+            widget_mount_timeout_ms=0,
+        ),
+        vision_client=FakeVision([]),
+    )
+    live_state = True
+    progress_calls = 0
+    click_calls = 0
+
+    async def locate() -> tuple[bool, str, Any | None, Any | None]:
+        return True, "", None, live
+
+    async def challenge_is_live(_frame: Any) -> bool:
+        return live_state
+
+    async def capture_round(_frame: Any, round_number: int) -> dict[str, Any]:
+        image = _png(100, 100, (80, 90, 100))
+        return {
+            "round": round_number,
+            "prompt": "click the target",
+            "task_type": "point",
+            "image": image,
+            "media_type": "image/png",
+            "tiles": [],
+            "action_target": FakeLocator(),
+            "challenge_fingerprint": _image_fingerprint(image),
+        }
+
+    async def ask_vision(_request: Any) -> dict[str, Any]:
+        return {"challenge_type": "point", "confidence": 1, "points": [{"x": 500, "y": 500}]}
+
+    async def refresh_context(*_args: Any, **_kwargs: Any) -> tuple[Any, Any, bool]:
+        return live, FakeLocator(), True
+
+    async def apply_answer(*_args: Any, **_kwargs: Any) -> str:
+        nonlocal live_state
+        live_state = False
+        return "applied"
+
+    async def wait_for_progress() -> tuple[str, Any | None, bool]:
+        nonlocal progress_calls
+        progress_calls += 1
+        if progress_calls < 3:
+            return "", live, False
+        return "reset-token", None, True
+
+    async def find_frames() -> tuple[Any, Any]:
+        return checkbox, live
+
+    async def click_checkbox(_frame: Any) -> bool:
+        nonlocal click_calls
+        click_calls += 1
+        return True
+
+    solver._locate = locate  # type: ignore[method-assign]
+    solver._challenge_is_live = challenge_is_live  # type: ignore[method-assign]
+    solver._capture_round = capture_round  # type: ignore[method-assign]
+    solver._ask_vision = ask_vision  # type: ignore[method-assign]
+    solver._refresh_action_context = refresh_context  # type: ignore[method-assign]
+    solver._apply_answer = apply_answer  # type: ignore[method-assign]
+    solver._wait_for_progress = wait_for_progress  # type: ignore[method-assign]
+    solver._find_frames = find_frames  # type: ignore[method-assign]
+    solver._click_checkbox = click_checkbox  # type: ignore[method-assign]
+
+    result = run(solver.solve())
+    run(solver.aclose())
+
+    assert result.status == "success"
+    assert result.token == "reset-token"
+    assert click_calls == 1
 
 
 def test_blocking_dom_probe_cannot_consume_whole_budget() -> None:
@@ -1118,6 +1995,88 @@ def test_no_widget_still_reports_not_present() -> None:
     assert result.status == "not_present"
 
 
+def test_checkbox_falls_back_to_locator_click_when_coordinates_disappear() -> None:
+    """iframe 在定位后替换时 bounding_box 可为空，应重新定位并用 locator.click。"""
+
+    class ClickableNoBox(FakeLocator):
+        def __init__(self) -> None:
+            super().__init__()
+            self.clicks = 0
+
+        async def bounding_box(self) -> None:
+            return None
+
+        async def click(self, *, timeout: int) -> None:
+            assert timeout == 5_000
+            self.clicks += 1
+
+    checkbox_locator = ClickableNoBox()
+    checkbox = FakeFrame(
+        "https://newassets.hcaptcha.com/captcha/v1/checkbox",
+        {"#checkbox": checkbox_locator},
+    )
+    page = FakePage(FakeFrame("https://site.invalid", children=[checkbox]))
+    solver = HCaptchaSolver(page, options=options())
+
+    clicked = run(solver._click_checkbox(checkbox))
+    run(solver.aclose())
+
+    assert clicked is True
+    assert checkbox_locator.clicks == 1
+
+
+def test_checkbox_is_retried_once_when_first_click_produces_no_challenge() -> None:
+    """首次点击静默失效时重试一次；第二次出现题面后继续求解。"""
+    empty = FakeFrame(
+        "https://newassets.hcaptcha.com/captcha/v1/challenge",
+        {".challenge-container": FakeLocator(box={"x": 10, "y": 10, "width": 376, "height": 190})},
+    )
+    checkbox = FakeFrame(
+        "https://newassets.hcaptcha.com/captcha/v1/checkbox",
+        {"#checkbox": FakeLocator(box={"x": 20, "y": 30, "width": 28, "height": 28})},
+    )
+    live = challenge_frame()
+    page = FakePage(FakeFrame("https://site.invalid", children=[checkbox, empty]))
+    solver = HCaptchaSolver(
+        page,
+        options=options(post_action_wait_ms=0, widget_mount_timeout_ms=0),
+        vision_client=FakeVision(
+            [{"type": "point", "confidence": 0.9, "points": [{"x": 500, "y": 500}]}]
+        ),
+    )
+    click_calls = 0
+    progress_calls = 0
+    live_calls = 0
+
+    async def click_checkbox(_frame: Any) -> bool:
+        nonlocal click_calls
+        click_calls += 1
+        return True
+
+    async def wait_for_progress() -> tuple[str, Any | None, bool]:
+        nonlocal progress_calls
+        progress_calls += 1
+        if progress_calls < 3:
+            return "", empty, False
+        return "retry-token", None, True
+
+    async def wait_for_live(_frame: Any, *, timeout_ms: int | None = None) -> Any | None:
+        nonlocal live_calls
+        live_calls += 1
+        return None if live_calls == 1 else live
+
+    solver._click_checkbox = click_checkbox  # type: ignore[method-assign]
+    solver._wait_for_progress = wait_for_progress  # type: ignore[method-assign]
+    solver._wait_for_live_challenge = wait_for_live  # type: ignore[method-assign]
+
+    result = run(solver.solve())
+    run(solver.aclose())
+
+    assert click_calls == 2
+    assert result.status == "success"
+    assert result.token == "retry-token"
+
+
 def test_prerendered_empty_challenge_still_clicks_checkbox() -> None:
     """空壳 challenge iframe 不得跳过复选框点击，也不得把黑图发给模型。"""
     empty = FakeFrame(
@@ -1140,6 +2099,57 @@ def test_prerendered_empty_challenge_still_clicks_checkbox() -> None:
     assert vision.calls == []
     assert result.status == "success"
     assert result.token == "checkbox-token"
+
+
+def test_first_challenge_uses_widget_mount_budget_after_checkbox_click() -> None:
+    """首次题面挂载使用长预算，不能只等短的 post_action 窗口。"""
+    empty = FakeFrame(
+        "https://newassets.hcaptcha.com/captcha/v1/challenge",
+        {".challenge-container": FakeLocator(box={"x": 10, "y": 10, "width": 376, "height": 190})},
+    )
+    checkbox = FakeFrame(
+        "https://newassets.hcaptcha.com/captcha/v1/checkbox",
+        {"#checkbox": FakeLocator(box={"x": 20, "y": 30, "width": 28, "height": 28})},
+    )
+    live = challenge_frame()
+    page = FakePage(
+        FakeFrame("https://site.invalid", children=[checkbox, empty]),
+        responses=[(True, ""), (True, ""), (True, "first-challenge-token")],
+    )
+    solver = HCaptchaSolver(
+        page,
+        options=options(
+            post_action_wait_ms=20,
+            widget_mount_timeout_ms=40_000,
+        ),
+        vision_client=FakeVision(
+            [{"type": "point", "confidence": 0.9, "points": [{"x": 500, "y": 500}]}]
+        ),
+    )
+    waits: list[int | None] = []
+    progress_calls = 0
+
+    async def wait_for_progress() -> tuple[str, Any | None, bool]:
+        nonlocal progress_calls
+        progress_calls += 1
+        # 点击复选框后尚未签发 token，先出现题面；答题后再签发 token。
+        if progress_calls == 1:
+            return "", empty, False
+        return "first-challenge-token", None, True
+
+    async def wait_for_live(_frame: Any, *, timeout_ms: int | None = None) -> Any:
+        waits.append(timeout_ms)
+        return live
+
+    solver._wait_for_progress = wait_for_progress  # type: ignore[method-assign]
+    solver._wait_for_live_challenge = wait_for_live  # type: ignore[method-assign]
+
+    result = run(solver.solve())
+    run(solver.aclose())
+
+    assert waits == [40_000]
+    assert result.status == "success"
+    assert result.token == "first-challenge-token"
 
 
 def test_empty_challenge_without_checkbox_waits_then_reports_mount_timeout() -> None:

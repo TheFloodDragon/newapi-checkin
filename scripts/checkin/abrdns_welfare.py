@@ -324,15 +324,37 @@ async def _submit_checkin(page: Any, helpers: Any) -> dict[str, Any]:
             # 没返回就会被切断，结果报成「单轮求解超时」而掩盖真实错误（如 HTTP 424）。
             solve = await helpers.solve_hcaptcha(
                 options={
-                    # 各段之和必须留在 total 之内，否则总超时会在跑完计划轮次前
-                    # 触发（旧配比 40 + 2×(75+12) = 214s > 180s，结构上必然撞墙）。
-                    # 现：40 + 2×(75+12) = 214 仍偏大，故把 total 提到 300s，
-                    # 并由 helpers 按脚本剩余时间再收敛。
+                    # 各段之和必须留在 total 之内；同时一轮内要给瞬时断连留下重试
+                    # 机会，不能让第一请求独占整轮。端点实测 38.7s 才正常返回，
+                    # 三次×37.7s 会把可用慢响应全部误判为超时。本站改为两次请求，
+                    # 预留 15s 给退避、上下文刷新与保存 ⇒ 每次 55s，最坏约 111s。
                     "presence_timeout_ms": 20_000,
                     "widget_mount_timeout_ms": 40_000,
                     "post_action_wait_ms": 12_000,
-                    "round_timeout_ms": 75_000,
-                    "total_timeout_ms": 300_000,
+                    # 实测“帮助生物通过”的 drag 题连续两轮后仍会给新题面；2 轮是
+                    # 人为上限过低。提高到 5，但仍受 total 360s 与脚本 420s 双重限制。
+                    "max_rounds": 5,
+                    # 端点侧有约 60s 的硬性网关上限：实测无论单图、双图还是仅
+                    # 12.9KB 细节图，超过 60.2s 都会被 "Remote end closed connection"
+                    # 直接断开。因此单次请求预算必须小于 60s，并保留一次重试机会。
+                    "round_timeout_ms": 125_000,
+                    "vision_max_attempts": 2,
+                    "vision_retry_reserve_ms": 15_000,
+                    # 当前站真实 drag 图基准：640/82 约 54+68KB、24.5s 且易选错；
+                    # 400/72 约 18+26KB、13-29s，并能稳定识别带 Move 标记的源对象。
+                    "vision_max_edge": 400,
+                    "vision_jpeg_quality": 72,
+                    # 浏览器启动层已关闭 humanize；不要再在每次 click 前发送会被
+                    # Camoufox 延迟/取消的 mouse.move，直接使用有界真实鼠标点击。
+                    "move_before_click": False,
+                    "click_timeout_ms": 5_000,
+                    # grows / jumps highest 等题依赖时间变化；单帧模型只能猜。
+                    # 真实采样显示约 2.5s 一个周期，6×400ms 可覆盖主要变化阶段。
+                    "temporal_frames": 6,
+                    "temporal_interval_ms": 400,
+                    "temporal_sheet_max_edge": 800,
+                    "temporal_phase_wait_ms": 5_000,
+                    "total_timeout_ms": 360_000,
                 }
             )
         except Exception as exc:
