@@ -9,6 +9,7 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -37,6 +38,78 @@ def _valid_state() -> dict:
             }
         ],
     }
+
+
+def test_geoip_database_is_repaired_and_written_atomically(tmp_path, monkeypatch) -> None:
+    """并发启动读到半成品 mmdb 会让浏览器启动失败，必须锁 + 原子替换。
+
+    Camoufox 只用 exists() 判断是否下载，且直接写最终路径；批量签到组间并发时，
+    后启动的进程会读到仍在写入的 65MB 文件，报「Is this a valid MaxMind DB file?」。
+    """
+    from browser import geoip_cache
+
+    target = tmp_path / "GeoLite2-City.mmdb"
+    monkeypatch.setattr(geoip_cache, "_mmdb_path", lambda: target)
+
+    # 已损坏的旧缓存必须被删除重下，而不是继续交给 geoip2 打开。
+    target.write_bytes(b"truncated-garbage")
+    observed_during_download: list[bool] = []
+
+    def fake_webdl(_url, *, desc="", buffer=None):
+        # 下载进行中：最终路径要么不存在，要么仍是上一份完整文件，
+        # 绝不能是这次正在写入的半成品。
+        observed_during_download.append(target.exists())
+        assert buffer is not None
+        buffer.write(b"valid-mmdb-bytes")
+
+    monkeypatch.setattr(
+        geoip_cache,
+        "_database_is_valid",
+        lambda path: path.is_file() and path.read_bytes() == b"valid-mmdb-bytes",
+    )
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "camoufox.locale",
+        SimpleNamespace(
+            MMDB_REPO="repo",
+            MaxMindDownloader=lambda _repo: SimpleNamespace(get_asset=lambda: "https://x.invalid/db"),
+            geoip_allowed=lambda: None,
+        ),
+    )
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "camoufox.pkgman",
+        SimpleNamespace(webdl=fake_webdl),
+    )
+
+    assert geoip_cache.ensure_geoip_database() == "repaired"
+    assert target.read_bytes() == b"valid-mmdb-bytes"
+    assert observed_during_download == [False], "下载期间最终路径不得出现半成品"
+    # 临时分片必须清理干净。
+    assert list(tmp_path.glob("*.part")) == []
+    # 锁文件不得残留，否则后续启动会一直等锁。
+    assert list(tmp_path.glob("*.lock")) == []
+
+    # 已完整时走快路径，不再重复下载。
+    calls = len(observed_during_download)
+    assert geoip_cache.ensure_geoip_database() == "ready"
+    assert len(observed_during_download) == calls
+
+
+def test_geoip_lock_timeout_reports_failure_instead_of_reading_partial_file(
+    tmp_path, monkeypatch
+) -> None:
+    """拿不到锁时不能放行半成品：宁可报失败，也不要让浏览器读坏文件。"""
+    from browser import geoip_cache
+
+    target = tmp_path / "GeoLite2-City.mmdb"
+    monkeypatch.setattr(geoip_cache, "_mmdb_path", lambda: target)
+    monkeypatch.setattr(geoip_cache, "_database_is_valid", lambda _path: False)
+
+    # 预先占住锁，模拟另一进程正在下载。
+    (tmp_path / "GeoLite2-City.mmdb.lock").write_bytes(b"")
+
+    assert geoip_cache.ensure_geoip_database(timeout=0.3) == "failed"
 
 
 def test_firefox_driver_page_error_patch_is_correct_and_idempotent(tmp_path) -> None:

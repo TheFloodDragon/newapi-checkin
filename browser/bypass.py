@@ -158,6 +158,18 @@ async def launch_camoufox(
     # 合并用户自定义参数
     launch_options.update(kwargs)
 
+    # geoip=True 时 Camoufox 会按需下载 65MB 的 GeoLite2-City.mmdb，但它只用
+    # exists() 判断、且直接写最终路径。批量签到组间并发启动浏览器时，后启动的进程
+    # 会读到仍在写入的半成品，报「Is this a valid MaxMind DB file?」。这里用文件锁
+    # 加原子替换先把数据库准备好，并顺带修复此前已被写坏的缓存。
+    if launch_options.get("geoip"):
+        try:
+            from browser.geoip_cache import ensure_geoip_database
+
+            ensure_geoip_database()
+        except Exception:
+            pass
+
     # Firefox 驱动会因缺失 pageError.location 在 Node 侧崩溃（表现为随后的
     # "Connection closed while reading from the driver"）。该上报由 Firefox 的
     # _onUncaughtError 触发，与是否注册 pageerror 监听无关，页面内吞错脚本也晚于
