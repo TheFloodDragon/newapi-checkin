@@ -134,7 +134,9 @@ class FakePage:
     async def screenshot(self, **kwargs: Any) -> bytes:
         self.page_screenshots.append(kwargs)
         # 返回真实 PNG：坐标网格叠加会解码这份字节，假数据会被正确地判为不可用。
-        return _png(200, 160, (250, 250, 250))
+        # 必须带明暗结构 —— 纯色图代表 hCaptcha 换帧过渡的空壳画面，会被
+        # _image_is_nearly_blank 正确拦下，不能用来表示「正常题面」。
+        return _challenge_png()
 
     def on(self, event: str, callback: Callable[..., Any]) -> None:
         self.listeners.setdefault(event, []).append(callback)
@@ -163,7 +165,13 @@ class FakeVision:
 
     async def solve_hcaptcha(self, **request: Any) -> dict[str, Any]:
         self.calls.append(request)
-        return self.answers.pop(0)
+        # 真实客户端对同一题面可被多次调用（题面换掉导致坐标作废时会重新求解），
+        # 耗尽后复用最后一个答案，避免夹具用 IndexError 掩盖被测逻辑。
+        if len(self.answers) > 1:
+            return self.answers.pop(0)
+        if self.answers:
+            return self.answers[0]
+        raise AssertionError("FakeVision 未配置任何答案")
 
 
 class SlowResponse:
@@ -649,6 +657,25 @@ def _png(width: int, height: int, color: tuple[int, int, int]) -> bytes:
     return buffer.getvalue()
 
 
+def _challenge_png(width: int = 200, height: int = 160) -> bytes:
+    """带明暗结构的题面图：代表「可作答的正常题面」。
+
+    纯色图在真实链路里等同于 hCaptcha 换帧过渡的空壳画面，会被
+    _image_is_nearly_blank 拦下且不发给模型，因此不能用它表示正常题面。
+    """
+    from io import BytesIO
+
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", (width, height), (250, 250, 250))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((10, 10, width // 2, height // 2), fill=(20, 30, 40))
+    draw.ellipse((width // 2, height // 2, width - 10, height - 10), fill=(200, 40, 40))
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
 def test_prompt_task_type_inference_uses_visible_instruction() -> None:
     assert _task_type_from_prompt("Please drag the element to the gap", has_tiles=False) == "drag"
     assert _task_type_from_prompt("Please click on the animal", has_tiles=False) == "point"
@@ -877,6 +904,112 @@ def test_detect_move_sources_finds_all_badges() -> None:
     x_values = sorted(round(point[0]) for point in sources)
     assert x_values == [174, 842]
     assert all(abs(point[1] - 339) <= 2 for point in sources)
+
+
+def test_blank_transition_capture_never_reaches_the_model() -> None:
+    """换帧过渡的近空白截图不得发给模型：只会得到 confidence=0 并白费一轮。"""
+    from browser.hcaptcha import _image_is_nearly_blank
+
+    # 纯色 = 空白；带明显结构的条纹图 = 真实题面。
+    assert _image_is_nearly_blank(_png(200, 160, (250, 250, 250))) is True
+    assert _image_is_nearly_blank(_striped_png(200, 160, 8)) is False
+    # 无法解码时保持发送，避免漏掉真实题面。
+    assert _image_is_nearly_blank(b"not-an-image") is False
+    assert _image_is_nearly_blank(b"") is False
+
+
+def test_idle_rounds_do_not_consume_answer_budget() -> None:
+    """题面被换掉导致坐标作废属于空转，不得扣减 max_rounds。
+
+    实测 CI 上 5 轮里 3 轮是空转（恢复题面/丢弃坐标），只真正提交了 2 次答案，
+    却报「已达到最大求解轮数」。
+    """
+    frame = challenge_frame()
+    page = FakePage(FakeFrame("https://site.invalid", children=[frame]), responses=[(True, "")])
+    vision = FakeVision(
+        [{"type": "point", "confidence": 0.9, "points": [{"x": 500, "y": 500}]} for _ in range(6)]
+    )
+    solver = HCaptchaSolver(
+        page,
+        options=options(max_rounds=2, post_action_wait_ms=0, widget_mount_timeout_ms=0),
+        vision_client=vision,
+    )
+    applied_rounds = 0
+    refresh_calls = 0
+
+    async def locate() -> tuple[bool, str, Any | None, Any | None]:
+        return True, "", None, frame
+
+    async def challenge_is_live(_frame: Any) -> bool:
+        return True
+
+    async def refresh_context(*_args: Any, **_kwargs: Any) -> tuple[Any, Any, bool]:
+        nonlocal refresh_calls
+        refresh_calls += 1
+        # 前两次模拟「模型返回时题面已更新」，坐标必须作废且不计轮次。
+        return frame, FakeLocator(), refresh_calls > 2
+
+    async def apply_answer(*_args: Any, **_kwargs: Any) -> str:
+        nonlocal applied_rounds
+        applied_rounds += 1
+        return "applied"
+
+    async def wait_for_progress() -> tuple[str, Any | None, bool]:
+        return "", frame, False
+
+    solver._locate = locate  # type: ignore[method-assign]
+    solver._challenge_is_live = challenge_is_live  # type: ignore[method-assign]
+    solver._refresh_action_context = refresh_context  # type: ignore[method-assign]
+    solver._apply_answer = apply_answer  # type: ignore[method-assign]
+    solver._wait_for_progress = wait_for_progress  # type: ignore[method-assign]
+
+    result = run(solver.solve())
+    run(solver.aclose())
+
+    # 两次空转 + 两次真实作答；旧实现只会作答 0 次就耗尽轮次。
+    assert refresh_calls == 4
+    assert applied_rounds == 2
+    assert result.rounds == 2
+    assert result.status == "failed"
+
+
+def test_schema_retry_constraint_matches_the_actual_task_type() -> None:
+    """point 题的重试不得追加 drag 专用约束（实测曾串题型，重试仍答错）。"""
+    prompts: list[str] = []
+
+    class SchemaFailingVision:
+        config = SimpleNamespace(model="m", base_url="", timeout=1.0)
+
+        async def solve_hcaptcha(self, **request: Any) -> dict[str, Any]:
+            prompts.append(str(request.get("prompt") or ""))
+            error = VisionClientError("point plan has no matching actions")
+            error.model_output = {"challenge_type": "point", "confidence": 0, "points": []}
+            raise error
+
+    solver = HCaptchaSolver(
+        FakePage(FakeFrame("https://site.invalid")),
+        options=options(round_timeout_ms=60_000),
+        vision_client=SchemaFailingVision(),
+    )
+
+    run(
+        solver._ask_vision(
+            {
+                "round": 1,
+                "prompt": "Click the two arrows that do not match the pattern",
+                "task_type": "point",
+                "image": b"x",
+                "tiles": [],
+            }
+        )
+    )
+    run(solver.aclose())
+
+    assert len(prompts) == 2, "schema 失败后应重试一次"
+    retry_prompt = prompts[1]
+    assert "points array" in retry_prompt
+    assert "exactly two points" in retry_prompt
+    assert "marked Move" not in retry_prompt, "point 题不得混入 drag 约束"
 
 
 def test_drag_detail_sheet_enlarges_both_sides_and_keeps_original_coordinate_ticks() -> None:
@@ -1622,7 +1755,7 @@ def test_compression_can_be_disabled() -> None:
     run(solver.aclose())
 
     assert request["media_type"] == "image/png"
-    assert request["image"] == _png(200, 160, (250, 250, 250))
+    assert request["image"] == _challenge_png()
 
 
 def test_empty_capture_never_reaches_the_model() -> None:
@@ -1856,7 +1989,7 @@ def test_dismissed_challenge_restarts_explicitly_unchecked_checkbox_once() -> No
         return live_state
 
     async def capture_round(_frame: Any, round_number: int) -> dict[str, Any]:
-        image = _png(100, 100, (80, 90, 100))
+        image = _challenge_png(100, 100)
         return {
             "round": round_number,
             "prompt": "click the target",

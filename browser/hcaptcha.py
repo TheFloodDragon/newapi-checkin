@@ -457,6 +457,31 @@ def _same_challenge_image(left: bytes, right: bytes, *, max_distance: int = 8) -
     )
 
 
+def _image_is_nearly_blank(image: bytes, *, min_stddev: float = 6.0) -> bool:
+    """判断截图是否几乎没有内容（hCaptcha 换帧过渡期的空壳画面）。
+
+    实测同一题面的正常截图约 271KB，而换帧过渡帧只有 5KB 且几乎是纯色。把这种图
+    发给模型只会得到 confidence=0、空 points，白费一次请求与一次 schema 重试。
+
+    用灰度标准差判定而非字节数：字节数受 JPEG 质量与分辨率影响，不可靠；纯色/近纯色
+    画面的标准差必然很低，而任何真实题面都有明显的明暗结构。
+
+    无法解码时返回 False —— 宁可照旧发出请求，也不要因判定失败而漏掉真实题面。
+    """
+    if not image:
+        return False
+    try:
+        from PIL import Image, ImageStat
+
+        with Image.open(io.BytesIO(image)) as source:
+            grayscale = source.convert("L")
+            stat = ImageStat.Stat(grayscale)
+            stddev = float(stat.stddev[0]) if stat.stddev else 0.0
+        return stddev < float(min_stddev)
+    except Exception:
+        return False
+
+
 def _image_mean_difference(left: bytes, right: bytes, *, size: tuple[int, int] = (48, 48)) -> float | None:
     """返回两张截图归一化后的 RGB 平均差，供动画相位匹配使用。"""
     if not left or not right:
@@ -2142,15 +2167,41 @@ class HCaptchaSolver:
                     return None
                 retry_payload = dict(payload)
                 retry_prompt = str(retry_payload.get("prompt") or "").strip()
+                # 追加的约束必须匹配当前题型：实测 point 题被追加了 drag 专用说明
+                # （"source must be the movable object marked Move"），既无意义又会
+                # 干扰模型，重试后仍给出错误坐标。
+                retry_task_type = str(retry_payload.get("task_type") or "").strip().lower()
+                if retry_task_type == "drag":
+                    constraint = (
+                        "Return exactly one usable drag action. Source must be the movable object "
+                        "marked Move, target must be its matching destination, and source/target must "
+                        "be different coordinates given as plain numeric x and y fields; "
+                        "do not wrap coordinates in extra objects and do not return a zero-distance drag."
+                    )
+                elif retry_task_type == "grid":
+                    constraint = (
+                        "Return the tile_indices array with 1-based integer indices of every matching "
+                        "tile. Do not return an empty array unless no tile matches."
+                    )
+                elif retry_task_type == "point":
+                    constraint = (
+                        "Return the points array with one entry per target, each having plain numeric "
+                        "x and y fields in the 0-1000 space. If the prompt asks for two targets, return "
+                        "exactly two points. Do not return an empty array or zero confidence; look again "
+                        "and give your best estimate."
+                    )
+                else:
+                    constraint = (
+                        "Return exactly one usable action with plain numeric coordinates in the 0-1000 "
+                        "space, and set challenge_type to grid, point, or drag accordingly."
+                    )
                 retry_payload["prompt"] = (
-                    f"{retry_prompt} "
-                    "The previous JSON answer was rejected as invalid. Reinspect the image and "
-                    "return exactly one usable action. For drag, source must be the movable object "
-                    "marked Move, target must be its matching destination, and source/target must "
-                    "be different coordinates given as plain numeric x and y fields; "
-                    "do not wrap coordinates in extra objects and do not return a zero-distance drag."
+                    f"{retry_prompt} The previous JSON answer was rejected as invalid. "
+                    f"Reinspect the image. {constraint}"
                 ).strip()
-                self._safe_log("视觉 schema 校验失败，追加约束后重试一次")
+                self._safe_log(
+                    f"视觉 schema 校验失败，按 {retry_task_type or 'unknown'} 题型追加约束后重试一次"
+                )
                 return await self._ask_vision(retry_payload, _schema_retry=True)
             return None
         raw_output = getattr(answer, "raw_output", None)
@@ -2531,17 +2582,24 @@ class HCaptchaSolver:
 
                 last_challenge_type = ""
                 post_action_checkbox_retries = 0
-                for round_number in range(1, self.options.max_rounds + 1):
+                # 只有「真正把动作作用到题面」才算一轮。恢复题面、题面被换掉而丢弃
+                # 坐标这类空转不产生任何提交，若也扣轮次，就会在没答过几道题的情况下
+                # 报「已达到最大求解轮数」——实测 5 轮里 3 轮是空转，只提交了 2 次。
+                # 用 while 配合独立的 attempts 计数，并对空转设独立上限防止死循环。
+                round_number = 0
+                idle_rounds = 0
+                max_idle_rounds = max(3, self.options.max_rounds)
+                while round_number < self.options.max_rounds:
                     try:
                         self._round_deadline = (
                             asyncio.get_running_loop().time()
                             + self.options.round_timeout_ms / 1000
                         )
                         async with asyncio.timeout(self.options.round_timeout_ms / 1000):
-                            # 第 2 轮起先确认挑战仍在呈现：上一轮点击后 hCaptcha 可能
-                            # 已收起挑战（等待令牌签发）或换帧未完成，此时截图是空白图，
-                            # 发出去只会得到「图中没有目标」的空结果，白费一次调用。
-                            if round_number > 1 and not await self._challenge_is_live(challenge_frame):
+                            # 每次循环都确认挑战仍在呈现：上一轮点击/模型等待期间 hCaptcha
+                            # 可能已收起或换帧。不能用 round_number>0 作门槛，因为坐标被
+                            # 丢弃时会回退轮次到 0，但手里的 frame 仍可能已经失效。
+                            if not await self._challenge_is_live(challenge_frame):
                                 self._safe_log("挑战已不在呈现状态，等待令牌或新一帧题面")
                                 token, next_frame, passed = await self._wait_for_progress()
                                 if token or passed:
@@ -2549,7 +2607,7 @@ class HCaptchaSolver:
                                         "success",
                                         "hCaptcha 验证成功",
                                         token=token,
-                                        rounds=round_number - 1,
+                                        rounds=round_number,
                                         challenge_type=last_challenge_type,
                                     )
 
@@ -2576,7 +2634,7 @@ class HCaptchaSolver:
                                                 "success",
                                                 "hCaptcha 验证成功",
                                                 token=token,
-                                                rounds=round_number - 1,
+                                                rounds=round_number,
                                                 challenge_type=last_challenge_type,
                                             )
                                         current_challenge = (
@@ -2591,14 +2649,27 @@ class HCaptchaSolver:
                                     return await self._result(
                                         "timeout",
                                         "hCaptcha 上一轮动作后未出现新题面，也未签发令牌",
-                                        rounds=round_number - 1,
+                                        rounds=round_number,
                                         challenge_type=last_challenge_type,
                                         failure_stage="challenge_dismissed",
                                     )
                                 challenge_frame = refreshed
-                                self._safe_log("新题面已恢复，进入下一轮求解")
-                                # 当前轮的大部分预算已用于恢复，不再挤压模型请求。
+                                idle_rounds += 1
+                                if idle_rounds > max_idle_rounds:
+                                    return await self._result(
+                                        "timeout",
+                                        "hCaptcha 题面反复重置，未能进入可作答状态",
+                                        rounds=round_number,
+                                        challenge_type=last_challenge_type,
+                                        failure_stage="challenge_dismissed",
+                                    )
+                                self._safe_log("新题面已恢复，重新开始本轮求解")
+                                # 恢复题面不算一次作答：不推进 round_number。
                                 continue
+                            # 本轮确实进入求解（已拿到可作答题面），此时即计数：
+                            # 超时/失败的 rounds 必须反映真实尝试过的轮数。空转分支
+                            # 在上面就 continue 了，不会走到这里，因此不计入。
+                            round_number += 1
                             request = await self._capture_round(challenge_frame, round_number)
                             action_target = request.pop("action_target", None)
                             challenge_fingerprint = str(request.pop("challenge_fingerprint", "") or "")
@@ -2612,6 +2683,30 @@ class HCaptchaSolver:
                                     failure_stage="empty_capture",
                                 )
                             self._vision_failure = {}
+                            # 换帧过渡期的截图是近乎纯色的空壳（实测 271KB 的正常题面
+                            # 对比只有 5KB 的过渡帧），模型只会回 confidence=0、空
+                            # points，白费一次请求和一次 schema 重试。用像素方差判定
+                            # 「几乎没有内容」，此时等新题面而不是发请求。
+                            if _image_is_nearly_blank(request.get("image") or b""):
+                                self._safe_log("挑战截图接近空白（疑为换帧过渡），等待新题面后重试")
+                                # 没有发出请求也没有作答，回退本轮计数。
+                                round_number -= 1
+                                idle_rounds += 1
+                                if idle_rounds > max_idle_rounds:
+                                    return await self._result(
+                                        "timeout",
+                                        "hCaptcha 截图持续为空白过渡帧，无法作答",
+                                        rounds=round_number,
+                                        challenge_type=last_challenge_type,
+                                        failure_stage="blank_capture",
+                                    )
+                                refreshed = await self._wait_for_live_challenge(
+                                    challenge_frame,
+                                    timeout_ms=self.options.widget_mount_timeout_ms,
+                                )
+                                if refreshed is not None:
+                                    challenge_frame = refreshed
+                                continue
                             answer = await self._ask_vision(request)
                             if answer is None:
                                 failure = dict(self._vision_failure)
@@ -2672,15 +2767,28 @@ class HCaptchaSolver:
                                 )
                             if not same_challenge:
                                 self._safe_log(
-                                    "时间型挑战未匹配到末帧相位，丢弃旧坐标并进入下一轮"
+                                    "时间型挑战未匹配到末帧相位，丢弃旧坐标并重新求解"
                                     if temporal_phase_image
-                                    else "模型返回时题面已更新，丢弃旧坐标并进入下一轮"
+                                    else "模型返回时题面已更新，丢弃旧坐标并重新求解"
                                 )
                                 if refreshed_frame is not None:
                                     challenge_frame = refreshed_frame
+                                # 坐标被丢弃、未提交任何动作，同样不计入作答轮次。
+                                round_number -= 1
+                                idle_rounds += 1
+                                if idle_rounds > max_idle_rounds:
+                                    return await self._result(
+                                        "timeout",
+                                        "hCaptcha 题面持续变化，模型坐标始终无法落到同一题",
+                                        rounds=round_number,
+                                        challenge_type=last_challenge_type,
+                                        failure_stage="challenge_changed",
+                                    )
                                 continue
                             challenge_frame = refreshed_frame or challenge_frame
                             action_target = refreshed_target
+                            # 已回到稳定题面并准备执行动作，连续空转链在此结束。
+                            idle_rounds = 0
 
                             self._safe_log(
                                 f"hCaptcha 第 {round_number}/{self.options.max_rounds} 轮："
@@ -2719,8 +2827,10 @@ class HCaptchaSolver:
                             if next_frame is not None:
                                 challenge_frame = next_frame
                     except TimeoutError:
+                        # 极小预算可能在截图/探测阶段、round_number 自增前就超时；
+                        # 但这仍是第 1 轮尝试，结构化结果不能错误报告 rounds=0。
                         return await self._result(
-                            "timeout", "hCaptcha 单轮求解超时", rounds=round_number
+                            "timeout", "hCaptcha 单轮求解超时", rounds=max(1, round_number)
                         )
                 return await self._result(
                     "failed", "hCaptcha 已达到最大求解轮数", rounds=self.options.max_rounds
