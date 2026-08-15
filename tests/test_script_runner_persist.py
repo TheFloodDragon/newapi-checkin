@@ -59,6 +59,28 @@ def _entry(cache_path) -> dict[str, Any]:
     return doc["tokens"]["https://t.invalid|t"]
 
 
+def test_script_humanize_defaults_on_and_accepts_explicit_false() -> None:
+    assert script_runner._script_humanize(None) is True
+    assert script_runner._script_humanize({}) is True
+    assert script_runner._script_humanize({"browser_humanize": True}) is True
+    for value in (False, "false", "0", "no", "off"):
+        assert script_runner._script_humanize({"browser_humanize": value}) is False
+
+
+def test_script_headless_uses_environment_default_and_explicit_override(monkeypatch) -> None:
+    monkeypatch.delenv("CHECKIN_HEADLESS", raising=False)
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.delenv("CI", raising=False)
+    assert script_runner._script_headless(None) is False
+    assert script_runner._script_headless({}) is False
+
+    monkeypatch.setenv("CI", "1")
+    assert script_runner._script_headless({}) is True
+    assert script_runner._script_headless({"browser_headless": False}) is False
+    for value in (True, "true", "1", "yes", "on"):
+        assert script_runner._script_headless({"browser_headless": value}) is True
+
+
 def test_persist_session_writes_tokens_from_local_storage(tmp_path, monkeypatch) -> None:
     cache = tmp_path / "token_cache.json"
     monkeypatch.setattr(token_cache, "CACHE_PATH", cache)
@@ -86,6 +108,20 @@ def test_persisted_basis_matches_config_so_cache_is_reusable(tmp_path, monkeypat
     )
     assert resolved.get("access_token") == "ACCESS"
     assert resolved.get("refresh_token") == "REFRESH"
+
+
+def test_persist_session_storage_state_timeout_does_not_block_exit(tmp_path, monkeypatch) -> None:
+    class HangingContext:
+        async def storage_state(self) -> Any:
+            await asyncio.sleep(60)
+            return STORAGE_STATE
+
+    monkeypatch.setattr(script_runner, "_STORAGE_STATE_TIMEOUT_SECONDS", 0.01)
+    logs: list[str] = []
+    asyncio.run(script_runner._persist_session(_site(), HangingContext(), logs.append))
+
+    assert any("导出登录态超过" in line for line in logs)
+    assert not (tmp_path / "token_cache.json").exists()
 
 
 def test_persist_session_is_silent_when_context_unavailable(tmp_path, monkeypatch) -> None:

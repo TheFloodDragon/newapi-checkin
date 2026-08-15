@@ -12,6 +12,7 @@ import pytest
 
 from browser import session, state
 from browser.oauth_flow import is_oauth_callback_url
+from browser import runtime_loop
 from browser.runtime_loop import BrowserResources
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -34,6 +35,25 @@ def _valid_state() -> dict:
             }
         ],
     }
+
+
+def test_resource_close_timeouts_do_not_block_business_result(monkeypatch) -> None:
+    class HangingPage:
+        async def close(self) -> None:
+            await asyncio.sleep(60)
+
+    class HangingBrowser:
+        async def close(self) -> None:
+            await asyncio.sleep(60)
+
+    monkeypatch.setattr(runtime_loop, "PAGE_CLOSE_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(runtime_loop, "BROWSER_CLOSE_TIMEOUT_SECONDS", 0.01)
+
+    async def scenario() -> None:
+        resources = BrowserResources(browser=HangingBrowser(), page=HangingPage())
+        await resources.close()
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=1))
 
 
 def test_oauth_capture_auto_finishes_only_with_authenticated_cookie(monkeypatch) -> None:

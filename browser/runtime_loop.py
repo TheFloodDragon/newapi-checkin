@@ -70,22 +70,26 @@ def is_driver_closed_error(exc: BaseException | str) -> bool:
     return any(marker in text for marker in DRIVER_CLOSED_MARKERS)
 
 
+PAGE_CLOSE_TIMEOUT_SECONDS = 5.0
+BROWSER_CLOSE_TIMEOUT_SECONDS = 8.0
+
+
 async def safe_close_page(page: Any) -> None:
-    """尽力关闭 page，不让普通清理错误覆盖业务结果。"""
+    """有界关闭 page，不让卡死的驱动清理覆盖业务结果。"""
     if page is None:
         return
     try:
-        await page.close()
+        await asyncio.wait_for(page.close(), timeout=PAGE_CLOSE_TIMEOUT_SECONDS)
     except Exception:
         pass
 
 
 async def safe_close_browser(browser: Any) -> None:
-    """尽力关闭 browser，不让普通清理错误覆盖业务结果。"""
+    """有界关闭 browser，不让卡死的驱动清理覆盖业务结果。"""
     if browser is None:
         return
     try:
-        await browser.close()
+        await asyncio.wait_for(browser.close(), timeout=BROWSER_CLOSE_TIMEOUT_SECONDS)
     except Exception:
         pass
 

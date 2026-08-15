@@ -129,6 +129,25 @@ def _load_module(script_file: Path) -> LoadedSiteScript:
     return hooks
 
 
+def _script_humanize(script_args: dict[str, Any] | None) -> bool:
+    """解析脚本级浏览器轨迹缓动开关；默认保持原行为 True。"""
+    raw = (script_args or {}).get("browser_humanize", True)
+    if isinstance(raw, str):
+        return raw.strip().casefold() not in {"0", "false", "no", "off"}
+    return bool(raw)
+
+
+def _script_headless(script_args: dict[str, Any] | None) -> bool:
+    """解析脚本级无头开关；未配置时沿用 CHECKIN_HEADLESS/CI 环境策略。"""
+    args = script_args or {}
+    if "browser_headless" not in args:
+        return _env_headless()
+    raw = args["browser_headless"]
+    if isinstance(raw, str):
+        return raw.strip().casefold() in {"1", "true", "yes", "on"}
+    return bool(raw)
+
+
 def _site_view(site: Any, script_path: str, script_args: dict[str, Any] | None, timeout: int) -> ScriptSiteView:
     return ScriptSiteView(
         name=str(getattr(site, "name", "") or ""),
@@ -174,6 +193,7 @@ def _normalize_result(raw: Any, *, script_file: Path) -> BrowserScriptResult:
 # 明确表示「这次没登录成功」的脚本结论。仅当脚本没有给出任何登录成功证据时才据此
 # 拒绝续存：登录成功而签到失败（如验证码没过）时，登录态仍必须保存。
 _UNAUTHENTICATED_STATUSES = frozenset({"need_login", "need_verification", "need_config"})
+_STORAGE_STATE_TIMEOUT_SECONDS = 8.0
 
 
 async def _persist_session(
@@ -213,7 +233,12 @@ async def _persist_session(
         log(f"脚本结论为 {status}（未完成登录），跳过续存登录态以保留上次可用的缓存")
         return
     try:
-        storage_state = await context.storage_state()
+        storage_state = await asyncio.wait_for(
+            context.storage_state(), timeout=_STORAGE_STATE_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError:
+        log("导出登录态超过 8 秒，跳过本次续存以避免阻塞任务退出")
+        return
     except Exception:
         return
     try:
@@ -302,10 +327,16 @@ async def run_browser_script(
     # 避免被 asyncio.wait_for 强杀而丢掉结论与诊断（表现为 rc=124「执行超时」）。
     script_deadline = time.monotonic() + timeout
     try:
+        humanize = _script_humanize(site_view.script_args)
+        headless = _script_headless(site_view.script_args)
         log(f"启动浏览器执行脚本 {site_view.script}（超时 {timeout}s）")
+        if not humanize:
+            log("浏览器轨迹缓动已按站点配置关闭（仍使用 Camoufox 与真实鼠标事件）")
+        if "browser_headless" in site_view.script_args:
+            log(f"浏览器模式已按站点配置设为 {'headless' if headless else 'headful'}")
         browser, context = await bypass.launch_camoufox(
-            headless=_env_headless(),
-            humanize=True,
+            headless=headless,
+            humanize=humanize,
             geoip=True,
             proxy=str(getattr(site, "proxy", "") or "") or None,
         )
