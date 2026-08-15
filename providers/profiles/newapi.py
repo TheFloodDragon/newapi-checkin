@@ -24,7 +24,7 @@ import sys
 import urllib.parse
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from config import Timeouts
 
@@ -106,11 +106,20 @@ def _is_antibot_block(error: ApiError) -> bool:
 class NewApiClient(ProfileClient):
     quota_is_usd = False
 
-    def __init__(self, site: SiteConfig, auth: AuthInfo) -> None:
+    def __init__(
+        self,
+        site: SiteConfig,
+        auth: AuthInfo,
+        cookie_refresher: Callable[[AuthInfo], AuthInfo | None] | None = None,
+    ) -> None:
         self.site = site
         self.auth = auth
         self.base_url = normalize_base_url(site.base_url)
         self.referer = self.base_url + (site.referer_path if site.referer_path.startswith("/") else "/" + site.referer_path)
+        # access_token 站点可能同时保存已过期的 cf_clearance。命中 Cloudflare HTML 时
+        # 只允许启动一次浏览器刷新，避免每个接口递归拉起浏览器或重复提交签到。
+        self._cookie_refresher = cookie_refresher
+        self._cookie_refresh_used = False
 
     # ── 底层请求 ──
     def request(self, method: str, path: str, body: bytes | None = None, *, retry_non_idempotent: bool = False) -> Any:
@@ -147,6 +156,32 @@ class NewApiClient(ProfileClient):
             # 站点原始回执是排查的第一手材料：只上抛 message 时，业务码拒绝、
             # 验证码不通过和 WAF 换页在日志里长得一模一样。
             log_http_exchange(self.site.name, method, url, error=exc)
+            if (
+                not self._cookie_refresh_used
+                and self._cookie_refresher is not None
+                and _is_antibot_block(exc)
+            ):
+                self._cookie_refresh_used = True
+                self._log_stage("HTTP 命中 Cloudflare/WAF，启动一次浏览器刷新辅助 Cookie")
+                refreshed: AuthInfo | None = None
+                try:
+                    refreshed = self._cookie_refresher(self.auth)
+                except Exception as refresh_exc:
+                    self._log_stage(f"浏览器刷新辅助 Cookie 失败：{refresh_exc}")
+                if refreshed is not None and refreshed.cookie:
+                    self.auth.cookie = refreshed.cookie
+                    if refreshed.new_api_user:
+                        self.auth.new_api_user = refreshed.new_api_user
+                    if refreshed.prefetched_user is not None:
+                        self.auth.prefetched_user = refreshed.prefetched_user
+                    self.site.cookie = refreshed.cookie
+                    self._log_stage("已刷新辅助 Cookie，重试原 HTTP 请求")
+                    return self.request(
+                        method,
+                        path,
+                        body,
+                        retry_non_idempotent=retry_non_idempotent,
+                    )
             raise
         log_http_exchange(self.site.name, method, url, payload=payload)
         if isinstance(payload, dict) and payload.get("success") is False:
@@ -352,7 +387,61 @@ class NewApiProfile(SiteProfile):
     quota_is_usd = False
 
     def build_client(self, site: SiteConfig, auth: AuthInfo) -> ProfileClient:
-        return NewApiClient(site, auth)
+        refresher = None
+        if bool(getattr(site, "auto_refresh_cookie", True)) and auth.cookie:
+            def _refresh(current_auth: AuthInfo) -> AuthInfo | None:
+                return self._refresh_waf_cookie(site, current_auth)
+
+            refresher = _refresh
+        return NewApiClient(site, auth, cookie_refresher=refresher)
+
+    @staticmethod
+    def _refresh_waf_cookie(site: SiteConfig, current_auth: AuthInfo) -> AuthInfo | None:
+        """仅刷新 Cloudflare/WAF 辅助 Cookie，不改变 access_token 身份。"""
+        try:
+            from browser import session as browser_session
+        except Exception:
+            return None
+
+        def _log(message: str) -> None:
+            print(f"[newapi:{site.name}] {message}", file=sys.stderr, flush=True)
+
+        try:
+            outcome = browser_session.run_sync(
+                browser_session.refresh_site_cookies(
+                    base_url=normalize_base_url(site.base_url),
+                    browser_state_text=str(site.browser_state or ""),
+                    # 浏览器只用于过 Cloudflare/WAF，允许带完整站点 session；HTTP
+                    # 重试仍只使用 current_auth.access_token，不会混用第二身份。
+                    initial_cookie=str(site.cookie or current_auth.cookie),
+                    fallback_uid=site.user_id.strip(),
+                    proxy=site.proxy or "",
+                    log=_log,
+                )
+            )
+        except Exception as exc:
+            _log(f"浏览器刷新 WAF Cookie 异常：{exc}")
+            return None
+        if not isinstance(outcome, dict) or not outcome.get("ok"):
+            if isinstance(outcome, dict) and outcome.get("message"):
+                _log(str(outcome["message"]))
+            return None
+        cookie = str(outcome.get("cookie") or "").strip()
+        if not cookie:
+            return None
+        prefetched_user = None
+        if outcome.get("quota") is not None or outcome.get("username"):
+            prefetched_user = {
+                "quota": outcome.get("quota"),
+                "username": outcome.get("username") or "",
+                "id": outcome.get("new_api_user") or site.user_id,
+            }
+        return AuthInfo(
+            cookie=cookie,
+            new_api_user=str(outcome.get("new_api_user") or current_auth.new_api_user or ""),
+            access_token=current_auth.access_token,
+            prefetched_user=prefetched_user,
+        )
 
     def supports_browser_refresh(self) -> bool:
         return True

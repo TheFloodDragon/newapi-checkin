@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from . import bypass, oauth_providers, popups, state
 from . import storage_scope as _storage_scope
@@ -795,19 +796,43 @@ async def verify_state(
         await resources.close()
 
 
+def _cookie_header_to_playwright(cookie_header: str, base_url: str) -> list[dict[str, str]]:
+    """把 HTTP Cookie 头转换成当前站点可注入的 Playwright cookie 列表。
+
+    access_token 账号通常只有 ACCOUNTS.json 里的 ``cookie``，没有 storage_state。
+    Cloudflare 刷新只需要把这些 session/WAF cookie 先带进浏览器，再让页面执行挑战，
+    因此不能要求用户额外捕获 browser_state。
+    """
+    host = str(urlsplit(base_url).hostname or "").strip()
+    if not host:
+        return []
+    values: dict[str, str] = {}
+    for part in str(cookie_header or "").split(";"):
+        name, separator, value = part.strip().partition("=")
+        if not separator or not name or name.startswith("$"):
+            continue
+        values[name] = value
+    return [
+        {"name": name, "value": value, "domain": host, "path": "/"}
+        for name, value in values.items()
+    ]
+
+
 async def refresh_site_cookies(
     base_url: str,
     browser_state_text: str = "",
+    initial_cookie: str = "",
     fallback_uid: str = "",
     proxy: str = "",
     log: LogFn = _noop,
 ) -> dict[str, Any]:
     """用浏览器过 WAF，导出当前站点的 cookies（供 HTTP 层复用）。
 
-    仿 millylee 混合式签到：浏览器只负责“过 WAF + 拿 cookie”。加载已保存的
-    站点 storage_state（含 session cookie）后访问站点，让浏览器执行阿里云 WAF
-    的 JS 挑战拿到 acw_tc 等 WAF cookie，再把「WAF cookie + 站点 session cookie」
-    一起导出。真正的签到由 HTTP 层用这些 cookie 发轻量请求完成。
+    仿 millylee 混合式签到：浏览器只负责“过 WAF + 拿 cookie”。优先加载已保存的
+    站点 storage_state；没有 storage_state 时也可用 ``initial_cookie`` 注入已有的
+    session/WAF cookie。访问站点后让浏览器执行 Cloudflare/阿里云 WAF 的 JS 挑战，
+    再把「刷新后的 WAF cookie + 站点 session cookie」一起导出。真正的签到由 HTTP
+    层用这些 cookie 发轻量请求完成。
 
     Returns:
         {
@@ -848,6 +873,11 @@ async def refresh_site_cookies(
     page = None
     try:
         await state.restore_storage_state(context, storage_state_dict)
+        if initial_cookie:
+            initial_cookies = _cookie_header_to_playwright(initial_cookie, base_url)
+            if initial_cookies:
+                await context.add_cookies(initial_cookies)
+                log(f"已注入已有站点 Cookie（{len(initial_cookies)} 项），开始刷新 WAF 通行证")
 
         page = resources.track_page(await context.new_page())
         await popups.setup_popup_guard(page, allowed_origin=_origin_from_url(base_url))

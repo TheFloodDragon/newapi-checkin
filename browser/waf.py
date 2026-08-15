@@ -138,7 +138,33 @@ async def solve_waf(page: Any, base_url: str, log: LogFn = noop, rounds: int = 3
             if is_driver_closed_error(exc):
                 raise
             log(f"WAF 求解导航中断（继续等待）：{type(exc).__name__}")
-        for _ in range(15):
+
+        # 新版 Cloudflare Managed Challenge 会在页面里挂 Turnstile 复选框。
+        # 这里只复用底层真实鼠标点击，不调用完整 solve_cloudflare：后者内部还有
+        # ClickSolver 和二次点击，套在本函数的多轮重试里会把单站耗时放大到 15 分钟。
+        interactive_attempted = False
+        try:
+            from . import turnstile
+
+            if await turnstile.find_box(page):
+                interactive_attempted = True
+                log("检测到交互式 Cloudflare Turnstile，主动点击复选框...")
+                token = await turnstile.solve(
+                    page,
+                    timeout_ms=20_000,
+                    poll_interval_ms=250,
+                    log=log,
+                )
+                if token:
+                    log("Turnstile 令牌已签发，等待 Cloudflare 完成页面放行...")
+        except Exception as exc:
+            if is_driver_closed_error(exc):
+                raise
+            log(f"WAF 交互式验证异常（继续等待）：{type(exc).__name__}")
+
+        # 主动点击已经等待过令牌时，只需留一个短窗口观察异步跳转；普通 JS 挑战
+        # 仍沿用 15 秒被动等待。
+        for _ in range(5 if interactive_attempted else 15):
             await asyncio.sleep(1.0)
             if not await is_waf_html(page):
                 log(f"WAF 挑战已通过（第 {round_index + 1} 轮）")

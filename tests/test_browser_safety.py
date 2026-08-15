@@ -40,6 +40,20 @@ def _valid_state() -> dict:
     }
 
 
+def test_cookie_header_to_playwright_normalizes_duplicate_names() -> None:
+    from browser.session import _cookie_header_to_playwright
+
+    cookies = _cookie_header_to_playwright(
+        "session=old; cf_clearance=stale; cf_clearance=fresh; $Version=1",
+        "https://muyuan.do",
+    )
+
+    assert cookies == [
+        {"name": "session", "value": "old", "domain": "muyuan.do", "path": "/"},
+        {"name": "cf_clearance", "value": "fresh", "domain": "muyuan.do", "path": "/"},
+    ]
+
+
 def test_geoip_database_is_repaired_and_written_atomically(tmp_path, monkeypatch) -> None:
     """并发启动读到半成品 mmdb 会让浏览器启动失败，必须锁 + 原子替换。
 

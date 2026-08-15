@@ -16,7 +16,7 @@ import asyncio
 
 import pytest
 
-from browser import bypass, turnstile
+from browser import bypass, turnstile, waf
 
 
 # ── 检测覆盖 ────────────────────────────────────────────────────────────────
@@ -151,7 +151,33 @@ def test_turnstile_returns_empty_on_timeout_without_token() -> None:
     assert token == ""
 
 
-# ── solve_cloudflare 策略 ───────────────────────────────────────────────────
+def test_waf_solver_uses_existing_interactive_cloudflare_click(monkeypatch) -> None:
+    page = FakePage(
+        "Just a moment...",
+        '<input name="cf-turnstile-response">',
+    )
+    logs: list[str] = []
+    calls: list[tuple[int, int]] = []
+
+    async def fake_goto(*_args, **_kwargs) -> None:
+        return None
+
+    async def fake_find_box(_page):
+        return {"x": 100, "y": 200, "width": 300, "height": 65}
+
+    async def fake_solve(_page, *, timeout_ms: int, poll_interval_ms: int, log) -> str:
+        calls.append((timeout_ms, poll_interval_ms))
+        _page.on_click()
+        log("真实点击完成")
+        return "real-turnstile-token"
+
+    monkeypatch.setattr(waf, "safe_goto", fake_goto)
+    monkeypatch.setattr(turnstile, "find_box", fake_find_box)
+    monkeypatch.setattr(turnstile, "solve", fake_solve)
+
+    assert asyncio.run(waf.solve_waf(page, "https://site.invalid", logs.append, rounds=1)) is True
+    assert calls == [(20_000, 250)]
+    assert "真实点击完成" in logs
 def test_interactive_challenge_uses_real_mouse_click(monkeypatch) -> None:
     """交互式 widget 必须真实点击，而不是被动等待签发。"""
     monkeypatch.setattr(bypass, "_check_camoufox", lambda: None)

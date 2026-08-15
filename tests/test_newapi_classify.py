@@ -63,3 +63,81 @@ def test_auto_challenge_waf_falls_back_to_legacy(monkeypatch: pytest.MonkeyPatch
 
     assert client._challenge_with_fallback("token") == legacy_result
     assert legacy_calls == ["token"]
+
+
+def test_cloudflare_response_refreshes_cookie_once_and_retries_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """access_token 仍是身份凭据，过期 cf_clearance 只触发一次浏览器辅助刷新。"""
+    site = SiteConfig(
+        name="waf-site",
+        base_url="https://waf.invalid",
+        cookie="session=old; cf_clearance=stale",
+    )
+    calls: list[dict[str, object]] = []
+    refresh_calls = 0
+
+    def fake_request(url: str, **kwargs: object) -> object:
+        nonlocal refresh_calls
+        calls.append({"url": url, **kwargs})
+        if len(calls) == 1:
+            raise ApiError(
+                403,
+                "<!DOCTYPE html><title>Just a moment...</title>",
+                "接口返回非 JSON：<!DOCTYPE html><title>Just a moment...</title>",
+            )
+        return {"success": True, "quota": 12}
+
+    def refresh(_auth: AuthInfo) -> AuthInfo:
+        nonlocal refresh_calls
+        refresh_calls += 1
+        return AuthInfo(
+            cookie="session=old; cf_clearance=fresh",
+            access_token="token-keep",
+            new_api_user="7",
+        )
+
+    monkeypatch.setattr("providers.profiles.newapi.http_request", fake_request)
+    client = NewApiClient(
+        site,
+        AuthInfo(cookie="session=old; cf_clearance=stale", access_token="token-keep"),
+        cookie_refresher=refresh,
+    )
+
+    assert client.request("GET", "/api/user/self") == {"success": True, "quota": 12}
+    assert refresh_calls == 1
+    assert len(calls) == 2
+    assert "cf_clearance=fresh" in str(calls[1]["headers"])
+    assert "Bearer token-keep" == calls[1]["headers"]["Authorization"]
+    assert client.auth.access_token == "token-keep"
+    assert client.auth.cookie.endswith("cf_clearance=fresh")
+
+
+def test_cloudflare_refresh_is_not_repeated_after_failed_browser_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    site = SiteConfig(name="waf-site", base_url="https://waf.invalid")
+    calls = 0
+    refresh_calls = 0
+
+    def fake_request(*_args: object, **_kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        raise ApiError(403, "<title>Just a moment...</title>", "Just a moment")
+
+    def refresh(_auth: AuthInfo) -> None:
+        nonlocal refresh_calls
+        refresh_calls += 1
+        return None
+
+    monkeypatch.setattr("providers.profiles.newapi.http_request", fake_request)
+    client = NewApiClient(
+        site,
+        AuthInfo(access_token="token", cookie="cf_clearance=stale"),
+        cookie_refresher=refresh,
+    )
+
+    with pytest.raises(ApiError):
+        client.request("GET", "/api/user/self")
+    assert calls == 1
+    assert refresh_calls == 1
