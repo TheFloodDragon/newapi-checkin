@@ -6,6 +6,8 @@ import base64
 import gzip
 import importlib
 import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -35,6 +37,56 @@ def _valid_state() -> dict:
             }
         ],
     }
+
+
+def test_firefox_driver_page_error_patch_is_correct_and_idempotent(tmp_path) -> None:
+    """驱动读 pageError.location.url 会让 Node 进程崩溃，必须改写为安全形式。
+
+    崩溃发生在驱动进程（Python 端只看到 "Connection closed while reading from
+    the driver"），且由 Firefox 的 _onUncaughtError 主动触发，与是否注册
+    pageerror 监听无关，因此只能补驱动。
+    """
+    from browser.driver_patch import patch_firefox_page_error
+
+    bundle = tmp_path / "coreBundle.js"
+    bundle.write_text(
+        "function a(pageError, page){ return {\n"
+        "  url: pageError.location.url,\n"
+        "  line: pageError.location.lineNumber,\n"
+        "  column: pageError.location.columnNumber\n"
+        "}; }\n",
+        encoding="utf-8",
+    )
+
+    assert patch_firefox_page_error(bundle) == "patched"
+    patched = bundle.read_text(encoding="utf-8")
+    assert "pageError.location.url" not in patched
+    assert "(pageError.location||{}).url" in patched
+
+    # 补丁后的表达式必须是合法 JS，且对缺失 location 返回安全默认值。
+    node = shutil.which("node")
+    if node:
+        probe = tmp_path / "probe.js"
+        probe.write_text(
+            patched + "\nconst r=a({}, null);\n"
+            "if(r.url!==''||r.line!==0||r.column!==0) throw new Error('bad defaults');\n"
+            "const r2=a({location:{url:'u',lineNumber:7,columnNumber:9}}, null);\n"
+            "if(r2.url!=='u'||r2.line!==7||r2.column!==9) throw new Error('bad passthrough');\n"
+            "console.log('ok');\n",
+            encoding="utf-8",
+        )
+        completed = subprocess.run(
+            [node, str(probe)], capture_output=True, text=True, timeout=60
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert "ok" in completed.stdout
+
+    # 幂等：重复调用不得再改动文件。
+    assert patch_firefox_page_error(bundle) == "already"
+    assert bundle.read_text(encoding="utf-8") == patched
+
+    # 找不到文件时安静返回，不能影响浏览器启动。
+    assert patch_firefox_page_error(tmp_path / "missing.js") == "unavailable"
 
 
 def test_resource_close_timeouts_do_not_block_business_result(monkeypatch) -> None:

@@ -158,6 +158,17 @@ async def launch_camoufox(
     # 合并用户自定义参数
     launch_options.update(kwargs)
 
+    # Firefox 驱动会因缺失 pageError.location 在 Node 侧崩溃（表现为随后的
+    # "Connection closed while reading from the driver"）。该上报由 Firefox 的
+    # _onUncaughtError 触发，与是否注册 pageerror 监听无关，页面内吞错脚本也晚于
+    # 它，因此必须在启动前修补驱动本身。补丁幂等，失败不影响启动。
+    try:
+        from browser.driver_patch import patch_firefox_page_error
+
+        patch_firefox_page_error()
+    except Exception:
+        pass
+
     # Camoufox 返回的是已启动的 browser，不需要 async with
     browser = await AsyncCamoufox(**launch_options).start()
     # 某些 Camoufox/Playwright 组合不会预创建 context；直接 browser.new_context()
