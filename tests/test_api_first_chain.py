@@ -51,6 +51,8 @@ class FakeClient:
         return self._reward
 
     def classify(self, error: ApiError) -> str:
+        if error.not_open:
+            return "not_open"
         if error.status == 401:
             return "need_login"
         if "already" in error.message.lower() or "已签到" in error.message:
@@ -130,6 +132,33 @@ def test_stage1_token_already_checked_in_returns_without_login(monkeypatch) -> N
     assert result.detail["quota_is_usd"] is True
     assert profile.login_calls == 0
     assert client.checkin_calls == 0
+
+
+def test_not_open_api_result_stops_before_browser_fallback(monkeypatch) -> None:
+    client = FakeClient(status=StatusInfo(checked_in_today=False))
+    profile = FakeProfile({"old": client})
+
+    class Hooks:
+        owns_http_flow = True
+        run_http_extras = None
+
+        @staticmethod
+        def do_checkin(_client: Any, log: Any = None) -> CheckinReward:
+            raise ApiError(None, {"active": False}, "普通抽奖当前未开放", not_open=True)
+
+    monkeypatch.setattr(script_loader, "load_script_hooks", lambda _path: Hooks())
+
+    class ExplodingRunner:
+        def run_sync(self, **_kwargs: Any) -> Any:  # pragma: no cover - 不应调用
+            raise AssertionError("not_open 不得启动浏览器脚本")
+
+    monkeypatch.setattr(browser_script, "_load_runner", lambda: ExplodingRunner())
+    result = browser_script.run_action(
+        _site(script="scripts/checkin/vcnovb_lottery.py"), profile
+    )
+
+    assert result.status == "not_open"
+    assert result.message == "普通抽奖当前未开放"
 
 
 def test_explicit_http_hook_runs_before_profile_default(monkeypatch) -> None:

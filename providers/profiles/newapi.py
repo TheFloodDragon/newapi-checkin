@@ -224,6 +224,8 @@ class NewApiClient(ProfileClient):
         return self._reward_from(data)
 
     def classify(self, error: ApiError) -> str:
+        if error.not_open:
+            return "not_open"
         if contains_any(error.message, ALREADY_DONE_PATTERNS) or payload_code(error.payload) == "already_done":
             return "already_done"
         # 验证特征（如「Turnstile token 为空」）比登录特征更具体，须先判定：

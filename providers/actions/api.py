@@ -267,6 +267,8 @@ def _http_flow(
             kind = client.classify(exc)
             if kind == "already_done":
                 return CheckinResult(site.name, base_url, "already_done", exc.message, detail=exc.payload)
+            if kind == "not_open":
+                return CheckinResult(site.name, base_url, "not_open", exc.message, detail=exc.payload)
             if kind == "need_login":
                 return CheckinResult(site.name, base_url, "need_login", _need_login_message(site), detail=exc.payload)
             if kind == "need_verification":
@@ -331,6 +333,8 @@ def _http_flow(
         kind = client.classify(exc)
         if kind == "already_done":
             return CheckinResult(site.name, base_url, "already_done", exc.message, detail=exc.payload)
+        if kind == "not_open":
+            return CheckinResult(site.name, base_url, "not_open", exc.message, detail=exc.payload)
         if kind == "need_login":
             return CheckinResult(site.name, base_url, "need_login", _need_login_message(site), detail=exc.payload)
         if kind == "need_verification":

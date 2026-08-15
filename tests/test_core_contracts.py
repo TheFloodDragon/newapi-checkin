@@ -52,6 +52,14 @@ def test_status_metadata_drives_cli_labels_and_icons() -> None:
         assert runner.status_icon(status.value, 0) == meta.icon
 
 
+def test_not_open_is_neutral_but_not_labeled_success() -> None:
+    assert ResultStatus.NOT_OPEN.value in OK_STATUSES
+    meta = status_meta(ResultStatus.NOT_OPEN)
+    assert meta.ok is True
+    assert meta.label == "未开放"
+    assert meta.icon == "🚧"
+
+
 def test_worker_event_roundtrip_is_versioned_and_redacted() -> None:
     event = WorkerEvent(
         stage="api_first",

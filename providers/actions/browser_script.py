@@ -358,7 +358,10 @@ def _try_api_checkin(site: SiteConfig, profile: SiteProfile) -> CheckinResult | 
                 if raw_reward:
                     _api_log(site, f"[{stage}] 签到接口原始返回：{raw_reward}")
             elif event == "checkin_error":
-                _api_log(site, f"[{stage}] 签到接口失败：{_describe_failure(payload)}")
+                if bool(getattr(payload, "not_open", False)):
+                    _api_log(site, f"[{stage}] 活动未开放：{getattr(payload, 'message', '')}")
+                else:
+                    _api_log(site, f"[{stage}] 签到接口失败：{_describe_failure(payload)}")
 
         if script_owns_http_flow:
             _api_log(site, f"[{stage}] 站点脚本接管 HTTP 状态与签到，跳过 Sub2API 标准端点探测")
@@ -379,6 +382,9 @@ def _try_api_checkin(site: SiteConfig, profile: SiteProfile) -> CheckinResult | 
         if result.detail.get("unsupported_checkin"):
             _api_log(site, f"[{stage}] 站点无可用签到端点，交给浏览器脚本")
             return None
+        if result.status == "not_open":
+            _api_log(site, f"[{stage}] {result.message}，本次跳过（活动未开放）")
+            return result
         if result.status not in {"success", "already_done"}:
             _api_log(site, f"[{stage}] HTTP 状态机未完成（{result.status}）：{result.message}")
             return None

@@ -96,7 +96,11 @@ API_VARIANT_VALUES = tuple(item.value for item in ApiVariant)
 DEFAULT_API_VARIANT = ApiVariant.LEGACY.value
 VERIFICATION_MODE_VALUES = tuple(item.value for item in VerificationMode)
 VALID_RESULT_STATUSES = frozenset(item.value for item in ResultStatus)
-OK_STATUSES = frozenset({ResultStatus.SUCCESS.value, ResultStatus.ALREADY_DONE.value})
+# 「完成/非失败」状态：NOT_OPEN 保留独立标签，不会显示成成功，但活动窗口已关闭时
+# 重试或启动浏览器没有意义，因此不计失败、不影响退出码，也允许当天沿用结果。
+OK_STATUSES = frozenset(
+    {ResultStatus.SUCCESS.value, ResultStatus.ALREADY_DONE.value, ResultStatus.NOT_OPEN.value}
+)
 
 _EnumT = TypeVar("_EnumT", bound=StrEnum)
 

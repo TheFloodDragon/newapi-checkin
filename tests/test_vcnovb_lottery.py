@@ -197,5 +197,7 @@ def test_history_must_match_current_period() -> None:
 def test_inactive_pool_is_not_reported_as_checked_in() -> None:
     client = FakeClient({("GET", lottery.SUMMARY_ROUTE): _summary(active=False)})
 
-    with pytest.raises(ApiError, match="当前未开放"):
+    with pytest.raises(ApiError, match="当前未开放") as raised:
         lottery.do_checkin(client)
+
+    assert raised.value.not_open is True

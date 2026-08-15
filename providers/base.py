@@ -450,7 +450,7 @@ class ProfileClient(ABC):
 
     @abstractmethod
     def classify(self, error: ApiError) -> str:
-        """把 ApiError 归类为 already_done / need_login / need_verification / error。"""
+        """把 ApiError 归类为 already_done / not_open / need_login / need_verification / error。"""
 
 
 class BrowserAuthError(Exception):

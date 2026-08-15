@@ -256,7 +256,9 @@ def checked_in_flag(data: Any) -> bool | None:
 
 # ── 错误归类 ─────────────────────────────────────────────────────────────────
 def classify_error(error: ApiError) -> str:
-    """把 ApiError 归类为 already_done / need_login / need_verification / error。"""
+    """把 ApiError 归类为 already_done / not_open / need_login / need_verification / error。"""
+    if error.not_open:
+        return "not_open"
     if contains_any(error.message, ALREADY_DONE_PATTERNS):
         return "already_done"
     if (

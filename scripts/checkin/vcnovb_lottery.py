@@ -247,7 +247,7 @@ def do_checkin(client: Any, log: Any = None) -> CheckinReward:
 
     pool = state.get("pool") if isinstance(state.get("pool"), dict) else {}
     if not bool(state.get("active")) or not bool(pool.get("enabled", True)):
-        raise ApiError(None, summary, "普通抽奖当前未开放")
+        raise ApiError(None, summary, "普通抽奖当前未开放", not_open=True)
 
     if _remaining(state) <= 0:
         return _already_reward(client, state, log=log)
