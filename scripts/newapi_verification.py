@@ -39,6 +39,40 @@ def _status_data(client: Any) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _checkin_status(client: Any) -> dict[str, Any]:
+    """取签到状态响应。
+
+    优先复用 ``fetch_status`` 已取过的缓存：该响应在一次签到里必然被读过一次，
+    重复请求既慢又可能触发站点限流。没有缓存时不额外发请求，返回空字典。
+    """
+    data = getattr(client, "_checkin_status_data", None)
+    return data if isinstance(data, dict) else {}
+
+
+def _code_required(checkin_status: dict[str, Any]) -> bool:
+    """签到状态是否声明「必须提交每日口令」。
+
+    实测 xingya.site：签到状态返回 ``code_required: true``，而 /api/status 里既没有
+    验证码开关也没有 Turnstile。它**不是图形验证码**——前端只渲染一个「今日签到口令」
+    文本框（"Code is valid for today only"），把用户输入按 ``{"code": ...}`` 提交到
+    ``POST /api/user/checkin``，站点没有任何取图/取码端点。口令由站点站外发布，
+    程序无法自行获得，因此只能由配置提供。
+    """
+    return bool(checkin_status.get("code_required"))
+
+
+def _configured_checkin_code(client: Any) -> str:
+    """读取用户为本站配置的今日签到口令；未配置返回空串。"""
+    args = getattr(getattr(client, "site", None), "script_args", None)
+    if not isinstance(args, dict):
+        return ""
+    for key in ("checkin_code", "daily_code", "code"):
+        value = str(args.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
 def _auto_modes(options: dict[str, Any]) -> list[str]:
     modes: list[str] = []
     captcha_type = str(options.get("captcha_type") or "").strip().lower()
@@ -100,6 +134,8 @@ def do_checkin(
     selected = normalize_verification_mode(
         preferred if preferred is not None else getattr(client.site, "verification_mode", "auto")
     )
+    checkin_status = _checkin_status(client)
+    code_flag = _code_required(checkin_status)
     detected = _auto_modes(options)
     order: list[str] = []
     if selected != "auto":
@@ -109,7 +145,24 @@ def do_checkin(
     _log(
         f"验证路由：preferred={selected}，auto_detected={detected or ['none']}，"
         f"attempt_order={order or ['default_checkin']}"
+        + ("，签到状态 code_required=true" if code_flag else "")
     )
+
+    # 每日口令与图形验证码是两套机制：前者站点只发布在站外，程序拿不到。裸提交必被
+    # 服务端拒（实测星芽回「签到验证码不正确」），所以要么用配置的口令提交，要么直接
+    # 给出可操作结论，不再浪费一次写请求。
+    if code_flag:
+        code = _configured_checkin_code(client)
+        if not code:
+            raise ApiError(
+                None,
+                {"code_required": True},
+                "本站签到需要「今日签到口令」（站点站外发布、当日有效），程序无法自动获取。"
+                "请在该站点配置 script_args.checkin_code 填入今日口令，或关闭/容错该站点。",
+                need_config=True,
+            )
+        _log("使用配置的今日签到口令提交（script_args.checkin_code）")
+        return client._reward_from(client._legacy_checkin(code=code))
     if not order:
         return None
 

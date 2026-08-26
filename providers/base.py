@@ -426,6 +426,7 @@ class ApiError(Exception):
         *,
         transient: bool = False,
         not_open: bool = False,
+        need_config: bool = False,
     ) -> None:
         super().__init__(message)
         self.status = status
@@ -438,6 +439,9 @@ class ApiError(Exception):
         # 这不是本工具或账号的故障，重试也不会变好，因此归为告警而非失败：
         # 站点没开门时不应产生「签到失败」噪声，也不该让整批任务退出码变红。
         self.not_open = not_open
+        # need_config=True 表示缺少只能由用户提供的配置项（如站点站外发布的每日口令）。
+        # 站点、账号、人机验证都没问题，重试也不会变好，报「失败」会掩盖真正该做的动作。
+        self.need_config = need_config
 
 
 # ── 站点适配器抽象接口 ─────────────────────────────────────────────────────────
@@ -473,7 +477,7 @@ class ProfileClient(ABC):
 
     @abstractmethod
     def classify(self, error: ApiError) -> str:
-        """把 ApiError 归类为 already_done / not_open / need_login / need_verification / error。"""
+        """把 ApiError 归类为 already_done / not_open / need_config / need_login / need_verification / error。"""
 
 
 class BrowserAuthError(Exception):

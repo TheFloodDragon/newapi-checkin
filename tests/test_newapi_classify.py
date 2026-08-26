@@ -65,6 +65,30 @@ def test_auto_challenge_waf_falls_back_to_legacy(monkeypatch: pytest.MonkeyPatch
     assert legacy_calls == ["token"]
 
 
+def test_legacy_checkin_sends_daily_code_in_body_only_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """带口令时按 {"code": ...} 提交；不带时保持原来的空对象体。"""
+    sent: list[dict] = []
+
+    def fake_request(url: str, **kwargs: object) -> object:
+        sent.append({"url": url, "body": kwargs.get("body")})
+        return {"success": True, "data": {"quota_awarded": 1}}
+
+    monkeypatch.setattr("providers.profiles.newapi.http_request", fake_request)
+    client = NewApiClient(
+        SiteConfig(name="code-site", base_url="https://code.invalid"),
+        AuthInfo(access_token="tok"),
+    )
+
+    client._legacy_checkin(code="TODAY42")
+    client._legacy_checkin()
+
+    assert sent[0]["body"] == b'{"code": "TODAY42"}'
+    assert sent[1]["body"] == b"{}"
+    assert all(item["url"].endswith("/api/user/checkin") for item in sent)
+
+
 def test_cloudflare_response_refreshes_cookie_once_and_retries_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

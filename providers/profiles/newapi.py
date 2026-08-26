@@ -18,6 +18,7 @@ Turnstile、点阵字符、base64Captcha 字符图和 GoCaptcha 点选；本模�
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -120,6 +121,9 @@ class NewApiClient(ProfileClient):
         # 只允许启动一次浏览器刷新，避免每个接口递归拉起浏览器或重复提交签到。
         self._cookie_refresher = cookie_refresher
         self._cookie_refresh_used = False
+        # 签到状态响应缓存：验证路由要用其中的 code_required / captcha_enabled 判断
+        # 是否需要图形验证码，而这份响应在一次签到里已被 fetch_status 取过一次。
+        self._checkin_status_data: dict[str, Any] = {}
 
     # ── 底层请求 ──
     def request(self, method: str, path: str, body: bytes | None = None, *, retry_non_idempotent: bool = False) -> Any:
@@ -196,7 +200,13 @@ class NewApiClient(ProfileClient):
 
     def get_checkin_status_raw(self, month: str | None = None) -> Any:
         month = month or datetime.now().strftime("%Y-%m")
-        return self.request("GET", f"/api/user/checkin?{urllib.parse.urlencode({'month': month})}")
+        payload = self.request("GET", f"/api/user/checkin?{urllib.parse.urlencode({'month': month})}")
+        # 顺手缓存签到状态：验证路由据此判断本站是否需要图形验证码，
+        # 不缓存就得为同一份数据再发一次请求。
+        data = unwrap_data(payload)
+        if isinstance(data, dict):
+            self._checkin_status_data = data
+        return payload
 
     # ── ProfileClient 接口 ──
     def fetch_status(self) -> StatusInfo:
@@ -262,6 +272,10 @@ class NewApiClient(ProfileClient):
     def classify(self, error: ApiError) -> str:
         if error.not_open:
             return "not_open"
+        # 缺少用户独有的配置项（如站点站外发布的每日口令）：站点与账号都正常，
+        # 报「失败」会掩盖真正该做的动作，必须先于所有文案词表判定。
+        if getattr(error, "need_config", False):
+            return "need_config"
         # 服务端明确回执「签到功能未启用」等文案时，站点没开门：重试与浏览器兜底
         # 都不会改变结果，必须先于 already_done/登录判定，避免落入宽泛词表。
         if contains_any(error.message, NOT_OPEN_PATTERNS):
@@ -280,12 +294,15 @@ class NewApiClient(ProfileClient):
         return "error"
 
     # ── 签到接口变体 ──
-    def _legacy_checkin(self, turnstile: str = "") -> Any:
+    def _legacy_checkin(self, turnstile: str = "", code: str = "") -> Any:
         path = "/api/user/checkin"
         if turnstile:
             path += "?" + urllib.parse.urlencode({"turnstile": turnstile})
+        # 部分 fork 要求提交「今日签到口令」：前端按 {"code": ...} 放在请求体里
+        # （实测 xingya.site）。没有口令时保持原来的空对象体，行为不变。
+        body = json.dumps({"code": code}).encode("utf-8") if code else None
         # 签到 POST 是幂等的（重复签到 → already_done），瞬时网络错误可安全重试。
-        return unwrap_data(self.request("POST", path, retry_non_idempotent=True))
+        return unwrap_data(self.request("POST", path, body, retry_non_idempotent=True))
 
     def _challenge_checkin(self) -> Any:
         if not CHALLENGE_HELPER_PATH.exists():

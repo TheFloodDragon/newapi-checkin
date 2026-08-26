@@ -257,9 +257,12 @@ def checked_in_flag(data: Any) -> bool | None:
 
 # ── 错误归类 ─────────────────────────────────────────────────────────────────
 def classify_error(error: ApiError) -> str:
-    """把 ApiError 归类为 already_done / not_open / need_login / need_verification / error。"""
+    """把 ApiError 归类为 already_done / not_open / need_config / need_login / need_verification / error。"""
     if error.not_open:
         return "not_open"
+    # 缺少只能由用户提供的配置项时，站点与账号都正常，报「失败」会掩盖真正该做的动作。
+    if getattr(error, "need_config", False):
+        return "need_config"
     # 服务端明确说签到功能未启用/活动未开放时，必须先于宽泛的登录与验证词表判定，
     # 否则「未开启签到」这类文案会被 LOGIN_PATTERNS 的「无效/过期」等词误伤。
     if contains_any(error.message, NOT_OPEN_PATTERNS):
