@@ -24,7 +24,17 @@ SITE_LABEL = "ABR 福利站"
 OWNS_HTTP_FLOW = True
 LOGIN_PATH = "/auth/linuxdo/login"
 CHECKIN_PATH = "/checkin"
+LEVEL_PATH = "/level"
 HISTORY_PATH = "/history?page=1"
+
+# 站点新增等级模块后的行为（2026-08-26 实测）：账号未完成等级认证时，/checkin、
+# /lottery、/subsidy、/history 等全部模块路由都直接回 FastAPI 的 404
+# {"detail":"Not Found"}，首页导航里也只剩「主站 / 等级 / 退出」。
+# 这种 404 与「站点下线」「路由改名」长得一样，必须单独识别，否则只能报出
+# 无从下手的「未识别到签到页面」。
+_NOT_FOUND_MARKERS = ('"detail":"not found"', '"detail": "not found"')
+_LEVEL_PENDING_MARKERS = ("尚未认证", "未认证")
+_LEVEL_VERIFY_MARKERS = ("等级认证", "认证等级", "/level/verify")
 
 _LOGIN_MARKERS = (
     "使用 Linux DO 登录",
@@ -237,6 +247,25 @@ async def _open_checkin(page: Any, helpers: Any, origin: str) -> str:
     except Exception:
         pass
     return await _body_text(page)
+
+
+async def _level_gate_pending(page: Any, helpers: Any, text: str) -> str:
+    """签到路由 404 是否由「等级未认证」造成；是则返回等级页摘要，否则返回空串。
+
+    只有在签到页确实回了 FastAPI 404 时才去读 /level，避免给正常流程多加一次请求。
+    """
+    if not _contains_any(text, _NOT_FOUND_MARKERS):
+        return ""
+    try:
+        await helpers.goto(LEVEL_PATH, timeout=60000, wait_until="domcontentloaded")
+    except Exception:
+        return ""
+    level_text = await _body_text(page)
+    if not _contains_any(level_text, _LEVEL_VERIFY_MARKERS):
+        return ""
+    if not _contains_any(level_text, _LEVEL_PENDING_MARKERS):
+        return ""
+    return _short_text(level_text, 300)
 
 
 async def _oauth_login(page: Any, helpers: Any, origin: str) -> dict[str, Any]:
@@ -492,6 +521,20 @@ async def run(page: Any, context: Any, site: Any, helpers: Any) -> dict[str, Any
         screenshot = await helpers.screenshot("abrdns-welfare-checkin-page-unrecognized.png")
         if screenshot:
             auth_detail["screenshot"] = screenshot
+        # 页面地址与正文摘要必须进 detail：只给截图路径时，CI 上排查得先去翻构建产物，
+        # 而「站点改了路由」「模块被停用」「被 WAF 换页」三种情况的截图都只是一片空白。
+        auth_detail["page_url"] = str(getattr(page, "url", "") or "")
+        auth_detail["result_text"] = _short_text(text, 300)
+        level_summary = await _level_gate_pending(page, helpers, text)
+        if level_summary:
+            auth_detail.update(
+                {"completion_signal": "level_not_verified", "level_page_text": level_summary}
+            )
+            return helpers.need_config(
+                f"{SITE_LABEL}已启用等级模块：账号尚未完成等级认证，签到等所有模块路由都返回 404。"
+                f"请先在 {origin}{LEVEL_PATH} 点击认证按钮完成等级认证后重试。",
+                auth_detail,
+            )
         return helpers.error("ABR 福利站登录成功，但未识别到签到页面", auth_detail)
 
     submitted = await _submit_checkin(page, helpers)

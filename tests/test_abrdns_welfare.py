@@ -163,6 +163,9 @@ class FakeHelpers:
     def need_verification(self, message: str, detail: dict[str, Any] | None = None, **kwargs: Any) -> dict[str, Any]:
         return self._result("need_verification", message, detail, **kwargs)
 
+    def need_config(self, message: str, detail: dict[str, Any] | None = None, **kwargs: Any) -> dict[str, Any]:
+        return self._result("need_config", message, detail, **kwargs)
+
     def error(self, message: str, detail: dict[str, Any] | None = None, **kwargs: Any) -> dict[str, Any]:
         return self._result("error", message, detail, **kwargs)
 
@@ -220,6 +223,74 @@ def test_run_returns_need_verification_when_hcaptcha_is_present() -> None:
     assert helpers.solve_options["temporal_interval_ms"] == 400
     assert helpers.solve_options["temporal_sheet_max_edge"] == 800
     assert helpers.solve_options["temporal_phase_wait_ms"] == 5_000
+
+
+class FakeContext:
+    """只提供本站 session Cookie：真实流程靠它判定「已登录」。"""
+
+    async def cookies(self, *_args: Any) -> list[dict[str, str]]:
+        return [
+            {
+                "name": "session",
+                "value": "signed-session",
+                "domain": "checkin.new-api.abrdns.com",
+                "path": "/",
+            }
+        ]
+
+
+def test_unverified_level_gate_is_reported_as_need_config() -> None:
+    """站点启用等级模块后，未认证账号的所有模块路由都回 FastAPI 404。
+
+    2026-08-26 实测：/checkin、/lottery、/subsidy、/history 全部返回
+    {"detail":"Not Found"}，首页导航只剩「主站 / 等级 / 退出」，而 /level 显示
+    「当前等级 尚未认证」并提供认证表单。旧实现只能报「未识别到签到页面」，
+    与「站点下线」「路由改名」无法区分，用户看不出要去点等级认证。
+    """
+    level_text = "福利站 主站 等级 退出 当前等级 尚未认证 Linux DO 信任等级 L2 等级认证 等级 1 已满足"
+
+    class LevelGatePage(FakePage):
+        def __init__(self) -> None:
+            super().__init__('{"detail":"Not Found"}')
+            self.visited: list[str] = []
+
+        def show_level(self) -> None:
+            self.text = level_text
+            self.body = FakeLocator(text=level_text)
+
+    page = LevelGatePage()
+    helpers = FakeHelpers(page)
+
+    async def goto(path: str, **_kwargs: Any) -> None:
+        page.visited.append(path)
+        if path == welfare.LEVEL_PATH:
+            page.show_level()
+        page.url = "https://checkin.new-api.abrdns.com" + path
+
+    helpers.goto = goto  # type: ignore[method-assign]
+    site = SimpleNamespace(base_url="https://checkin.new-api.abrdns.com")
+
+    result = asyncio.run(welfare.run(page, FakeContext(), site, helpers))
+
+    assert result["status"] == "need_config"
+    assert "等级认证" in result["message"]
+    assert result["detail"]["completion_signal"] == "level_not_verified"
+    assert result["detail"]["result_text"] == '{"detail":"Not Found"}'
+    assert welfare.LEVEL_PATH in page.visited, "签到页 404 时应去读等级页取证"
+    assert page.submitted is False
+
+
+def test_unrecognized_page_keeps_url_and_text_for_diagnosis() -> None:
+    """非 404 的陌生页面仍报 error，但必须带上页面地址与正文摘要。"""
+    page = FakePage("欢迎来到福利站")
+    helpers = FakeHelpers(page)
+    site = SimpleNamespace(base_url="https://checkin.new-api.abrdns.com")
+
+    result = asyncio.run(welfare.run(page, FakeContext(), site, helpers))
+
+    assert result["status"] == "error"
+    assert result["detail"]["page_url"].endswith("/checkin")
+    assert "欢迎来到福利站" in result["detail"]["result_text"]
 
 
 def test_run_never_submits_logout_form_as_checkin() -> None:
