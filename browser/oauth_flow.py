@@ -85,6 +85,47 @@ def oauth_landed(link: dict[str, Any]) -> bool:
     return bool(link.get("landed_back")) and not link.get("need_human") and not link.get("waf_blocked")
 
 
+def oauth_failure_reason(link: dict[str, Any]) -> str:
+    """OAuth 链路没走通时的具体原因；走通了返回空串。
+
+    独立成函数是因为顺序即语义：relogin 站点在登录前读额度必然失败（当时确实
+    未登录），所以「读不到额度」是最弱的线索，绝不能盖住「停在第三方登录页」这类
+    确定原因。旧实现把「额度前后都读不到」放在最前面判定，于是日志里明明写着
+    「停在 github 登录页」，结论却只剩一句「无法读取额度，登录态可能已失效」。
+    """
+    if link.get("waf_blocked"):
+        return "waf_blocked"
+    if link.get("need_human"):
+        return "provider_login"
+    if link.get("cloudflare"):
+        return "cloudflare"
+    if link.get("state_error"):
+        return "state_error"
+    if not link.get("landed_back"):
+        return "no_callback"
+    return ""
+
+
+def _provider_login_message(link: dict[str, Any]) -> str:
+    """停在第三方登录页时的可操作提示，并区分「登录态没装进浏览器」与「已被拒绝」。"""
+    provider = str(link.get("provider") or "第三方").strip() or "第三方"
+    session_present = link.get("provider_session_present")
+    if session_present is False:
+        detail = (
+            f"浏览器上下文里没有 {provider} 的认证 Cookie（共享登录态未成功加载或已被清空）"
+        )
+    elif session_present is True:
+        detail = (
+            f"{provider} 认证 Cookie 已装载但被 {provider} 拒绝（会话已过期或被吊销）"
+        )
+    else:
+        detail = f"浏览器停在 {provider} 登录页"
+    return (
+        f"共享 {provider} 登录态已失效：{detail}，站点无法自动完成 OAuth 授权。"
+        f"请在管理界面重新捕获 {provider} 登录态后重试。"
+    )
+
+
 def oauth_checkin_result(quota_before: Any, quota_after: Any, link: dict[str, Any]) -> dict[str, Any]:
     """综合额度变化、OAuth 回跳状态和站点弹窗生成签到结果。"""
     result: dict[str, Any] = {
@@ -108,39 +149,58 @@ def oauth_checkin_result(quota_before: Any, quota_after: Any, link: dict[str, An
         result["message"] = f"签到成功（站点弹窗：{success_message}）。"
         return result
 
-    if quota_before is None and quota_after is None:
-        if link.get("waf_blocked"):
-            result["status"] = "need_verification"
-            result["message"] = message_with_site_error(
-                "站点阿里云 WAF 持续拦截当前出口 IP（数据中心/CI IP 信誉过低），"
-                "浏览器无法通过 JS 挑战，本次签到中止。登录态可能仍有效，无需重新捕获；"
-                "请为该账号配置住宅代理（proxy 字段），或改用住宅 IP 环境运行。",
-                link,
-            )
-        elif link.get("cloudflare"):
-            result["status"] = "need_verification"
-            result["message"] = message_with_site_error(
-                "OAuth 过程命中 Cloudflare/WAF 人机验证，无法自动完成，请重新捕获登录态。",
-                link,
-            )
-        else:
-            result["status"] = "need_login"
-            result["message"] = message_with_site_error("无法读取额度，登录态可能已失效，请重新捕获登录态。", link)
-        return result
-
+    # 授权确实走通了：先按额度/弹窗判定，不能因为「过程中出现过 CF 挑战」翻案。
+    # waf_blocked / need_human 已在 oauth_landed 里否决，不会落到这里。
     if oauth_completed:
         current = quota_after if quota_after is not None else quota_before
+        if current is None:
+            # 授权跳回了站点，但前后都读不到额度：站点没认到登录身份或额度接口异常，
+            # 不能当成「今日已发放」。
+            result["status"] = "need_login"
+            result["message"] = message_with_site_error(
+                "OAuth 已跳回站点，但仍读不到额度（站点未认到登录身份或额度接口异常）。"
+                "请确认站点登录方式与账号状态，必要时重新捕获登录态。",
+                link,
+            )
+            return result
         result["status"] = "already_done"
         result["message"] = f"OAuth 重登完成，额度无变化（当前 {_quota_to_usd(current)}，今日可能已发放）。"
         return result
 
-    reason = (
-        "停在第三方登录页（共享登录态可能已过期）"
-        if link.get("need_human")
-        else ("OAuth 授权未带 code 顺畅跳回站点" if not link.get("landed_back") else "OAuth 链路未顺畅完成")
-    )
+    reason = oauth_failure_reason(link)
+    if reason == "waf_blocked":
+        result["status"] = "need_verification"
+        result["message"] = message_with_site_error(
+            "站点阿里云 WAF 持续拦截当前出口 IP（数据中心/CI IP 信誉过低），"
+            "浏览器无法通过 JS 挑战，本次签到中止。登录态可能仍有效，无需重新捕获；"
+            "请为该账号配置住宅代理（proxy 字段），或改用住宅 IP 环境运行。",
+            link,
+        )
+        return result
+    if reason == "provider_login":
+        result["status"] = "need_login"
+        result["message"] = message_with_site_error(_provider_login_message(link), link)
+        return result
+    if reason == "cloudflare":
+        result["status"] = "need_verification"
+        result["message"] = message_with_site_error(
+            "OAuth 过程命中 Cloudflare/WAF 人机验证，无法自动完成，请重新捕获登录态。",
+            link,
+        )
+        return result
+    if reason == "state_error":
+        result["status"] = "need_login"
+        result["message"] = message_with_site_error(
+            f"OAuth 自动重登未完成：站点未下发一次性 state（{link.get('state_error')}），"
+            "可能被限流或该站未开启此 OAuth 登录方式。",
+            link,
+        )
+        return result
+
     result["status"] = "need_login"
-    result["message"] = message_with_site_error(f"OAuth 自动重登未完成：{reason}。请重新捕获登录态。", link)
+    result["message"] = message_with_site_error(
+        "OAuth 自动重登未完成：授权未带 code 顺畅跳回站点。请重新捕获登录态。", link
+    )
     return result
 
 
@@ -431,6 +491,27 @@ def is_oauth_callback_url(url: str, base_url: str) -> bool:
     return True
 
 
+async def provider_session_present(page: Any, provider: Any) -> bool | None:
+    """浏览器上下文里是否仍带着该 provider 的认证 Cookie；读不到返回 None。
+
+    停在第三方登录页时这是唯一能分开两种成因的证据：Cookie 还在却被拒 → 会话确实
+    过期/被吊销，重新捕获有用；Cookie 根本不在上下文里 → 是登录态没装进浏览器，
+    重新捕获再多次也没用，得先查登录态加载链路。
+    """
+    try:
+        cookies = await page.context.cookies()
+    except Exception as exc:
+        if is_driver_closed_error(exc):
+            raise
+        return None
+    if not isinstance(cookies, list):
+        return None
+    try:
+        return bool(provider.has_authenticated_state(cookies))
+    except Exception:
+        return None
+
+
 async def finish_oauth_authorization(
     page: Any,
     base_url: str,
@@ -447,7 +528,20 @@ async def finish_oauth_authorization(
         try:
             if await page.query_selector(marker):
                 result["need_human"] = True
-                log(f"停在 {provider.key} 登录页：共享登录态失效，请在 GUI 重新捕获 {provider.key} 登录态")
+                session_present = await provider_session_present(page, provider)
+                result["provider_session_present"] = session_present
+                if session_present is True:
+                    log(
+                        f"停在 {provider.key} 登录页：认证 Cookie 仍在浏览器中但被 {provider.key} 拒绝"
+                        "（会话已过期或被吊销），请在 GUI 重新捕获登录态"
+                    )
+                elif session_present is False:
+                    log(
+                        f"停在 {provider.key} 登录页：浏览器上下文里没有 {provider.key} 认证 Cookie，"
+                        "共享登录态未成功加载（重新捕获前先确认登录态是否完整）"
+                    )
+                else:
+                    log(f"停在 {provider.key} 登录页：共享登录态失效，请在 GUI 重新捕获 {provider.key} 登录态")
                 attach_site_errors(result, await site_error_messages(page, error_collector), log)
                 return result
         except Exception as exc:
@@ -593,7 +687,9 @@ __all__ = [
     "is_oauth_callback_url",
     "maybe_click_with_popup",
     "oauth_checkin_result",
+    "oauth_failure_reason",
     "oauth_landed",
+    "provider_session_present",
     "site_oauth_selectors",
     "trigger_oauth",
 ]

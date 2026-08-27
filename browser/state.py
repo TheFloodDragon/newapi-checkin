@@ -57,12 +57,36 @@ class BrowserStateError(Exception):
 async def restore_storage_state(
     context: Any,
     storage_state: dict[str, Any] | None,
+    log: Any = None,
 ) -> None:
-    """把 cookies/localStorage 恢复到浏览器上下文，并严格隔离不同 origin。"""
+    """把 cookies/localStorage 恢复到浏览器上下文，并严格隔离不同 origin。
+
+    cookie 先整批写入；整批被拒时逐条重试，只丢掉真正不合规的那一条。
+    ``add_cookies`` 是全有全无的：一条 ``__Host-`` 前缀或字段组合不合规的 cookie
+    就会让 14 条里的会话 cookie 全部没进去，表现为「登录态明明没过期却停在登录页」，
+    而且没有任何日志能指向那一条。
+    """
     data = storage_state or {}
     cookies = data.get("cookies") or []
     if cookies:
-        await context.add_cookies(cookies)
+        try:
+            await context.add_cookies(cookies)
+        except Exception as exc:
+            rejected: list[str] = []
+            accepted = 0
+            for cookie in cookies:
+                try:
+                    await context.add_cookies([cookie])
+                    accepted += 1
+                except Exception:
+                    rejected.append(str(cookie.get("name") or "?"))
+            if log:
+                log(
+                    f"登录态 Cookie 整批写入被拒（{type(exc).__name__}），已逐条写入 "
+                    f"{accepted}/{len(cookies)} 条；被拒：{', '.join(rejected) or '无'}"
+                )
+            if not accepted:
+                raise
 
     origin_map: dict[str, dict[str, str]] = {}
     for origin_data in data.get("origins", []) or []:

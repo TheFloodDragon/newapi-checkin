@@ -31,6 +31,10 @@ SITE_ERROR_NOISE = [
     "e.response is undefined",
     "google-analytics",
     "googletagmanager",
+    # 第三方站点自己的前端告警：OAuth 授权页跑的是 GitHub/Linux.do 的代码，它们的
+    # 兼容性 warning 与本次签到无关，混进「站点原始错误」只会把真正的原因挤走。
+    "ignoring unsupported entrytypes",
+    "githubassets.com",
 ]
 
 

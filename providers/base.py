@@ -22,6 +22,7 @@ import gzip
 import json
 import math
 import random
+import re
 import sys
 import time
 import urllib.error
@@ -57,6 +58,50 @@ VERIFICATION_PATTERNS = [
     # 而图形验证码本身就属于人机验证 —— 缺它被拒时应归 need_verification。
     "验证码",
 ]
+
+# Cloudflare 挑战页特征：浏览器执行 JS / 点一次 Turnstile 就能通过，值得启动浏览器兜底。
+# 只收拦截页上不会出现的标记 —— 例如不能用 "challenge-platform"：Cloudflare 的
+# 拦截页也会加载 /cdn-cgi/challenge-platform/scripts/jsd/main.js，用它判定会把
+# 「出口 IP 被封禁」误判成「可解挑战」，白启动一次浏览器。
+CF_CHALLENGE_PATTERNS = [
+    "just a moment",
+    "checking your browser",
+    "cf-challenge",
+    "cf_chl_opt",
+    "_cf_chl_opt",
+]
+
+# 阿里云 WAF 的 JS 挑战特征（urllib 只会拿到这段混淆 JS）。浏览器能执行它，因此
+# 与 Cloudflare 挑战页同属「值得开浏览器」的一类。
+ALIYUN_WAF_PATTERNS = [
+    "aliyun_waf",
+    "acw_sc__",
+    "slidecaptcha",
+    "var arg1=",
+]
+
+# Cloudflare 硬拦截页特征（HTTP 403 + error 1020 / WAF 自定义规则 / IP 信誉封禁）。
+# 与挑战页必须分开：拦截页没有任何可作答的验证，浏览器同样过不去，唯一可行动作是
+# 换出口 IP（代理节点）或联系站长放行。旧实现把整页 HTML 当 message 抛给用户，
+# 既看不出这是 IP 被拒，还会把 5KB HTML 灌进汇总行与结果文件。
+CF_BLOCK_PATTERNS = [
+    "sorry, you have been blocked",
+    "attention required! | cloudflare",
+    "you are unable to access",
+    "error 1020",
+    "access denied | cloudflare",
+    "cf-error-details",
+]
+
+_CF_RAY_RE = re.compile(r"Cloudflare Ray ID:\s*(?:<[^>]+>\s*)*([0-9a-f]{8,32})", re.I)
+_CF_CLIENT_IP_RE = re.compile(r'id="cf-footer-ip"[^>]*>\s*([0-9a-fA-F:.]{3,45})\s*<', re.I)
+_HTML_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
+_HTML_HEADING_RE = re.compile(r"<h[12][^>]*>(.*?)</h[12]>", re.I | re.S)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+# 非 JSON 响应体存进 ApiError.payload 的字符上限。payload 会作为 detail 进结果文件与
+# GUI，整页 HTML 放进去只会挤占版面；模式匹配（WAF 标记、端点缺失文案）用这段预览足够。
+BODY_PREVIEW_MAX = 300
 
 # 「活动未开放」特征唯一词表（contains_any 匹配时双方都转小写，大小写无关）。
 # 站点管理员关闭签到功能、活动未到开始时间或已结束时，服务端会明确回执这类文案。
@@ -145,7 +190,14 @@ def log_http_exchange(
     if error is not None:
         status = getattr(error, "status", None)
         body = getattr(error, "payload", None)
-        detail = _brief_payload(body, limit) if body not in (None, "") else str(error)
+        if looks_like_html(body):
+            # 整页 HTML 的原文对排查没有增量信息，message 已是归纳后的结论
+            # （含 Cloudflare Ray ID / 出口 IP）；打原文只会把日志顶满。
+            detail = str(getattr(error, "message", "") or error)
+        elif body not in (None, ""):
+            detail = _brief_payload(body, limit)
+        else:
+            detail = str(error)
         suffix = f" status={status}" if status else ""
         line = f"[http:{tag}] {method.upper()} {url} 失败{suffix} → {detail}"
     else:
@@ -427,6 +479,7 @@ class ApiError(Exception):
         transient: bool = False,
         not_open: bool = False,
         need_config: bool = False,
+        waf_kind: str = "",
     ) -> None:
         super().__init__(message)
         self.status = status
@@ -442,6 +495,11 @@ class ApiError(Exception):
         # need_config=True 表示缺少只能由用户提供的配置项（如站点站外发布的每日口令）。
         # 站点、账号、人机验证都没问题，重试也不会变好，报「失败」会掩盖真正该做的动作。
         self.need_config = need_config
+        # waf_kind 是「HTTP 拿到的是防护页而非业务响应」的结构化标记，取值见 waf_page_kind：
+        #   challenge —— 可由浏览器执行 JS/点验证通过，值得启动浏览器兜底；
+        #   block     —— 出口 IP 被安全规则拒绝，浏览器同样过不去，启动浏览器只是空耗。
+        # 之所以不靠文案匹配：message 会被各层改写，一次措辞调整就会让兜底策略静默失效。
+        self.waf_kind = waf_kind
 
 
 # ── 站点适配器抽象接口 ─────────────────────────────────────────────────────────
@@ -623,16 +681,106 @@ def decode_response_body(body: bytes, content_encoding: str = "") -> str:
     return body.decode("utf-8", "replace")
 
 
+def looks_like_html(text: Any) -> bool:
+    """响应体是否是 HTML 页面（而不是业务 JSON 或一句纯文本错误）。"""
+    if not isinstance(text, str):
+        return False
+    head = text.lstrip()[:400].lower()
+    return head.startswith("<!doctype html") or head.startswith("<html") or "<html" in head
+
+
+def _html_snippet(pattern: re.Pattern[str], text: str, limit: int = 120) -> str:
+    """取出 HTML 里第一处匹配的可读文本（去标签、压空白、限长）。"""
+    match = pattern.search(text)
+    if not match:
+        return ""
+    inner = _HTML_TAG_RE.sub(" ", match.group(1) or "")
+    return " ".join(inner.split())[:limit]
+
+
+def cloudflare_block_details(text: Any) -> dict[str, str] | None:
+    """识别 Cloudflare 硬拦截页，返回 Ray ID 与站点回显的出口 IP；不是拦截页返回 None。
+
+    只在拦截页（"Sorry, you have been blocked" / Attention Required）上返回结果。
+    挑战页（Just a moment）不算：那是可由浏览器执行 JS 通过的，仍应走浏览器兜底。
+    """
+    if not isinstance(text, str) or not text:
+        return None
+    if not contains_any(text, CF_BLOCK_PATTERNS):
+        return None
+    if contains_any(text, CF_CHALLENGE_PATTERNS):
+        return None
+    ray = _CF_RAY_RE.search(text)
+    client_ip = _CF_CLIENT_IP_RE.search(text)
+    return {
+        "ray_id": (ray.group(1) if ray else ""),
+        "client_ip": (client_ip.group(1) if client_ip else ""),
+    }
+
+
+def waf_page_kind(text: Any) -> str:
+    """判断响应体是哪类防护页：``block``（出口 IP 被拒）/ ``challenge``（可解）/ ``""``。
+
+    这个区分决定「值不值得启动浏览器」：挑战页浏览器执行一次 JS 就能过；拦截页是
+    安全规则对当前出口 IP 的终局拒绝，开浏览器只是白花一分钟再失败一次。
+    """
+    if not isinstance(text, str) or not text:
+        return ""
+    if cloudflare_block_details(text) is not None:
+        return "block"
+    if contains_any(text, CF_CHALLENGE_PATTERNS + ALIYUN_WAF_PATTERNS):
+        return "challenge"
+    return ""
+
+
+def describe_html_body(text: str, *, limit: int = 160) -> str:
+    """把 HTML 响应体压成一句可行动的诊断，绝不把整页 HTML 当错误消息。
+
+    整页 HTML 作为 message 会一路进汇总行、结果 JSON 与通知，把真正有用的信息顶掉，
+    而且看不出到底是「被 CF 按出口 IP 拦下」还是「站点回了登录页」。
+    """
+    block = cloudflare_block_details(text)
+    if block is not None:
+        marks = [f"Ray ID={block['ray_id']}"] if block["ray_id"] else []
+        if block["client_ip"]:
+            marks.append(f"出口 IP={block['client_ip']}")
+        suffix = f"（{'，'.join(marks)}）" if marks else ""
+        return (
+            f"Cloudflare 已拒绝当前出口 IP{suffix}：这是站点安全规则的封禁，"
+            "不是可作答的验证码，浏览器同样无法通过，与登录态无关。"
+            "请更换代理节点/出口 IP 后重试，或联系站长放行。"
+        )
+    if contains_any(text, CF_CHALLENGE_PATTERNS):
+        return "站点返回 Cloudflare 人机验证挑战页（需浏览器执行 JS 挑战），纯 HTTP 无法通过。"
+    title = _html_snippet(_HTML_TITLE_RE, text)
+    heading = _html_snippet(_HTML_HEADING_RE, text)
+    parts = [part for part in (title, heading) if part]
+    summary = " / ".join(dict.fromkeys(parts))[:limit]
+    if summary:
+        return f"接口返回 HTML 页面而不是 JSON（{summary}；共 {len(text)} 字符）"
+    return f"接口返回 HTML 页面而不是 JSON（共 {len(text)} 字符）"
+
+
 def parse_json(text: str) -> Any:
     if not text:
         return None
     try:
         return json.loads(text)
     except json.JSONDecodeError as exc:
-        preview = text[:300]
+        preview = text[:BODY_PREVIEW_MAX]
+        kind = waf_page_kind(text)
+        # 判定用完整响应体：CF 拦截页的 <title> 与 Ray ID 都在 300 字符之外，
+        # 只看 preview 会把「出口 IP 被封禁」误判成普通的「接口返回非 JSON」。
+        if looks_like_html(text):
+            raise ApiError(None, preview, describe_html_body(text), waf_kind=kind) from exc
         if contains_any(preview, VERIFICATION_PATTERNS):
-            raise ApiError(None, preview, "站点要求 Cloudflare/Turnstile 验证，请先在浏览器完成验证并重新导出 Cookie。") from exc
-        raise ApiError(None, preview, f"接口返回非 JSON：{preview}") from exc
+            raise ApiError(
+                None,
+                preview,
+                "站点要求 Cloudflare/Turnstile 验证，请先在浏览器完成验证并重新导出 Cookie。",
+                waf_kind=kind or "challenge",
+            ) from exc
+        raise ApiError(None, preview, f"接口返回非 JSON：{preview}", waf_kind=kind) from exc
 
 
 def extract_message(payload: Any) -> str:
@@ -648,6 +796,10 @@ def extract_message(payload: Any) -> str:
                 value = data.get(key)
                 if value:
                     return str(value)
+    # HTML 响应体（WAF 拦截页、登录页、502 错误页）压成一句诊断：原样返回会让
+    # 整页 HTML 变成 CheckinResult.message。
+    if looks_like_html(payload):
+        return describe_html_body(payload)
     return str(payload) if payload else "请求失败"
 
 
@@ -713,10 +865,21 @@ def _http_request_once(
         text = decode_response_body(exc.read(), exc.headers.get("content-encoding", ""))
         try:
             payload = parse_json(text)
+            message = extract_message(payload)
         except ApiError:
-            payload = text
+            # 非 JSON 响应：结论按整段响应体归纳（Cloudflare 的 Ray ID 与出口 IP
+            # 都在页尾），但 payload 只留短预览 —— 它会作为 detail 进结果文件、
+            # 通知与 GUI，整页 HTML 放进去除了挤占版面没有任何用途。
+            message = extract_message(text)
+            payload = text[:BODY_PREVIEW_MAX]
         transient = exc.code in RETRY_STATUS_CODES
-        raise ApiError(exc.code, payload, extract_message(payload), transient=transient) from exc
+        raise ApiError(
+            exc.code,
+            payload,
+            message,
+            transient=transient,
+            waf_kind=waf_page_kind(text),
+        ) from exc
     except urllib.error.URLError as exc:
         # socket 超时在部分平台会被包进 URLError.reason
         raise ApiError(None, None, f"网络请求失败：{exc.reason}", transient=True) from exc

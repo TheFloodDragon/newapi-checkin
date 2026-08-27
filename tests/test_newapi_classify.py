@@ -165,3 +165,108 @@ def test_cloudflare_refresh_is_not_repeated_after_failed_browser_refresh(
         client.request("GET", "/api/user/self")
     assert calls == 1
     assert refresh_calls == 1
+
+
+# ── Cloudflare 拦截页（error 1020 类）与挑战页必须分开处理 ──────────────────────
+# 实测 Future Hub / Orbelis：GET /api/user/checkin 回 HTTP 403 + 「Sorry, you have
+# been blocked」整页 HTML。旧实现把整页 HTML 当 message 一路上抛，汇总行直接被 5KB
+# HTML 灌满，还看不出这是「当前出口 IP 被站点安全规则封禁」。
+CF_BLOCK_HTML = """<!DOCTYPE html>
+<!--[if lt IE 7]> <html class="no-js ie6 oldie" lang="en-US"> <![endif]-->
+<!--[if IE 7]>    <html class="no-js ie7 oldie" lang="en-US"> <![endif]-->
+<!--[if IE 8]>    <html class="no-js ie8 oldie" lang="en-US"> <![endif]-->
+<!--[if gt IE 8]><!--> <html class="no-js" lang="en-US"> <!--<![endif]-->
+<head>
+<title>Attention Required! | Cloudflare</title>
+<link rel="stylesheet" id="cf_styles-css" href="/cdn-cgi/styles/cf.errors.css" />
+</head>
+<body>
+  <div id="cf-error-details" class="cf-error-details-wrapper">
+    <h1 data-translate="block_headline">Sorry, you have been blocked</h1>
+    <h2 class="cf-subheadline"><span>You are unable to access</span> futureppo.top</h2>
+  </div>
+  <div class="cf-error-footer">
+    <span class="cf-footer-item">Cloudflare Ray ID: <strong class="font-semibold">a31ae42cdc7984cc</strong></span>
+    <span id="cf-footer-item-ip">Your IP: <span class="hidden" id="cf-footer-ip">2602:2b5:13::19d</span></span>
+  </div>
+  <script>window.__CF$cv$params={r:'a31ae42cdc7984cc'};var a=document.createElement('script');
+  a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';</script>
+</body>
+</html>"""
+
+
+def test_cloudflare_block_page_becomes_one_actionable_line() -> None:
+    from providers.base import parse_json, waf_page_kind
+
+    assert waf_page_kind(CF_BLOCK_HTML) == "block"
+    with pytest.raises(ApiError) as excinfo:
+        parse_json(CF_BLOCK_HTML)
+
+    error = excinfo.value
+    assert error.waf_kind == "block"
+    assert "<html" not in error.message and "<!DOCTYPE" not in error.message
+    assert len(error.message) < 200
+    # Ray ID 与站点回显的出口 IP 是排查这类封禁的唯一线索，必须留在消息里。
+    assert "a31ae42cdc7984cc" in error.message
+    assert "2602:2b5:13::19d" in error.message
+    assert "出口 IP" in error.message
+
+
+def test_cloudflare_block_is_need_verification_without_browser_fallback() -> None:
+    """拦截页浏览器同样过不去：归类保持 need_verification，但不许再白开一次浏览器。"""
+    from providers.base import extract_message, waf_page_kind
+    from providers.profiles.newapi import _browser_can_bypass, _is_antibot_block
+
+    error = ApiError(
+        403,
+        CF_BLOCK_HTML,
+        extract_message(CF_BLOCK_HTML),
+        waf_kind=waf_page_kind(CF_BLOCK_HTML),
+    )
+
+    assert _client().classify(error) == "need_verification"
+    assert _is_antibot_block(error) is True
+    assert _browser_can_bypass(error) is False
+
+
+def test_cloudflare_challenge_page_still_gets_browser_fallback() -> None:
+    """挑战页恰恰相反：浏览器执行一次 JS 就能过，必须继续走浏览器兜底。"""
+    from providers.base import parse_json
+    from providers.profiles.newapi import _browser_can_bypass
+
+    challenge = (
+        '<!DOCTYPE html><html><head><title>Just a moment...</title></head>'
+        '<body><div class="cf-challenge-running"></div></body></html>'
+    )
+    with pytest.raises(ApiError) as excinfo:
+        parse_json(challenge)
+
+    assert excinfo.value.waf_kind == "challenge"
+    assert _browser_can_bypass(excinfo.value) is True
+    assert _client().classify(excinfo.value) == "need_verification"
+
+
+def test_aliyun_waf_js_is_still_a_solvable_challenge() -> None:
+    from providers.base import parse_json
+    from providers.profiles.newapi import _browser_can_bypass
+
+    with pytest.raises(ApiError) as excinfo:
+        parse_json("var arg1='7F3A';var _0x=function(){};acw_sc__v2")
+
+    assert excinfo.value.waf_kind == "challenge"
+    assert _browser_can_bypass(excinfo.value) is True
+
+
+def test_plain_html_error_page_is_summarized_not_dumped() -> None:
+    """非 WAF 的 HTML 页面（登录页/502 页）也不该把整页塞进 message。"""
+    from providers.base import extract_message
+
+    html = (
+        "<!DOCTYPE html><html><head><title>502 Bad Gateway</title></head>"
+        "<body><h1>nginx</h1>" + "填充" * 2000 + "</body></html>"
+    )
+    message = extract_message(html)
+
+    assert "502 Bad Gateway" in message and "nginx" in message
+    assert len(message) < 200
+    assert "填充填充" not in message

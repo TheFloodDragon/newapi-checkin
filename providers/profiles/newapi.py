@@ -33,6 +33,8 @@ from accounts_store import normalize_api_variant
 
 from ..base import (
     USER_AGENT,
+    ALIYUN_WAF_PATTERNS,
+    CF_CHALLENGE_PATTERNS,
     NOT_OPEN_PATTERNS,
     ApiError,
     AuthInfo,
@@ -58,16 +60,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent.parent.parent
 CHALLENGE_HELPER_PATH = SCRIPT_DIR / "checkin_challenge.js"
 CHALLENGE_TIMEOUT = Timeouts.NODE_CHALLENGE  # Node 执行 WASM PoW 的超时（秒）
 
-# 阿里云/反爬 JS 挑战页特征（urllib 拿不到 JSON，只会拿到这段混淆 JS 或挑战 HTML）。
+# 「HTTP 拿到的是防护页而不是业务响应」的文案特征。词表用于兼容没有结构化
+# waf_kind 标记的 ApiError（站点脚本、Node 子进程自行构造的错误）。
 ANTIBOT_BLOCK_PATTERNS = [
     "接口返回非 JSON",
-    "var arg1=",
-    "acw_sc__",
-    "aliyun_waf",
-    "slidecaptcha",
-    "just a moment",
-    "cf-challenge",
-    "checking your browser",
+    "接口返回 HTML 页面",
+    *ALIYUN_WAF_PATTERNS,
+    *CF_CHALLENGE_PATTERNS,
 ]
 
 ALREADY_DONE_PATTERNS = ["已签到", "今日已", "已领取", "明天再来", "already"]
@@ -91,17 +90,34 @@ TURNSTILE_MODE_HINT = "turnstile"
 
 
 def _is_antibot_block(error: ApiError) -> bool:
-    """判断 ApiError 是否为「urllib 命中阿里云/反爬 JS 挑战页」而非真实业务错误。
+    """判断 ApiError 是否为「urllib 命中防护页」而非真实业务错误。
 
-    这类错误的特征：HTTP 200 但响应体是混淆 JS/挑战 HTML（parse_json 抛出「接口返回
-    非 JSON」），或 body 里出现 acw_sc__/aliyun_waf 等 WAF 标记。命中时可用浏览器
-    预取的额度兜底，而不是把它当成登录失效或站点异常。
+    这类错误的特征：HTTP 200/403 但响应体是混淆 JS、挑战页或 Cloudflare 拦截页
+    （parse_json 抛出非 JSON/HTML 诊断），或 body 里出现 acw_sc__/aliyun_waf 等 WAF
+    标记。命中时可用浏览器预取的额度兜底，而不是把它当成登录失效或站点异常。
     """
+    if getattr(error, "waf_kind", ""):
+        return True
     haystacks = [str(error.message or "")]
     if isinstance(error.payload, str):
         haystacks.append(error.payload)
     text = " ".join(haystacks)
     return contains_any(text, ANTIBOT_BLOCK_PATTERNS)
+
+
+def _browser_can_bypass(error: ApiError) -> bool:
+    """浏览器兜底对这次防护页是否可能有效。
+
+    只有「可解挑战」才值得启动浏览器：Cloudflare/阿里云的 JS 挑战执行一次即可放行。
+    出口 IP 被安全规则拒绝（CF error 1020 类拦截页）时浏览器同样拿到 403，
+    启动一次 Camoufox 只是白等一分钟，还会把真正的原因埋进更长的日志里。
+    """
+    kind = getattr(error, "waf_kind", "")
+    if kind == "block":
+        return False
+    if kind == "challenge":
+        return True
+    return _is_antibot_block(error)
 
 
 class NewApiClient(ProfileClient):
@@ -163,7 +179,7 @@ class NewApiClient(ProfileClient):
             if (
                 not self._cookie_refresh_used
                 and self._cookie_refresher is not None
-                and _is_antibot_block(exc)
+                and _browser_can_bypass(exc)
             ):
                 self._cookie_refresh_used = True
                 self._log_stage("HTTP 命中 Cloudflare/WAF，启动一次浏览器刷新辅助 Cookie")

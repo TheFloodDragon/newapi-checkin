@@ -118,6 +118,10 @@ def run_action(site: SiteConfig, profile: SiteProfile, turnstile: str = "") -> C
         detail["site_error"] = link.get("site_error")
     if link.get("site_errors"):
         detail["site_errors"] = link.get("site_errors")
+    # 停在第三方登录页时，「认证 Cookie 还在不在浏览器里」决定用户下一步该做什么：
+    # 在 → 重新捕获登录态；不在 → 先查登录态加载链路，重新捕获也不会变好。
+    if link.get("provider_session_present") is not None:
+        detail["oauth_provider_session_present"] = bool(link.get("provider_session_present"))
     if outcome.get("delta") is not None:
         detail["quota_awarded"] = outcome["delta"]
 

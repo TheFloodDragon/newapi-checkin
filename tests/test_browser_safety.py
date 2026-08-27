@@ -603,6 +603,112 @@ def test_need_human_and_waf_still_veto_oauth() -> None:
     assert session._oauth_landed({"landed_back": True, "cloudflare": True})
 
 
+def test_provider_login_page_beats_quota_read_failure_in_conclusion() -> None:
+    """relogin 站点登录前必然读不到额度，这条最弱的线索不能盖住真实原因。
+
+    实测 AgentRouter(G)：日志写着「停在 github 登录页」，结论却只有一句
+    「无法读取额度，登录态可能已失效」——用户看不出该重新捕获哪个登录态。
+    """
+    link = {
+        "landed_back": False,
+        "need_human": True,
+        "provider": "github",
+        "provider_session_present": True,
+    }
+    result = session._oauth_checkin_result(None, None, link)
+
+    assert result["status"] == "need_login"
+    assert "无法读取额度" not in result["message"]
+    assert "github" in result["message"]
+    assert "重新捕获" in result["message"]
+    # Cookie 还在却被拒 → 会话过期，重新捕获确实有用。
+    assert "过期" in result["message"] or "吊销" in result["message"]
+
+
+def test_provider_cookie_missing_points_at_state_loading_not_recapture() -> None:
+    """认证 Cookie 压根没进浏览器时，症状一样但该查加载链路，不是反复重新捕获。"""
+    link = {
+        "landed_back": False,
+        "need_human": True,
+        "provider": "github",
+        "provider_session_present": False,
+    }
+    result = session._oauth_checkin_result(None, None, link)
+
+    assert result["status"] == "need_login"
+    assert "没有 github 的认证 Cookie" in result["message"]
+
+
+def test_waf_block_is_not_reported_as_missing_callback() -> None:
+    """WAF 持续拦截时即使额度读到了，也必须给出「换出口 IP」而不是「重新捕获登录态」。"""
+    result = session._oauth_checkin_result(1_000_000, 1_000_000, {"landed_back": False, "waf_blocked": True})
+
+    assert result["status"] == "need_verification"
+    assert "代理" in result["message"]
+
+
+def test_landed_oauth_without_quota_is_not_reported_as_already_done() -> None:
+    """跳回站点但前后都读不到额度，不能当成「今日已发放」。"""
+    result = session._oauth_checkin_result(None, None, {"landed_back": True})
+
+    assert result["status"] == "need_login"
+    assert "读不到额度" in result["message"]
+
+
+def test_restore_storage_state_falls_back_to_per_cookie_when_batch_is_rejected() -> None:
+    """整批写入被拒时逐条重试：一条不合规的 cookie 不能带走整个会话。"""
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.accepted: list[dict] = []
+            self.batch_calls = 0
+
+        async def add_cookies(self, cookies: list[dict]) -> None:
+            if len(cookies) > 1:
+                self.batch_calls += 1
+                raise ValueError("invalid cookie in batch")
+            cookie = cookies[0]
+            if cookie["name"].startswith("__Host-"):
+                raise ValueError("__Host- prefix rejected")
+            self.accepted.append(cookie)
+
+        async def add_init_script(self, script: str) -> None:
+            raise AssertionError("本用例没有 origins，不应注入脚本")
+
+    context = FakeContext()
+    logs: list[str] = []
+    storage_state = {
+        "cookies": [
+            {"name": "user_session", "value": "v", "domain": "github.com", "path": "/"},
+            {"name": "__Host-user_session_same_site", "value": "v", "domain": "github.com", "path": "/"},
+            {"name": "logged_in", "value": "yes", "domain": ".github.com", "path": "/"},
+        ],
+        "origins": [],
+    }
+
+    asyncio.run(state.restore_storage_state(context, storage_state, log=logs.append))
+
+    assert context.batch_calls == 1
+    assert [cookie["name"] for cookie in context.accepted] == ["user_session", "logged_in"]
+    assert logs and "__Host-user_session_same_site" in logs[0]
+
+
+def test_restore_storage_state_raises_when_every_cookie_is_rejected() -> None:
+    """一条都写不进去时必须抛出：静默继续只会在第三方登录页上白等一分钟。"""
+
+    class FakeContext:
+        async def add_cookies(self, _cookies: list[dict]) -> None:
+            raise ValueError("nope")
+
+    with pytest.raises(ValueError):
+        asyncio.run(
+            state.restore_storage_state(
+                FakeContext(),
+                {"cookies": [{"name": "a", "value": "b", "domain": "x.invalid", "path": "/"}]},
+            )
+        )
+
+
 def test_site_error_noise_is_dropped() -> None:
     """公告接口失败、JSHandle@object、CF beacon 等与签到成败无关，
     留着只会把真正的失败原因挤出「站点原始错误」（实测挤掉了一次成功结论）。
@@ -614,6 +720,13 @@ def test_site_error_noise_is_dropped() -> None:
                             "Cross-Origin Request Blocked: ... static.cloudflareinsights.com/beacon.min.js ...")
     session._add_site_error(collector, "console.warning",
                             'Storage access automatically granted for origin “https://connect.linux.do”')
+    # 第三方授权页跑的是 GitHub 自己的前端，它的兼容性告警与本次签到无关。
+    session._add_site_error(
+        collector,
+        "console.warning",
+        '[JavaScript Warning: "Ignoring unsupported entryTypes: layout-shift." '
+        '{file: "https://github.githubassets.com/assets/chunk-33450.js" line: 1}]',
+    )
     assert collector["items"] == []
 
     session._add_site_error(collector, "response", "HTTP 403 https://s.invalid/api/user/checkin body=账号已封禁")

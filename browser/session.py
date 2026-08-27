@@ -968,6 +968,45 @@ async def refresh_site_cookies(
         await resources.close()
 
 
+async def _log_provider_state_loaded(
+    context: Any,
+    oauth_provider: str,
+    storage_state: dict[str, Any] | None,
+    log: LogFn = _noop,
+) -> bool | None:
+    """记录第三方认证 Cookie 是否真的进了浏览器上下文；无法判断返回 None。
+
+    「登录态里有 user_session」和「浏览器真的带着它发请求」是两件事：整批 cookie
+    写入被拒、域名/前缀不合规都会让前者成立而后者不成立，症状却同样是停在第三方
+    登录页。开跑前把这个事实记下来，失败结论才能分清该重新捕获还是查加载链路。
+    """
+    if not isinstance(storage_state, dict):
+        return None
+    provider = oauth_providers.get_oauth_provider(oauth_provider)
+    if not provider.authenticated_cookie_names:
+        return None
+    if not provider.has_authenticated_state(storage_state.get("cookies") or []):
+        log(
+            f"登录态里没有 {provider.key} 认证 Cookie"
+            f"（{'/'.join(provider.authenticated_cookie_names)}），请重新捕获"
+        )
+        return False
+    try:
+        cookies = await context.cookies()
+    except Exception as exc:
+        if _is_driver_closed_error(exc):
+            raise
+        return None
+    if not isinstance(cookies, list):
+        return None
+    loaded = bool(provider.has_authenticated_state(cookies))
+    if loaded:
+        log(f"{provider.key} 认证 Cookie 已装载到浏览器上下文")
+    else:
+        log(f"警告：{provider.key} 认证 Cookie 未进入浏览器上下文（登录态写入被拒），OAuth 必然停在登录页")
+    return loaded
+
+
 async def run_oauth_checkin(
     base_url: str,
     account_name: str = "",
@@ -1022,7 +1061,8 @@ async def run_oauth_checkin(
     link: dict[str, Any] = {}
 
     try:
-        await state.restore_storage_state(context, storage_state_dict)
+        await state.restore_storage_state(context, storage_state_dict, log=log)
+        await _log_provider_state_loaded(context, oauth_provider, storage_state_dict, log)
 
         page = resources.track_page(await context.new_page())
         error_collector = _install_site_error_collector(page, base_url)
@@ -1036,6 +1076,12 @@ async def run_oauth_checkin(
         if user_data_before:
             quota_before = user_data_before.get("quota")
             log(f"OAuth 前额度：{quota_to_usd(quota_before)}")
+
+        # relogin 站点在这一步必然未登录，/api/user/self 的 401 是流程的正常一环。
+        # 若把它留在采集器里，一旦 OAuth 失败就会被当作「站点原始错误」附到结论上，
+        # 用一句「未登录且未提供 access token」盖住真正的原因（如停在第三方登录页）。
+        if error_collector is not None and not user_data_before:
+            error_collector["items"] = []
 
         # 触发 OAuth 登录（拼授权 URL 法）
         link = await _trigger_oauth(page, base_url, oauth_provider, log, error_collector)
