@@ -13,8 +13,9 @@ import asyncio
 import json
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote, urlsplit
 
-from browser import bypass, oauth_flow, oauth_providers
+from browser import bypass, oauth_providers
 from providers.base import (
     ApiError,
     CheckinReward,
@@ -40,6 +41,89 @@ EXCHANGE_PATH = "/auth/sso/exchange"
 # 运行器统一缓存键；Fengwind 页面仍要求 welfare_token，仅在页面边界转换。
 INTERNAL_TOKEN_KEY = "auth_token"
 SITE_TOKEN_KEY = "welfare_token"
+
+# ── 双层 SSO 的每一跳 ────────────────────────────────────────────────────────
+# 实测链路：福利站 /api/auth/login-url → 主站 /sso/continue → 主站 /login（未登录时）
+# → 主站 /api/v1/auth/oauth/linuxdo/start → connect.linux.do/oauth2/authorize
+# → linux.do/session/sso_provider（302 中转）→ connect.linux.do 授权同意页
+# → 主站 callback → 福利站 /auth/callback?code=...
+#
+# 其中两跳需要动手：主站登录页要点「Continue with Linux.do」，LINUX DO Connect 的
+# 同意页要点「允许」—— 实测它是 a[href^="/oauth2/approve"] 而不是 button。
+MAIN_LOGIN_SELECTORS = (
+    "button:has-text('Continue with Linux.do')",
+    "button:has-text('使用 Linux.do 登录')",
+    "button:has-text('使用 LinuxDO 登录')",
+    "button:has-text('Linux.do')",
+    "button:has-text('LinuxDO')",
+    "[href*='/auth/oauth/linuxdo/start']",
+)
+CONNECT_APPROVE_SELECTORS = (
+    "a[href^='/oauth2/approve']",
+    "a:has-text('允许')",
+)
+STAGE_LABELS = {
+    "welfare_callback": "福利站 callback（已带 code）",
+    "welfare_home": "福利站页面（未带 code）",
+    "main_login": "主站登录页",
+    "main_other": "主站页面（可能已登录）",
+    "connect": "LINUX DO Connect 授权页",
+    "linuxdo": "linux.do SSO 中转/登录页",
+    "other": "未知页面",
+}
+# 主站/福利站页面刚打开时 SPA 还在决定跳哪里，先给它这么久再判定「停住了」。
+STAGE_SETTLE_SECONDS = 6.0
+# 任一跳停滞超过这个时间就先解一次验证再刷新：实测 linux.do 的 302 中转跳会被
+# Cloudflare Turnstile 挡住，干等只会耗完预算（旧实现就是这样白等 25 秒）。
+STAGE_STALL_SECONDS = 8.0
+
+
+def _origin_of(url: str) -> str:
+    parsed = urlsplit(str(url or ""))
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _linuxdo_start_url(login_url: str) -> str:
+    """主站「Continue with Linux.do」按钮背后的 OAuth 起跳地址。
+
+    直接导航而不是点按钮：那个按钮由主站 SPA 渲染，实测在 humanize 轨迹下三种点击
+    方式都会 TimeoutError（元素被动画/遮挡判为不可操作），一旦点不动就会把整个脚本
+    预算耗尽。按钮本身只是 302 到这个端点，导航是等价且确定的做法。
+    """
+    parsed = urlsplit(str(login_url or ""))
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    redirect = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+    return (
+        f"{parsed.scheme}://{parsed.netloc}/api/v1/auth/oauth/linuxdo/start"
+        f"?redirect={quote(redirect, safe='')}"
+    )
+
+
+def _sso_stage(url: str, welfare_origin: str, main_origin: str) -> str:
+    """判断当前 URL 处于双层 SSO 的哪一跳（纯函数，便于直接断言）。"""
+    parsed = urlsplit(str(url or ""))
+    host = (parsed.hostname or "").casefold()
+    if not host:
+        return "other"
+    path = (parsed.path or "").casefold()
+    has_code = any(part.partition("=")[0] == "code" for part in (parsed.query or "").split("&"))
+
+    if _origin_of(url) == _origin_of(welfare_origin):
+        return "welfare_callback" if has_code else "welfare_home"
+    main_host = (urlsplit(main_origin).hostname or "").casefold()
+    if main_host and host == main_host:
+        # 主站已经把 code 发回来时 URL 会带上它；否则 /login 表示还要点 LinuxDO。
+        if has_code:
+            return "main_other"
+        return "main_login" if path.rstrip("/").endswith("/login") or path == "/login" else "main_other"
+    if host == "connect.linux.do":
+        return "connect"
+    if host == "linux.do" or host.endswith(".linux.do"):
+        return "linuxdo"
+    return "other"
 
 
 @dataclass(slots=True)
@@ -427,103 +511,233 @@ async def _wait_for_welfare_token(
     return ""
 
 
-async def _click_main_linuxdo(page: Any, log: Any, timeout_ms: int = 20000) -> Any | None:
-    """等待主站 SPA 渲染 LinuxDO 按钮后再点击。"""
-    selectors = (
-        "button:has-text('使用 Linux.do 登录')",
-        "button:has-text('使用 LinuxDO 登录')",
-        "button:has-text('Linux.do')",
-        "button:has-text('LinuxDO')",
-        "[href*='/auth/oauth/linuxdo/start']",
-    )
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + max(1000, timeout_ms) / 1000
-    while loop.time() < deadline:
-        current_url = str(getattr(page, "url", "") or "").casefold()
-        # 已经进入 LinuxDO/连接授权页时，不必继续等待主站按钮，交给授权处理器。
-        if "linux.do" in current_url and "api.fengwind.com" not in current_url:
-            return None
-        for selector in selectors:
+async def _click_first_visible(page: Any, selectors: tuple[str, ...], log: Any) -> str:
+    """点击第一个可见的候选元素，返回命中的选择器；都不可见返回空串。"""
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            if await locator.count() <= 0 or not await locator.is_visible():
+                continue
+        except Exception:
+            continue
+        before_url = str(getattr(page, "url", "") or "")
+        for label, click in (
+            ("普通点击", lambda: locator.click(timeout=5000)),
+            ("强制点击", lambda: locator.click(timeout=3000, force=True)),
+            ("DOM dispatch", lambda: locator.dispatch_event("click")),
+        ):
             try:
-                locator = page.locator(selector).first
-                if await locator.count() <= 0 or not await locator.is_visible():
-                    continue
-                log(f"点击 Fengwind 主站 LinuxDO 登录入口：{selector}")
-                before_url = str(getattr(page, "url", "") or "")
-                strategies = (
-                    ("普通点击", lambda: locator.click(timeout=7000)),
-                    ("强制点击", lambda: locator.click(timeout=3000, force=True)),
-                    ("DOM dispatch", lambda: locator.dispatch_event("click")),
-                )
-                for label, click in strategies:
-                    try:
-                        await click()
-                        return page
-                    except Exception as exc:
-                        try:
-                            await page.wait_for_timeout(500)
-                            current_url = str(getattr(page, "url", "") or "")
-                        except Exception:
-                            current_url = ""
-                        if current_url and current_url != before_url:
-                            log(f"LinuxDO 入口{label}虽等待超时，但已触发页面跳转")
-                            return page
-                        log(f"LinuxDO 入口{label}失败（{type(exc).__name__}）")
-                continue
-            except Exception:
-                continue
-        await page.wait_for_timeout(400)
-    log("Fengwind 主站 LinuxDO 登录入口在等待窗口内未出现")
-    return None
+                await click()
+                return selector
+            except Exception as exc:
+                try:
+                    await page.wait_for_timeout(400)
+                    moved = str(getattr(page, "url", "") or "") != before_url
+                except Exception:
+                    moved = False
+                if moved:
+                    if callable(log):
+                        log(f"{selector} {label}报超时但页面已跳转")
+                    return selector
+                if callable(log):
+                    log(f"{selector} {label}失败（{type(exc).__name__}）")
+    return ""
 
 
-async def _login_with_linuxdo(page: Any, helpers: Any, origin: str) -> str:
+async def _has_any_selector(page: Any, selectors: tuple[str, ...] | list[str]) -> bool:
+    for selector in selectors:
+        try:
+            if await page.locator(selector).first.count() > 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _drive_sso_chain(
+    page: Any,
+    helpers: Any,
+    origin: str,
+    login_url: str,
+    state_value: str,
+    budget_seconds: float,
+) -> dict[str, Any]:
+    """按当前所处的一跳逐步推进双层 SSO，直到福利站回调带回 code。
+
+    返回 ``{"token": str, "reason": str, "stage": str}``：reason 为空表示成功，
+    ``provider_login`` 表示停在 linux.do 登录页（共享登录态失效），``timeout``
+    表示预算内没能走完，stage 指出最后停在哪一跳 —— 这是排查的关键信息，
+    旧实现只会回一句「SSO 未完成」。
+    """
+    provider = oauth_providers.get_oauth_provider("linuxdo")
+    main_origin = _origin_of(login_url)
+    start_url = _linuxdo_start_url(login_url)
+    approve_selectors = tuple(provider.approve_selectors) + CONNECT_APPROVE_SELECTORS
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(20.0, budget_seconds)
+
+    last_stage = ""
+    stale_url = ""
+    stale_since = loop.time()
+    reopen_left = 3      # 重新发起 /sso/continue 的次数（主站登录完成后要靠它带回 code）
+    nudge_left = 2       # 对卡住的 302 中转跳做「解 CF + 刷新」的次数
+    start_left = 2       # 直连主站 linuxdo start 端点的次数
+    exchange_tried = 0
+
+    while loop.time() < deadline:
+        url = str(getattr(page, "url", "") or "")
+        stage = _sso_stage(url, origin, main_origin)
+        if stage != last_stage:
+            helpers.log(f"SSO 当前位置：{STAGE_LABELS.get(stage, stage)}")
+            last_stage = stage
+            stale_url = url
+            stale_since = loop.time()
+        elif url != stale_url:
+            stale_url = url
+            stale_since = loop.time()
+        stale_for = loop.time() - stale_since
+
+        if stage == "welfare_callback":
+            exchange_tried += 1
+            token = await _wait_for_welfare_token(
+                page, origin, state_value, log=helpers.log, timeout_ms=15000
+            )
+            if token:
+                return {"token": token, "reason": "", "stage": stage}
+            if exchange_tried >= 2 or reopen_left <= 0:
+                return {"token": "", "reason": "exchange_failed", "stage": stage}
+            reopen_left -= 1
+            helpers.log("callback 未能换出 welfare_token，重新发起主站 SSO")
+            await _safe_goto(page, login_url, helpers.log)
+            continue
+
+        if stage == "main_login":
+            # 主站要求登录：直连 OAuth 起跳端点，点按钮只作兜底。
+            if start_url and start_left > 0:
+                start_left -= 1
+                helpers.log("主站要求登录，直连 LinuxDO OAuth 起跳端点")
+                await _safe_goto(page, start_url, helpers.log)
+                await page.wait_for_timeout(1200)
+                continue
+            selector = await _click_first_visible(page, MAIN_LOGIN_SELECTORS, helpers.log)
+            if selector:
+                helpers.log(f"已点击主站 LinuxDO 登录入口：{selector}")
+                await page.wait_for_timeout(1500)
+                continue
+            await page.wait_for_timeout(600)
+            continue
+
+        if stage in {"welfare_home", "main_other"}:
+            # 主站页面刚打开时 SPA 还没决定跳哪里，先给它几秒；确实停住了才重新发起
+            # /sso/continue —— 主站已登录时靠这一步把 code 发回福利站，旧实现完全没有，
+            # 主站登录成功后链路就断在这里。
+            if stale_for < STAGE_SETTLE_SECONDS:
+                await page.wait_for_timeout(700)
+                continue
+            if reopen_left <= 0:
+                return {"token": "", "reason": "timeout", "stage": stage}
+            reopen_left -= 1
+            helpers.log("重新发起主站 /sso/continue 以换取福利站 code")
+            await _safe_goto(page, login_url, helpers.log)
+            await page.wait_for_timeout(1500)
+            continue
+
+        if stage == "connect":
+            selector = await _click_first_visible(page, approve_selectors, helpers.log)
+            if selector:
+                helpers.log(f"已在 LINUX DO Connect 点击授权：{selector}")
+                await page.wait_for_timeout(1500)
+                continue
+            await page.wait_for_timeout(600)
+
+        if stage == "linuxdo":
+            if await _has_any_selector(page, provider.login_markers):
+                return {"token": "", "reason": "provider_login", "stage": stage}
+
+        # 同一个页面长时间没有进展：先给 Cloudflare 一次机会，再刷新这一跳。
+        # linux.do 的 /session/sso_provider 正常只是 302，停在那里说明这一跳被
+        # 挡住或超时，干等到底只会耗完预算。
+        if stale_for > STAGE_STALL_SECONDS:
+            if nudge_left > 0:
+                nudge_left -= 1
+                helpers.log(f"{STAGE_LABELS.get(stage, stage)} 停滞，尝试解验证并重试该跳")
+                try:
+                    await bypass.solve_cloudflare(page, log=helpers.log)
+                except Exception:
+                    pass
+                try:
+                    await page.reload(wait_until="domcontentloaded", timeout=30000)
+                except Exception:
+                    pass
+                stale_since = loop.time()
+                continue
+            if stage in {"linuxdo", "connect", "other"} and reopen_left > 0:
+                reopen_left -= 1
+                helpers.log(f"{STAGE_LABELS.get(stage, stage)} 仍无进展，从主站 SSO 重新开始")
+                await _safe_goto(page, login_url, helpers.log)
+                stale_since = loop.time()
+                continue
+
+        await page.wait_for_timeout(700)
+
+    return {"token": "", "reason": "timeout", "stage": last_stage or "other"}
+
+
+async def _safe_goto(page: Any, url: str, log: Any) -> None:
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+    except Exception as exc:
+        if callable(log):
+            log(f"打开 {url[:80]} 失败：{type(exc).__name__}")
+
+
+async def _login_with_linuxdo(page: Any, helpers: Any, origin: str) -> dict[str, Any]:
+    """完成 福利站 → 主站 → LINUX DO Connect → linux.do 的双层 SSO。"""
     state_value = "fengwind-" + __import__("secrets").token_urlsafe(18)
     login_url = await _fetch_login_url(page, origin, state_value)
     if not login_url:
         helpers.log("Fengwind SSO 登录地址获取失败")
-        return ""
+        return {"token": "", "reason": "login_url_missing", "stage": "welfare_home"}
     helpers.log("已获取 Fengwind SSO 地址，打开主站登录页")
-    try:
-        await page.goto(login_url, wait_until="domcontentloaded", timeout=60000)
-    except Exception as exc:
-        helpers.log(f"打开 Fengwind 主站 SSO 失败：{type(exc).__name__}")
-        return ""
-    helpers.log("已打开 Fengwind 主站 SSO，等待 LinuxDO 登录入口")
+    await _safe_goto(page, login_url, helpers.log)
     try:
         await bypass.solve_cloudflare(page, log=helpers.log)
     except Exception:
         pass
 
-    # 主站可能已经有登录态并直接回跳；否则点击主站的 LinuxDO 按钮。
-    entry_page = await _click_main_linuxdo(page, helpers.log)
-    if entry_page is not None:
-        page_for_oauth = entry_page
-    else:
-        page_for_oauth = page
-    provider = oauth_providers.get_oauth_provider("linuxdo")
-    oauth_result = {
-        "clicked": False,
-        "landed_back": False,
-        "need_human": False,
-        "cloudflare": False,
-        "provider": "linuxdo",
-    }
-    if not str(getattr(page_for_oauth, "url", "") or "").startswith(origin):
-        oauth_result = await oauth_flow.finish_oauth_authorization(
-            page_for_oauth,
-            origin,
-            provider,
-            oauth_result,
-            log=helpers.log,
-        )
-    if oauth_result.get("need_human"):
-        return ""
-    # LinuxDO 页面可能被 ClickSolver 标记为 Cloudflare，但只要已经严格回跳到
-    # 福利站 callback，就仍应继续交换一次 code；未回跳时才把挑战视为失败。
-    if oauth_result.get("cloudflare") and not oauth_result.get("landed_back"):
-        return ""
-    return await _wait_for_welfare_token(page_for_oauth, origin, state_value, log=helpers.log)
+    remaining = helpers.remaining_seconds()
+    # 留出签到 API 的时间预算；拿不到剩余预算时按 100s 走（脚本默认超时 240s）。
+    budget = 100.0 if remaining is None else max(20.0, min(150.0, remaining - 45.0))
+    return await _drive_sso_chain(page, helpers, origin, login_url, state_value, budget)
+
+
+SSO_FAILURE_MESSAGES = {
+    "provider_login": (
+        "共享 linuxdo 登录态已失效（浏览器停在 linux.do 登录页），"
+        "请在管理界面重新捕获 linuxdo:default 登录态"
+    ),
+    "login_url_missing": (
+        "Fengwind 福利站未下发 SSO 登录地址（/api/auth/login-url 无响应或被拦截），"
+        "站点可能临时不可用，请稍后重试"
+    ),
+    "exchange_failed": (
+        "已回到 Fengwind 福利站 callback，但 code 换取 welfare_token 失败；"
+        "请确认账号已在 Fengwind 主站完成 LinuxDO 绑定"
+    ),
+}
+
+
+def _sso_failure_message(outcome: dict[str, Any]) -> str:
+    reason = str(outcome.get("reason") or "timeout")
+    stage = STAGE_LABELS.get(str(outcome.get("stage") or ""), "未知位置")
+    known = SSO_FAILURE_MESSAGES.get(reason)
+    if known:
+        return known
+    return (
+        f"Fengwind 双层 SSO 未在预算内走完（最后停在{stage}）。"
+        "该链路需要先登录 Fengwind 主站再换取福利站 Token；"
+        "若反复停在同一跳，请重新捕获 linuxdo:default 登录态或稍后重试"
+    )
 
 
 async def run(page: Any, context: Any, site: Any, helpers: Any) -> dict[str, Any]:
@@ -533,15 +747,22 @@ async def run(page: Any, context: Any, site: Any, helpers: Any) -> dict[str, Any
 
     token = await _page_token(page)
     verified = bool(token and await _verify_page_token(page, origin))
+    outcome: dict[str, Any] = {}
     if not verified:
         helpers.log("Fengwind welfare_token 不可用，开始双层 LinuxDO SSO")
-        token = await _login_with_linuxdo(page, helpers, origin)
+        outcome = await _login_with_linuxdo(page, helpers, origin)
+        token = str(outcome.get("token") or "")
         verified = bool(token and await _verify_page_token(page, origin))
     if not verified:
-        return helpers.need_login(
-            "Fengwind 福利站 LinuxDO SSO 未完成，请重新捕获 linuxdo:default 登录态",
-            {"oauth_provider": "linuxdo", "target_url": origin},
-        )
+        # 失败原因必须落到具体那一跳：旧实现无论卡在主站登录页、授权同意页还是
+        # linux.do 中转，都只回同一句「请重新捕获登录态」，而这三种情况该做的事完全不同。
+        detail = {
+            "oauth_provider": "linuxdo",
+            "target_url": origin,
+            "sso_stage": outcome.get("stage") or "",
+            "sso_reason": outcome.get("reason") or "",
+        }
+        return helpers.need_login(_sso_failure_message(outcome), detail)
 
     helpers.log("Fengwind 福利站登录态验证成功，执行签到 API")
     client = _ClientView(base_url=origin, access_token=token, site=site)
