@@ -1,3 +1,10 @@
+# 项目更新
+
+**仓库变更**：请转到 [auto-checkin](https://github.com/TheFloodDragon/auto-checkin)
+
+该仓库已停止使用
+
+
 # newapi-checkin
 
 面向 **New API / Sub2API 系中转站**的自动签到、额度查询与登录态管理工具。
